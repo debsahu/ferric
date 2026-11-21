@@ -4329,6 +4329,190 @@ impl NmrWorkbenchApp {
         sc
     }
 
+    /// Minimum-cost square assignment (`n x n` row-major cost matrix) via the Kuhn-Munkres
+    /// shortest-augmenting-path Hungarian algorithm (Kuhn 1955; Munkres 1957; Jonker & Volgenant
+    /// 1987). Returns `(row_to_col, total_cost)`.
+    fn hungarian_min_cost_square(n: usize, cost: &[f64]) -> (Vec<usize>, f64) {
+        if n == 0 {
+            return (Vec::new(), 0.0);
+        }
+        let mut u = vec![0.0_f64; n + 1];
+        let mut v = vec![0.0_f64; n + 1];
+        let mut p = vec![0usize; n + 1];
+        let mut way = vec![0usize; n + 1];
+
+        for i in 1..=n {
+            p[0] = i;
+            let mut j0 = 0usize;
+            let mut minv = vec![f64::INFINITY; n + 1];
+            let mut used = vec![false; n + 1];
+            loop {
+                used[j0] = true;
+                let i0 = p[j0];
+                let mut delta = f64::INFINITY;
+                let mut j1 = 0usize;
+                for j in 1..=n {
+                    if !used[j] {
+                        let cur = cost[(i0 - 1) * n + (j - 1)] - u[i0] - v[j];
+                        if cur < minv[j] {
+                            minv[j] = cur;
+                            way[j] = j0;
+                        }
+                        if minv[j] < delta {
+                            delta = minv[j];
+                            j1 = j;
+                        }
+                    }
+                }
+                for j in 0..=n {
+                    if used[j] {
+                        u[p[j]] += delta;
+                        v[j] -= delta;
+                    } else {
+                        minv[j] -= delta;
+                    }
+                }
+                j0 = j1;
+                if p[j0] == 0 {
+                    break;
+                }
+            }
+            loop {
+                let j1 = way[j0];
+                p[j0] = p[j1];
+                j0 = j1;
+                if j0 == 0 {
+                    break;
+                }
+            }
+        }
+
+        let mut row_to_col = vec![0usize; n];
+        for j in 1..=n {
+            if p[j] > 0 {
+                row_to_col[p[j] - 1] = j - 1;
+            }
+        }
+        let total_cost: f64 = row_to_col
+            .iter()
+            .enumerate()
+            .map(|(r, &c)| cost[r * n + c])
+            .sum();
+        (row_to_col, total_cost)
+    }
+
+    /// Optimal maximum-cardinality, minimum-cost bipartite matching between old and new spin
+    /// systems over gated pairs (`|dH| <= 0.03 ppm`, `|dN| <= 0.30 ppm`) using connected-component
+    /// Kuhn-Munkres (Hungarian) assignment. Any matched edge that belongs to an exact-cost tie
+    /// (ambiguous swap within `1e-9`) is refused (`None`) rather than silently guessing a label.
+    fn match_spin_systems_hungarian(
+        old_sys: &[SpinSystem],
+        new_sys: &[SpinSystem],
+    ) -> Vec<Option<usize>> {
+        const H_GATE: f64 = 0.03;
+        const N_GATE: f64 = 0.30;
+        const TIE_EPS: f64 = 1e-9;
+
+        let n_old = old_sys.len();
+        let n_new = new_sys.len();
+        let mut old_to_new: Vec<Option<usize>> = vec![None; n_old];
+        if n_old == 0 || n_new == 0 {
+            return old_to_new;
+        }
+
+        let mut old_adj: Vec<Vec<(usize, f64)>> = vec![Vec::new(); n_old];
+        let mut new_adj: Vec<Vec<usize>> = vec![Vec::new(); n_new];
+        for (oi, old_ss) in old_sys.iter().enumerate() {
+            for (ni, new_ss) in new_sys.iter().enumerate() {
+                let dh = (new_ss.h - old_ss.h).abs();
+                let dn = (new_ss.n - old_ss.n).abs();
+                if dh <= H_GATE && dn <= N_GATE {
+                    let d2 = (dh / H_GATE).powi(2) + (dn / N_GATE).powi(2);
+                    old_adj[oi].push((ni, d2));
+                    new_adj[ni].push(oi);
+                }
+            }
+        }
+
+        let mut vis_old = vec![false; n_old];
+        let mut vis_new = vec![false; n_new];
+
+        for start_oi in 0..n_old {
+            if vis_old[start_oi] || old_adj[start_oi].is_empty() {
+                continue;
+            }
+            // BFS to collect one connected component of gated old/new systems
+            let mut comp_old = Vec::new();
+            let mut comp_new = Vec::new();
+            let mut queue_old = vec![start_oi];
+            vis_old[start_oi] = true;
+            while let Some(oi) = queue_old.pop() {
+                comp_old.push(oi);
+                for &(ni, _) in &old_adj[oi] {
+                    if !vis_new[ni] {
+                        vis_new[ni] = true;
+                        comp_new.push(ni);
+                        for &other_oi in &new_adj[ni] {
+                            if !vis_old[other_oi] {
+                                vis_old[other_oi] = true;
+                                queue_old.push(other_oi);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Fast path: isolated 1-to-1 pair
+            if comp_old.len() == 1 && comp_new.len() == 1 {
+                old_to_new[comp_old[0]] = Some(comp_new[0]);
+                continue;
+            }
+
+            comp_old.sort_unstable();
+            comp_new.sort_unstable();
+            let r_cnt = comp_old.len();
+            let c_cnt = comp_new.len();
+            let k = r_cnt.max(c_cnt);
+            // Strictly larger than the maximum possible sum of gated d2 costs (<= 2.0 * k),
+            // guaranteeing maximum cardinality first and minimum sum(d2) second.
+            let unmatched_cost = 2.0 * (k as f64) + 100.0;
+            let mut cost = vec![unmatched_cost; k * k];
+            let mut gated = vec![false; k * k];
+            for (r, &oi) in comp_old.iter().enumerate() {
+                for &(ni, d2) in &old_adj[oi] {
+                    if let Ok(c) = comp_new.binary_search(&ni) {
+                        cost[r * k + c] = d2;
+                        gated[r * k + c] = true;
+                    }
+                }
+            }
+
+            let (assignment, opt_cost) = Self::hungarian_min_cost_square(k, &cost);
+            for r in 0..r_cnt {
+                let c = assignment[r];
+                if c >= c_cnt || !gated[r * k + c] {
+                    continue;
+                }
+                // Check for exact-cost ambiguity by temporarily forbidding (r, c) on small/medium components.
+                let mut ambiguous = false;
+                if k <= 64 {
+                    let saved = cost[r * k + c];
+                    cost[r * k + c] = unmatched_cost;
+                    let (_, alt_cost) = Self::hungarian_min_cost_square(k, &cost);
+                    cost[r * k + c] = saved;
+                    if (alt_cost - opt_cost).abs() <= TIE_EPS {
+                        ambiguous = true;
+                    }
+                }
+                if !ambiguous {
+                    old_to_new[comp_old[r]] = Some(comp_new[c]);
+                }
+            }
+        }
+
+        old_to_new
+    }
+
     fn rebuild_systems_and_matrices(&mut self) {
         if !self.peaks.iter().any(|p| p.exp == "HSQC") {
             let had_systems = !self.systems.is_empty();
@@ -4361,36 +4545,11 @@ impl NmrWorkbenchApp {
 
         match build_spin_systems(&self.peaks, &Tolerances::default(), 3, false) {
             Ok(sys) => {
-                // Global distance-sorted one-to-one matching between old and new spin systems
-                // within (|dH| <= 0.03 ppm, |dN| <= 0.30 ppm) so deleting one peak never lets
-                // its residue label or lock spill onto a nearby surviving neighbor.
-                let mut pairs: Vec<(f64, usize, usize)> = Vec::new();
-                for (oi, old_ss) in self.systems.iter().enumerate() {
-                    for (ni, new_ss) in sys.iter().enumerate() {
-                        let dh = (new_ss.h - old_ss.h).abs();
-                        let dn = (new_ss.n - old_ss.n).abs();
-                        if dh <= 0.03 && dn <= 0.30 {
-                            let d2 = (dh / 0.03).powi(2) + (dn / 0.30).powi(2);
-                            pairs.push((d2, oi, ni));
-                        }
-                    }
-                }
-                pairs.sort_by(|a, b| {
-                    a.0.total_cmp(&b.0)
-                        .then_with(|| a.1.cmp(&b.1))
-                        .then_with(|| a.2.cmp(&b.2))
-                });
-                let mut used_old = vec![false; self.systems.len()];
-                let mut used_new = vec![false; sys.len()];
-                let mut old_to_new: Vec<Option<usize>> = vec![None; self.systems.len()];
-                for (_, oi, ni) in pairs {
-                    if used_old[oi] || used_new[ni] {
-                        continue;
-                    }
-                    used_old[oi] = true;
-                    used_new[ni] = true;
-                    old_to_new[oi] = Some(ni);
-                }
+                // Optimal maximum-cardinality minimum-cost bipartite matching (Hungarian /
+                // Kuhn-Munkres) over gated pairs (|dH| <= 0.03 ppm, |dN| <= 0.30 ppm) with
+                // exact-tie ambiguity refusal so peak deletions and uniform shifts never
+                // mis-transfer labels or locks onto the wrong neighbor.
+                let old_to_new = Self::match_spin_systems_hungarian(&self.systems, &sys);
 
                 let mut remapped_locks = BTreeMap::new();
                 let mut used_lock_res = BTreeSet::new();
@@ -17489,19 +17648,33 @@ impl NmrWorkbenchApp {
                 McpUiCommand::LoadStudyFolder {
                     path,
                     run_full_pipeline,
+                    confirm,
                 } => {
+                    if !self.mcp_bridge.destructive_actions_allowed() || !confirm {
+                        self.status_msg = "MCP destructive action 'load_study_folder' denied (enable destructive actions in MCP Bridge settings and pass confirm: true)".to_string();
+                        continue;
+                    }
                     #[cfg(not(target_arch = "wasm32"))]
                     {
-                        let resolved =
-                            match self.mcp_bridge.resolve_sandboxed_read_path(&path, true) {
-                                Ok(p) => p,
-                                Err(e) => {
-                                    self.status_msg = format!("MCP load_study_folder denied: {e}");
-                                    continue;
-                                }
-                            };
+                        let resolved = match self.mcp_bridge.resolve_sandboxed_study_path(&path) {
+                            Ok(p) => p,
+                            Err(e) => {
+                                self.status_msg = format!("MCP load_study_folder denied: {e}");
+                                continue;
+                            }
+                        };
                         match IngestPanelState::from_native_path(&resolved) {
                             Ok(panel) => {
+                                let child_escapes =
+                                    panel.row_resolved_paths.iter().flatten().any(|child| {
+                                        std::fs::canonicalize(child)
+                                            .map(|c| !c.starts_with(&resolved))
+                                            .unwrap_or(true)
+                                    });
+                                if child_escapes {
+                                    self.status_msg = "MCP load_study_folder denied: resolved study child path escapes study root".to_string();
+                                    continue;
+                                }
                                 self.mcp_bridge.set_last_mcp_loaded_path(Some(&resolved));
                                 self.ingest_panel = panel;
                                 let plan = self.ingest_panel.build_execution_plan();
@@ -17527,7 +17700,18 @@ impl NmrWorkbenchApp {
                 McpUiCommand::SetSequence {
                     sequence,
                     sequence_path,
+                    confirm,
                 } => {
+                    let replacing_existing = !self.sequence.is_empty()
+                        || self.assign_res.is_some()
+                        || self.pred_ref.is_some()
+                        || !self.session.state.assignments.is_empty();
+                    if replacing_existing
+                        && (!self.mcp_bridge.destructive_actions_allowed() || !confirm)
+                    {
+                        self.status_msg = "MCP destructive action 'set_sequence' denied (replacing existing sequence/assignments requires enabling destructive actions in MCP Bridge settings and confirm: true)".to_string();
+                        continue;
+                    }
                     #[cfg_attr(target_arch = "wasm32", allow(unused_mut))]
                     let mut raw_seq = sequence;
                     #[cfg(not(target_arch = "wasm32"))]
@@ -17883,14 +18067,17 @@ impl NmrWorkbenchApp {
     ) {
         if action == WorkbenchAction::LoadPathOrSpectrum {
             self.status_msg =
-                "Use run_workbench_workflow(action='load_study_folder', path=...) to load datasets via MCP"
+                "Use run_workbench_workflow(action='load_study_folder', path=..., confirm=true) to load datasets via MCP"
                     .to_string();
             return;
         }
-        if action == WorkbenchAction::ResetWorkspace
+        if nmr_gui::mcp_bridge::workbench_action_is_destructive(action)
             && (!self.mcp_bridge.destructive_actions_allowed() || !confirm)
         {
-            self.status_msg = "MCP destructive action 'ResetWorkspace' denied".to_string();
+            self.status_msg = format!(
+                "MCP destructive action '{}' denied (enable destructive actions in MCP Bridge settings and pass confirm: true)",
+                nmr_gui::mcp_bridge::workbench_action_canonical_name(action)
+            );
             return;
         }
         #[cfg(not(target_arch = "wasm32"))]
@@ -17969,7 +18156,7 @@ impl NmrWorkbenchApp {
                 if let Some(ref rp) = self.ingest_panel.root_path {
                     if let Err(e) = self
                         .mcp_bridge
-                        .resolve_sandboxed_read_path(&rp.to_string_lossy(), true)
+                        .resolve_sandboxed_study_path(&rp.to_string_lossy())
                     {
                         self.status_msg = format!("MCP FID processing denied: {e}");
                         return;
@@ -22927,6 +23114,7 @@ CBCACON\t175.41\t122.09\t30.40\t1\t520.0
 
         app.mcp_bridge
             .set_permission(McpBridgePermission::ReadWrite);
+        app.mcp_bridge.set_destructive_actions_allowed(true);
 
         let rpc = |app: &mut NmrWorkbenchApp, id: u64, method: &str, params: serde_json::Value| {
             let body = serde_json::json!({
@@ -22956,6 +23144,7 @@ CBCACON\t175.41\t122.09\t30.40\t1\t520.0
                 "arguments": {
                     "action": "set_sequence",
                     "sequence": format!(">1UBQ:A|PDBID\n{UBIQUITIN_SEQ}\n"),
+                    "confirm": true,
                 }
             }),
         );
@@ -23273,21 +23462,22 @@ CBCACON\t175.41\t122.09\t30.40\t1\t520.0
         assert_ne!(save_ok["isError"], true);
         app.apply_pending_mcp_bridge_commands();
 
-        // 3. In-root sequence read succeeds
-        let ok_seq = call_mcp(
+        // 3. In-root sequence read replacing existing 76-res sequence/assignments requires destructive opt-in + confirm
+        let seq_denied_no_perm = call_mcp(
             &mut app,
             11,
             "run_workbench_workflow",
             serde_json::json!({
                 "action": "set_sequence",
-                "sequence_path": in_fasta.to_string_lossy()
+                "sequence_path": in_fasta.to_string_lossy(),
+                "confirm": true
             }),
         );
-        assert_ne!(ok_seq["isError"], true);
+        assert_eq!(seq_denied_no_perm["isError"], true);
         app.apply_pending_mcp_bridge_commands();
-        assert_eq!(app.sequence.len(), 10);
+        assert_eq!(app.sequence.len(), 76);
 
-        // 4. ResetWorkspace denied unless both allow_destructive_actions=true and confirm=true
+        // 4. ResetWorkspace & replacing set_sequence denied unless both allow_destructive_actions=true and confirm=true
         let reset_no_perm = call_mcp(
             &mut app,
             12,
@@ -23296,13 +23486,40 @@ CBCACON\t175.41\t122.09\t30.40\t1\t520.0
         );
         assert_eq!(reset_no_perm["isError"], true);
         app.apply_pending_mcp_bridge_commands();
-        assert_eq!(app.sequence.len(), 10);
+        assert_eq!(app.sequence.len(), 76);
         assert!(!app.peaks.is_empty());
 
         app.mcp_bridge.set_destructive_actions_allowed(true);
-        let reset_no_confirm = call_mcp(
+        let seq_no_confirm = call_mcp(
             &mut app,
             13,
+            "run_workbench_workflow",
+            serde_json::json!({
+                "action": "set_sequence",
+                "sequence_path": in_fasta.to_string_lossy()
+            }),
+        );
+        assert_eq!(seq_no_confirm["isError"], true);
+        app.apply_pending_mcp_bridge_commands();
+        assert_eq!(app.sequence.len(), 76);
+
+        let ok_seq = call_mcp(
+            &mut app,
+            14,
+            "run_workbench_workflow",
+            serde_json::json!({
+                "action": "set_sequence",
+                "sequence_path": in_fasta.to_string_lossy(),
+                "confirm": true
+            }),
+        );
+        assert_ne!(ok_seq["isError"], true);
+        app.apply_pending_mcp_bridge_commands();
+        assert_eq!(app.sequence.len(), 10);
+
+        let reset_no_confirm = call_mcp(
+            &mut app,
+            15,
             "dispatch_workbench_action",
             serde_json::json!({ "action": "reset_workspace" }),
         );
@@ -23312,7 +23529,7 @@ CBCACON\t175.41\t122.09\t30.40\t1\t520.0
 
         let reset_confirmed = call_mcp(
             &mut app,
-            14,
+            16,
             "dispatch_workbench_action",
             serde_json::json!({ "action": "reset_workspace", "confirm": true }),
         );
@@ -24526,6 +24743,487 @@ CBCACON\t175.41\t122.09\t30.40\t1\t520.0
                 .iter()
                 .any(|p| (p.h - p2.0).abs() < 0.008 && (p.n - p2.1).abs() < 0.08),
             "expected second crowded IDP amide near {p2:?} (0.018/0.18 ppm away) not to be NMS-merged, got {picked:?}"
+        );
+    }
+
+    #[test]
+    fn test_mcp_e2e_p1_9_fail_closed_no_roots_blocks_hosts_yml_exfil() {
+        use super::*;
+        use nmr_gui::mcp_bridge::McpBridgePermission;
+
+        struct TempDirGuard(std::path::PathBuf);
+        impl TempDirGuard {
+            fn new(tag: &str) -> Self {
+                static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let raw = std::env::temp_dir().join(format!(
+                    "ferric_gui_p1_9_{tag}_{}_{}",
+                    std::process::id(),
+                    n
+                ));
+                std::fs::create_dir_all(&raw).expect("create temp test dir");
+                Self(std::fs::canonicalize(&raw).expect("canonicalize temp test dir"))
+            }
+        }
+        impl Drop for TempDirGuard {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        let fake_home = TempDirGuard::new("home");
+        let gh_dir = fake_home.0.join(".config").join("gh");
+        std::fs::create_dir_all(&gh_dir).expect("create fake .config/gh");
+        let hosts_yml = gh_dir.join("hosts.yml");
+        std::fs::write(&hosts_yml, "github.com:\n  oauth_token: ghp_MQIFVKTLTG\n")
+            .expect("write hosts.yml");
+
+        // Fresh GUI workbench with no study open and no configured MCP roots:
+        let mut app = make_headless_test_app();
+        app.sync_mcp_bridge_snapshot_and_viewport();
+        assert!(
+            app.mcp_bridge.approved_roots().is_empty(),
+            "fresh workbench with no study must have zero approved MCP roots"
+        );
+        app.mcp_bridge
+            .set_permission(McpBridgePermission::ReadWrite);
+        app.mcp_bridge.set_destructive_actions_allowed(true);
+
+        let call_mcp = |app: &mut NmrWorkbenchApp, id: u64, name: &str, args: serde_json::Value| {
+            let req = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "tools/call",
+                "params": { "name": name, "arguments": args }
+            });
+            app.mcp_bridge
+                .handle_jsonrpc_bytes(req.to_string().as_bytes())
+                .expect("JSON-RPC response")["result"]
+                .clone()
+        };
+
+        // Exfiltrating ~/.config/gh/hosts.yml via set_sequence must be denied fail-closed
+        let exfil = call_mcp(
+            &mut app,
+            1,
+            "run_workbench_workflow",
+            serde_json::json!({
+                "action": "set_sequence",
+                "sequence_path": hosts_yml.to_string_lossy(),
+                "confirm": true
+            }),
+        );
+        assert_eq!(exfil["isError"], true);
+        let exfil_body: serde_json::Value =
+            serde_json::from_str(exfil["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(exfil_body["error_kind"], "no_allowed_roots");
+        app.apply_pending_mcp_bridge_commands();
+        assert!(
+            app.sequence.is_empty(),
+            "failed exfiltration must not populate sequence"
+        );
+
+        // export_results and load_study_folder must also be denied fail-closed
+        let export_denied = call_mcp(
+            &mut app,
+            2,
+            "run_workbench_workflow",
+            serde_json::json!({
+                "action": "export_results",
+                "prefix": fake_home.0.join("drop").to_string_lossy(),
+                "format": "nef",
+                "overwrite": true
+            }),
+        );
+        assert_eq!(export_denied["isError"], true);
+        let study_denied = call_mcp(
+            &mut app,
+            3,
+            "run_workbench_workflow",
+            serde_json::json!({
+                "action": "load_study_folder",
+                "path": fake_home.0.to_string_lossy(),
+                "confirm": true
+            }),
+        );
+        assert_eq!(study_denied["isError"], true);
+        app.apply_pending_mcp_bridge_commands();
+        assert!(!fake_home.0.join("drop.nef").exists());
+
+        // Real $HOME set as ingest_panel.root_path must NEVER become an automatic root
+        if let Some(home_os) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))
+        {
+            let home_p = std::path::PathBuf::from(home_os);
+            if home_p.is_dir() {
+                app.ingest_panel.root_path = Some(home_p);
+                app.sync_mcp_bridge_snapshot_and_viewport();
+                assert!(
+                    app.mcp_bridge.approved_roots().is_empty(),
+                    "$HOME must never become an automatic MCP sandbox root"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_mcp_e2e_p1_10_all_destructive_actions_gated_end_to_end() {
+        use super::*;
+        use nmr_gui::mcp_bridge::McpBridgePermission;
+
+        struct TempDirGuard(std::path::PathBuf);
+        impl TempDirGuard {
+            fn new(tag: &str) -> Self {
+                static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let raw = std::env::temp_dir().join(format!(
+                    "ferric_gui_p1_10_{tag}_{}_{}",
+                    std::process::id(),
+                    n
+                ));
+                std::fs::create_dir_all(&raw).expect("create temp test dir");
+                Self(std::fs::canonicalize(&raw).expect("canonicalize temp test dir"))
+            }
+        }
+        impl Drop for TempDirGuard {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        let sandbox = TempDirGuard::new("sandbox");
+        let study_dir = sandbox.0.join("study_ubq");
+        std::fs::create_dir_all(&study_dir).expect("create study dir");
+        std::fs::write(study_dir.join("seq.fasta"), ">MINI\nMQIFVK\n").expect("write study fasta");
+
+        let mut app = make_headless_test_app();
+        app.mcp_bridge
+            .set_approved_roots([sandbox.0.as_path()])
+            .expect("approve sandbox");
+        app.mcp_bridge
+            .set_permission(McpBridgePermission::ReadWrite);
+
+        let call_mcp = |app: &mut NmrWorkbenchApp, id: u64, name: &str, args: serde_json::Value| {
+            let req = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "tools/call",
+                "params": { "name": name, "arguments": args }
+            });
+            app.mcp_bridge
+                .handle_jsonrpc_bytes(req.to_string().as_bytes())
+                .expect("JSON-RPC response")["result"]
+                .clone()
+        };
+
+        // 1. set_sequence on an EMPTY workspace works without destructive confirmation
+        let init_seq = call_mcp(
+            &mut app,
+            1,
+            "run_workbench_workflow",
+            serde_json::json!({
+                "action": "set_sequence",
+                "sequence": "MQIFVKTLTG"
+            }),
+        );
+        assert_ne!(init_seq["isError"], true);
+        app.apply_pending_mcp_bridge_commands();
+        app.sync_mcp_bridge_snapshot_and_viewport();
+        assert_eq!(app.sequence.len(), 10);
+
+        // Save a real .nef session inside sandbox so LoadSessionNef can be tested end-to-end
+        let sess_prefix = sandbox.0.join("saved_session");
+        app.export_prefix = sess_prefix.to_string_lossy().into_owned();
+        app.sync_mcp_bridge_snapshot_and_viewport();
+        let save_nef = call_mcp(
+            &mut app,
+            2,
+            "dispatch_workbench_action",
+            serde_json::json!({ "action": "save_session_nef", "overwrite": true }),
+        );
+        assert_ne!(save_nef["isError"], true);
+        app.apply_pending_mcp_bridge_commands();
+        assert!(sess_prefix.with_extension("nef").exists());
+
+        // 2. LoadUbiquitinDemo, LoadSessionNef, ResetWorkspace, load_study_folder, and replacing
+        //    set_sequence MUST ALL be denied when allow_destructive_actions=false or confirm!=true
+        let blocked_picker = call_mcp(
+            &mut app,
+            3,
+            "dispatch_workbench_action",
+            serde_json::json!({ "action": "load_path_or_spectrum", "confirm": true }),
+        );
+        assert_eq!(blocked_picker["isError"], true);
+
+        for (id, tool, args) in [
+            (
+                10,
+                "dispatch_workbench_action",
+                serde_json::json!({ "action": "load_ubiquitin_demo", "confirm": true }),
+            ),
+            (
+                11,
+                "dispatch_workbench_action",
+                serde_json::json!({ "action": "load_session_nef", "confirm": true }),
+            ),
+            (
+                12,
+                "dispatch_workbench_action",
+                serde_json::json!({ "action": "reset_workspace", "confirm": true }),
+            ),
+            (
+                13,
+                "run_workbench_workflow",
+                serde_json::json!({
+                    "action": "load_study_folder",
+                    "path": study_dir.to_string_lossy(),
+                    "confirm": true
+                }),
+            ),
+            (
+                14,
+                "run_workbench_workflow",
+                serde_json::json!({
+                    "action": "set_sequence",
+                    "sequence": "AAAA",
+                    "confirm": true
+                }),
+            ),
+        ] {
+            let resp = call_mcp(&mut app, id, tool, args);
+            assert_eq!(
+                resp["isError"], true,
+                "expected destructive_action_denied for id={id}: {resp}"
+            );
+            app.apply_pending_mcp_bridge_commands();
+            assert_eq!(
+                app.sequence.len(),
+                10,
+                "denied destructive action id={id} must leave sequence untouched"
+            );
+        }
+
+        // Enable destructive actions, but omit confirm -> all must fail with confirmation_required
+        app.mcp_bridge.set_destructive_actions_allowed(true);
+        for (id, tool, args) in [
+            (
+                20,
+                "dispatch_workbench_action",
+                serde_json::json!({ "action": "load_ubiquitin_demo" }),
+            ),
+            (
+                21,
+                "dispatch_workbench_action",
+                serde_json::json!({ "action": "load_session_nef" }),
+            ),
+            (
+                22,
+                "dispatch_workbench_action",
+                serde_json::json!({ "action": "reset_workspace" }),
+            ),
+            (
+                23,
+                "run_workbench_workflow",
+                serde_json::json!({
+                    "action": "load_study_folder",
+                    "path": study_dir.to_string_lossy()
+                }),
+            ),
+            (
+                24,
+                "run_workbench_workflow",
+                serde_json::json!({
+                    "action": "set_sequence",
+                    "sequence": "AAAA"
+                }),
+            ),
+        ] {
+            let resp = call_mcp(&mut app, id, tool, args);
+            assert_eq!(
+                resp["isError"], true,
+                "expected confirmation_required for id={id}: {resp}"
+            );
+            app.apply_pending_mcp_bridge_commands();
+            assert_eq!(
+                app.sequence.len(),
+                10,
+                "unconfirmed destructive action id={id} must leave sequence untouched"
+            );
+        }
+
+        // 3. With BOTH allow_destructive_actions=true AND confirm=true, each executes cleanly
+        let ok_demo = call_mcp(
+            &mut app,
+            30,
+            "dispatch_workbench_action",
+            serde_json::json!({ "action": "load_ubiquitin_demo", "confirm": true }),
+        );
+        assert_ne!(ok_demo["isError"], true);
+        app.apply_pending_mcp_bridge_commands();
+        app.sync_mcp_bridge_snapshot_and_viewport();
+        assert_eq!(app.sequence.len(), 76);
+
+        let ok_load_nef = call_mcp(
+            &mut app,
+            31,
+            "dispatch_workbench_action",
+            serde_json::json!({ "action": "load_session_nef", "confirm": true }),
+        );
+        assert_ne!(ok_load_nef["isError"], true);
+        app.apply_pending_mcp_bridge_commands();
+        app.sync_mcp_bridge_snapshot_and_viewport();
+        assert_eq!(app.sequence.len(), 10);
+
+        let ok_replace_seq = call_mcp(
+            &mut app,
+            32,
+            "run_workbench_workflow",
+            serde_json::json!({
+                "action": "set_sequence",
+                "sequence": "GAVLI",
+                "confirm": true
+            }),
+        );
+        assert_ne!(ok_replace_seq["isError"], true);
+        app.apply_pending_mcp_bridge_commands();
+        app.sync_mcp_bridge_snapshot_and_viewport();
+        assert_eq!(app.sequence.len(), 5);
+
+        let ok_study = call_mcp(
+            &mut app,
+            33,
+            "run_workbench_workflow",
+            serde_json::json!({
+                "action": "load_study_folder",
+                "path": study_dir.to_string_lossy(),
+                "confirm": true
+            }),
+        );
+        assert_ne!(ok_study["isError"], true);
+        app.apply_pending_mcp_bridge_commands();
+        app.sync_mcp_bridge_snapshot_and_viewport();
+
+        let ok_reset = call_mcp(
+            &mut app,
+            34,
+            "dispatch_workbench_action",
+            serde_json::json!({ "action": "reset_workspace", "confirm": true }),
+        );
+        assert_ne!(ok_reset["isError"], true);
+        app.apply_pending_mcp_bridge_commands();
+        assert!(app.sequence.is_empty());
+        assert!(app.peaks.is_empty());
+    }
+
+    #[test]
+    fn test_rebuild_systems_hungarian_claude_counterexample_and_ambiguous_tie() {
+        use nmr_core::peaks::Peak;
+
+        // 1. Claude's exact counterexample:
+        //    Old A = 8.000 (ALA2, locked, conf 0.94), Old B = 8.020 (SER3, locked, conf 0.81)
+        //    New A' = 8.015, New B' = 8.035 (uniform +0.015 ppm shift).
+        //    Greedy closest-first erroneously matched B -> A' (dH=0.005) and dropped A & B'.
+        //    Hungarian matching must uniquely match A -> A' and B -> B'.
+        let mut app = make_headless_test_app();
+        app.sequence = vec![
+            "MET".to_string(),
+            "ALA".to_string(),
+            "SER".to_string(),
+            "GLY".to_string(),
+        ];
+        app.seq_ids = vec![1, 2, 3, 4];
+        app.peaks = vec![
+            Peak {
+                exp: "HSQC".to_string(),
+                h: 8.000,
+                n: 120.00,
+                c: None,
+                h2: None,
+                sign: 1,
+                height: Some(100.0),
+                volume: None,
+            },
+            Peak {
+                exp: "HSQC".to_string(),
+                h: 8.020,
+                n: 120.00,
+                c: None,
+                h2: None,
+                sign: 1,
+                height: Some(95.0),
+                volume: None,
+            },
+        ];
+        app.rebuild_systems_and_matrices();
+        assert_eq!(app.systems.len(), 2);
+        app.assign_res = Some(nmr_core::solver::AssignResult {
+            position: vec![1, 2],
+            confidence: vec![0.94, 0.81],
+            score: 0.0,
+            run_scores: Vec::new(),
+        });
+        app.session.state.locked_residues.insert(0, 1);
+        app.session.state.locked_residues.insert(1, 2);
+        app.rebuild_systems_and_matrices();
+
+        // Shift both peaks by +0.015 ppm -> 8.015 and 8.035
+        app.peaks[0].h = 8.015;
+        app.peaks[1].h = 8.035;
+        app.rebuild_systems_and_matrices();
+        assert_eq!(app.systems.len(), 2);
+        let idx_a_prime = app
+            .systems
+            .iter()
+            .position(|s| (s.h - 8.015).abs() < 1e-4)
+            .expect("A' at 8.015");
+        let idx_b_prime = app
+            .systems
+            .iter()
+            .position(|s| (s.h - 8.035).abs() < 1e-4)
+            .expect("B' at 8.035");
+        let ar = app.assign_res.as_ref().expect("assign_res preserved");
+        assert_eq!(
+            ar.position[idx_a_prime], 1,
+            "A' (0.015) must inherit A's label (ALA2=1), NOT B's label"
+        );
+        assert_eq!(
+            ar.position[idx_b_prime], 2,
+            "B' (0.035) must inherit B's label (SER3=2)"
+        );
+        assert!((ar.confidence[idx_a_prime] - 0.94).abs() < 1e-6);
+        assert!((ar.confidence[idx_b_prime] - 0.81).abs() < 1e-6);
+        assert_eq!(
+            app.session.state.locked_residues.get(&idx_a_prime).copied(),
+            Some(1)
+        );
+        assert_eq!(
+            app.session.state.locked_residues.get(&idx_b_prime).copied(),
+            Some(2)
+        );
+
+        // 2. Exact-tie ambiguity refusal:
+        //    Old A at 8.015 (ALA2) & Old B at 8.035 (SER3) replaced by a single equidistant peak
+        //    at 8.025 -> neither label may be silently guessed.
+        app.peaks = vec![Peak {
+            exp: "HSQC".to_string(),
+            h: 8.025,
+            n: 120.00,
+            c: None,
+            h2: None,
+            sign: 1,
+            height: Some(100.0),
+            volume: None,
+        }];
+        app.rebuild_systems_and_matrices();
+        assert_eq!(app.systems.len(), 1);
+        let ar_tie = app.assign_res.as_ref().expect("assign_res updated");
+        assert_eq!(
+            ar_tie.position,
+            vec![-1],
+            "equidistant exact-tie peak must refuse ambiguous remap"
+        );
+        assert!(
+            app.session.state.locked_residues.is_empty(),
+            "equidistant exact-tie peak must clear ambiguous locks"
         );
     }
 }
