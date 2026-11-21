@@ -591,7 +591,7 @@ const WILKS_HALF_CHI2_1_95: f64 = 1.920_729_410_347_062;
 /// (`Rotnitzky & Jewell, Biometrika 1990, 77, 485–497`; `Varin, Reid & Firth, Stat. Sinica 2011, 21, 5–42`;
 /// `Gross & Vitells, Eur. Phys. J. C 2010, 70, 525–530`):
 /// $$\Delta\ell_{\text{crit}} = \lambda_{\text{Godambe}}\left[\ln(N_{\text{grid,eff}}) + \frac{1}{2}\chi^2_{1,0.95}\right], \qquad \lambda_{\text{Godambe}} = s_{\text{harm}}^2\,\frac{1}{n}\sum_{i=1}^n h_i.$$
-fn fit_1d_unlabelled_marginal_offset(
+pub(crate) fn fit_1d_unlabelled_marginal_offset(
     obs_sorted: &[f64],
     model_sorted: &[(f64, f64)],
     range_ppm: f64,
@@ -3518,7 +3518,7 @@ impl StrUpperHelper for str {
 
 /// Compute primary-sequence Shannon AA entropy (bits), max single-AA fraction, max single-dipeptide
 /// fraction, and top-3 cumulative dipeptide repeat fraction for IDP low-complexity QC gating.
-fn sequence_complexity_metrics(sequence: &[String]) -> (f64, f64, f64, f64) {
+pub fn sequence_complexity_metrics(sequence: &[String]) -> (f64, f64, f64, f64) {
     let norm = normalize_seq_3(sequence);
     let k_len = norm.len();
     if k_len == 0 {
@@ -4525,6 +4525,58 @@ pub fn idp_to_reference(
 // RD-10 & RD-13: CAS + H(CC)CON + HNCO->HNCACB + (H)N(CA)CON / HN(CA)CONH Links
 // ============================================================================
 
+/// Shared `HNCACB` `i` vs `i-1` disambiguation helper (`P2-3`):
+/// 1) Filters out peaks corroborated as `(i-1)` by `prev_list` or `hncocacb_c` (backfilling
+///    `prev_list` when empty);
+/// 2) When no `(i-1)` reference matched, uses relative `1J` vs `2J` intensity (`>= 1.35x`) to
+///    separate intraresidue `(i)` from preceding `(i-1)` while keeping ambiguous equal-height
+///    doublets ordered by intensity.
+pub(crate) fn select_hncacb_intra_and_backfill_prev(
+    hits: &[(f64, f64)],
+    prev_list: &mut Vec<f64>,
+    hncocacb_c: &[f64],
+    tol_p: f64,
+) -> Vec<f64> {
+    if hits.is_empty() {
+        return Vec::new();
+    }
+    let is_known_prev = |v: f64, prev: &[f64]| -> bool {
+        prev.iter().any(|&p| (p - v).abs() <= tol_p)
+            || hncocacb_c.iter().any(|&p| (p - v).abs() <= tol_p)
+    };
+    let mut filt: Vec<(f64, f64)> = Vec::new();
+    let mut matched_prev_any = false;
+    for &(v, sc) in hits {
+        if is_known_prev(v, prev_list) {
+            matched_prev_any = true;
+            if prev_list.is_empty() {
+                prev_list.push(v);
+            }
+        } else {
+            filt.push((v, sc));
+        }
+    }
+    if matched_prev_any {
+        if !filt.is_empty() {
+            if filt.len() >= 2 && filt[0].1 >= 1.35 * filt[1].1 {
+                return vec![filt[0].0];
+            }
+            return filt.into_iter().take(2).map(|(v, _)| v).collect();
+        }
+        return vec![hits[0].0];
+    }
+    if hits.len() >= 2 && (hits[0].0 - hits[1].0).abs() > 0.25 {
+        if hits[0].1 >= 1.35 * hits[1].1 {
+            if prev_list.is_empty() {
+                prev_list.push(hits[1].0);
+            }
+            return vec![hits[0].0];
+        }
+        return vec![hits[0].0, hits[1].0];
+    }
+    hits.iter().take(1).map(|&(v, _)| v).collect()
+}
+
 /// Summary statistics from matching `HNCO -> HNCACB` onto `CON` roots (`RD-10`).
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct IdpHncoHncacbLinkStats {
@@ -4679,58 +4731,10 @@ pub fn attach_hnco_hncacb_to_con_systems(
             }
         }
 
-        let is_known_prev = |v: f64, prev_list: &[f64], tol_p: f64| -> bool {
-            prev_list.iter().any(|&p| (p - v).abs() <= tol_p)
-                || hncocacb_c.iter().any(|&p| (p - v).abs() <= tol_p)
-        };
-
-        // Separate intraresidue (i) from sequential (i-1) peaks using:
-        // 1) Explicit (i-1) corroboration from H(CC)CON/CBCACON or HN(CO)CACB;
-        // 2) Relative intensity (1J intra is stronger than 2J sequential) when no i-1 ref filtered peaks.
-        let select_intra_and_backfill_prev =
-            |hits: &[(f64, f64)], prev_list: &mut Vec<f64>, tol_p: f64| -> Vec<f64> {
-                if hits.is_empty() {
-                    return Vec::new();
-                }
-                let mut filt: Vec<(f64, f64)> = Vec::new();
-                let mut matched_prev_any = false;
-                for &(v, sc) in hits {
-                    if is_known_prev(v, prev_list, tol_p) {
-                        matched_prev_any = true;
-                        // Backfill sys.*_prev from HN(CO)CACB cross-check when empty
-                        if prev_list.is_empty() {
-                            prev_list.push(v);
-                        }
-                    } else {
-                        filt.push((v, sc));
-                    }
-                }
-                if matched_prev_any {
-                    if !filt.is_empty() {
-                        if filt.len() >= 2 && filt[0].1 >= 1.35 * filt[1].1 {
-                            return vec![filt[0].0];
-                        }
-                        return filt.into_iter().take(2).map(|(v, _)| v).collect();
-                    }
-                    // All HNCACB peaks coincided with i-1 (degenerate i == i-1): keep strongest peak only
-                    return vec![hits[0].0];
-                }
-                // No i-1 reference available: distinguish stronger 1J intra peak from weaker 2J i-1 peak
-                if hits.len() >= 2 && (hits[0].0 - hits[1].0).abs() > 0.25 {
-                    if hits[0].1 >= 1.35 * hits[1].1 {
-                        if prev_list.is_empty() {
-                            prev_list.push(hits[1].0);
-                        }
-                        return vec![hits[0].0];
-                    }
-                    // Ambiguous equal-height doublet with no i-1 ref: retain at most top 2 ordered by intensity
-                    return vec![hits[0].0, hits[1].0];
-                }
-                hits.iter().take(1).map(|&(v, _)| v).collect()
-            };
-
-        let ca_src = select_intra_and_backfill_prev(&ca_hits, &mut sys.ca_prev, 0.18);
-        let cb_src = select_intra_and_backfill_prev(&cb_hits, &mut sys.cb_prev, 0.22);
+        let ca_src =
+            select_hncacb_intra_and_backfill_prev(&ca_hits, &mut sys.ca_prev, &hncocacb_c, 0.18);
+        let cb_src =
+            select_hncacb_intra_and_backfill_prev(&cb_hits, &mut sys.cb_prev, &hncocacb_c, 0.22);
 
         let mut any_added = false;
         for v in ca_src {

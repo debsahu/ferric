@@ -55,6 +55,10 @@ use nmr_core::idp_solver::{
     pick_hncacon_nn_coadded, register_and_build_con_dipeptide_systems,
     summarize_idp_cas_residue_typing, ConDipeptideSystem, IdpAssignResult, IdpSolverConfig,
 };
+use nmr_core::joint_idp_solver::{
+    assign_joint_idp_cpu, joint_idp_to_reference, DirectionalNnPeak, JointIdpConfig,
+    JointIdpDataset, JointIdpResult, CANONICAL_TROSY_FALLBACK_MHZ,
+};
 use nmr_core::nef::{read_nef_file, write_nef_file, write_nef_str, NefDocument};
 use nmr_core::neural_picker::{
     run_e2e_blind_benchmark, E2eBenchmarkConfig, NeuralPicker, NeuralPickerConfig,
@@ -188,6 +192,7 @@ pub enum RegimeKind {
     #[default]
     Globular,
     Idp13C,
+    IdpJoint,
     Paramagnetic,
 }
 
@@ -228,7 +233,7 @@ fn usage() -> String {
        ferric fetch-bmrb      --id <bmrb_id> [--dest <dir>] [--dry-run] [--all-archives] [--max-bytes <bytes>]\n\
        ferric process         --in <fid_dir> --out <path_or_dir> [--exp <EXP>] [--recipe <json>] [--crop-h 5.5:11.5] [--no-crop] [--lp] [--auto-phase] [--phase-x P0:P1] [--phase-y P0:P1] [--phase-z P0:P1] [--hilbert] [--nus-method fista|ist]\n\
        ferric e2e-benchmark   [--star data/fixtures/synthetic_ubiquitin.str] [--noise 1.0] [--seed 42]\n\
-       ferric assign          [--peaks <peaks.tsv>] (--seq <SEQ|fasta> | --star <ref.str>) --out <prefix> [--regime globular|idp-13c|paramagnetic] [--hncacb-polarity auto|cb-negative|cb-positive] [--roots all|hnco] [--cas X=path ...] [--af-structure <model.cif|pdb>] [--af-pae <pae.json>] [--noesy-15n <noesy.tsv|nef>] [--af-weight 0.65] [--af-clamp-nats 4.0] [--metal-ligands <SPEC>] [--r-bleach 11.0] [--pdb <model.pdb>] [--pcs <pcs.tsv>] [--temp-k 298.15] [--ph <f64>] [--con <path>] [--caco <path>] [--canco <path>] [--cbcacon <path>] [--cccon <path>] [--ncaco <path>] [--hncacon <path> ...] [--hncaconh <path>] [--solver evo-graph|standard|bayes-sa] [--engine auto|gpu|cpu] [--runs 16] [--steps 1500] [--assign-cost 0.0] [--no-auto-ref] [--locks <SPEC>] [--json-out <path>] [--nef-out <path>] [--report-out <path>] [--priors priors.json] [-v]\n\
+       ferric assign          [--peaks <peaks.tsv>] [--hsqc <path>] (--seq <SEQ|fasta> | --star <ref.str>) --out <prefix> [--regime globular|idp-13c|idp-joint|paramagnetic] [--hncacb-polarity auto|cb-negative|cb-positive] [--roots all|hnco] [--cas X=path ...] [--af-structure <model.cif|pdb>] [--af-pae <pae.json>] [--noesy-15n <noesy.tsv|nef>] [--af-weight 0.65] [--af-clamp-nats 4.0] [--metal-ligands <SPEC>] [--r-bleach 11.0] [--pdb <model.pdb>] [--pcs <pcs.tsv>] [--temp-k 298.15] [--ph <f64>] [--con <path>] [--caco <path>] [--canco <path>] [--cbcacon <path>] [--cccon <path>] [--ncaco <path>] [--hncacon <path> ...] [--hncaconh <path>] [--solver evo-graph|standard|bayes-sa] [--engine auto|gpu|cpu] [--runs 16] [--steps 1500] [--assign-cost 0.0] [--no-auto-ref] [--locks <SPEC>] [--json-out <path>] [--nef-out <path>] [--report-out <path>] [--priors priors.json] [-v]\n\
        ferric propensity      --shifts <assigned.str|assigned.nef> [--temp-k 298.15] [--ph <f64>] [--format tsv|json] [-o <out_path>]\n\
        ferric torsions        --shifts <assigned.str|assigned.nef> -o <out.tsv|out.nef|out.json> [--include-chi1] [--exclude-pdb <ids>] [--exclude-bmrb <ids>] [--exclude-topology <id>]\n\
        ferric af-validate     --structure <model.cif|model.pdb> [--pae <pae.json>] --shifts <assigned.str|assigned.nef> [--s2 <modelfree.tsv>] [--fetch-uniprot <id> --cache-dir <dir>] [--exclude-pdb <ids>] [--exclude-bmrb <ids>] [-o <out.json|out.tsv|report.html>]\n\
@@ -252,7 +257,7 @@ fn usage() -> String {
        ferric nef-import      --in <project.nef> [--out-star <shifts.str>] [--out-peaks <peaks.tsv>]\n\
        ferric nef-export      --star <shifts.str> [--peaks <peaks.tsv>] --out <project.nef> [--name <entry>]\n\
        ferric report          --star|--shifts <shifts.str|shifts.nef> [--peaks <peaks.tsv>] [--pdb <ensemble.pdb>] [--rdc <rdcs.tsv|rdcs.nef>] [--idp-propensity] [--temp-k 298.15] [--ph <f64>] --out <report.html> [--title <name>]\n\
-       ferric pipeline        (--seq <SEQ|fasta> (--hsqc <path> [--triple EXP=path ...] | --fid-hsqc <dir> [--fid-triple EXP=dir ...] | --fid <dir> | --peaks <peaks.tsv>) | --star <entry.str> | --nef <project.nef>) --out-dir <dir> [--regime globular|idp-13c|paramagnetic] [--hncacb-polarity auto|cb-negative|cb-positive] [--roots all|hnco] [--cas X=path ...] [--hncacon <path> ...] [--hncaconh <path>] [--metal-ligands <SPEC>] [--pdb <model.pdb>] [--pcs <pcs.tsv>] [--temp-k 298.15] [--ph <f64>] [--idp-propensity] [--recipe <json>] [--no-crop] [--lp] [--auto-phase] [--solver evo-graph|standard|bayes-sa] [--no-auto-ref] [--locks <SPEC>] [--method classical|neural] [--engine auto|gpu|cpu] [--fold] [--pdb-ref <ref.pdb>]\n\
+       ferric pipeline        (--seq <SEQ|fasta> (--hsqc <path> [--triple EXP=path ...] | --fid-hsqc <dir> [--fid-triple EXP=dir ...] | --fid <dir> | --peaks <peaks.tsv>) | --star <entry.str> | --nef <project.nef>) --out-dir <dir> [--regime globular|idp-13c|idp-joint|paramagnetic] [--hncacb-polarity auto|cb-negative|cb-positive] [--roots all|hnco] [--cas X=path ...] [--hncacon <path> ...] [--hncaconh <path>] [--metal-ligands <SPEC>] [--pdb <model.pdb>] [--pcs <pcs.tsv>] [--temp-k 298.15] [--ph <f64>] [--idp-propensity] [--recipe <json>] [--no-crop] [--lp] [--auto-phase] [--solver evo-graph|standard|bayes-sa] [--no-auto-ref] [--locks <SPEC>] [--method classical|neural] [--engine auto|gpu|cpu] [--fold] [--pdb-ref <ref.pdb>]\n\
        ferric serve           [--bind 127.0.0.1:8080] [--storage ./jobs]\n\
        ferric mcp             [--transport stdio|http] [--root <dir> ...] [--mode read-only|read-write] [--bind 127.0.0.1:<port>] [--token <bearer>]\n\
        ferric mcp-config      --client antigravity|claude-desktop|cursor [--root <dir> ...] [--mode read-only|read-write] [--bridge-port <port>] [-o <out.json>]\n\
@@ -318,9 +323,10 @@ pub(crate) fn parse_regime(val: &str) -> Result<RegimeKind, String> {
     match val.trim().to_ascii_lowercase().as_str() {
         "globular" => Ok(RegimeKind::Globular),
         "idp-13c" | "idp_13c" | "idp13c" => Ok(RegimeKind::Idp13C),
+        "idp-joint" | "idp_joint" | "idpjoint" => Ok(RegimeKind::IdpJoint),
         "paramagnetic" => Ok(RegimeKind::Paramagnetic),
         other => Err(format!(
-            "unknown --regime {other:?}; expected globular, idp-13c, or paramagnetic"
+            "unknown --regime {other:?}; expected globular, idp-13c, idp-joint, or paramagnetic"
         )),
     }
 }
@@ -2761,6 +2767,393 @@ pub(crate) fn execute_idp_13c_workflow_with_extras(
     })
 }
 
+pub(crate) struct JointIdpWorkflowOutput {
+    pub(crate) result: JointIdpResult,
+    pub(crate) pred: Reference,
+    pub(crate) conf: BTreeMap<usize, f64>,
+    pub(crate) engine_label: String,
+    pub(crate) star_header: String,
+}
+
+fn is_hn_triple_name(exp_raw: &str) -> bool {
+    let norm: String = exp_raw
+        .trim()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .map(|c| c.to_ascii_uppercase())
+        .collect();
+    matches!(
+        norm.as_str(),
+        "HSQC"
+            | "15NHSQC"
+            | "BESTHSQC"
+            | "SOFAST"
+            | "HNCO"
+            | "HNCACO"
+            | "HNCACB"
+            | "CBCACONH"
+            | "HNCOCACB"
+            | "HNCA"
+            | "HNCOCA"
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn load_joint_idp_dataset_from_cli(
+    peaks_paths: &[PathBuf],
+    hsqc_path: Option<&Path>,
+    con_path: Option<&Path>,
+    caco_path: Option<&Path>,
+    canco_path: Option<&Path>,
+    cbcacon_path: Option<&Path>,
+    cccon_path: Option<&Path>,
+    ncaco_path: Option<&Path>,
+    triples: &[(String, PathBuf)],
+    hncacon_cli_paths: &[PathBuf],
+    hncaconh_cli_paths: &[PathBuf],
+    cas_specs: &[String],
+    snr: f32,
+) -> Result<JointIdpDataset, String> {
+    let mut hn_peaks: Vec<Peak> = Vec::new();
+    let mut c13_ds = C13PickedDataset::default();
+    let mut proton_mhz = CANONICAL_TROSY_FALLBACK_MHZ;
+
+    let mut c13_triples: Vec<(String, PathBuf)> = Vec::new();
+    let mut hn_triples: Vec<(String, PathBuf)> = Vec::new();
+    let mut hncacon_paths: Vec<PathBuf> = hncacon_cli_paths.to_vec();
+    let mut hncaconh_paths: Vec<PathBuf> = hncaconh_cli_paths.to_vec();
+
+    for (exp_raw, path) in triples {
+        let norm: String = exp_raw
+            .trim()
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric())
+            .map(|c| c.to_ascii_uppercase())
+            .collect();
+        match norm.as_str() {
+            "HNCACON" | "NCACON" | "HACANCACON" => hncacon_paths.push(path.clone()),
+            "HNCACONH" | "BTHNCACONH" => hncaconh_paths.push(path.clone()),
+            _ if is_hn_triple_name(&norm) => hn_triples.push((norm, path.clone())),
+            _ => c13_triples.push((exp_raw.clone(), path.clone())),
+        }
+    }
+
+    // 1. Parse `--peaks` files (may contain 1H triple-resonance peaks, 13C-detected peaks, or both)
+    for pp in peaks_paths {
+        let txt = fs::read_to_string(pp)
+            .map_err(|e| format!("failed to read peaks {}: {e}", pp.display()))?;
+        let mut parsed_any = false;
+        if let Ok(hn_sub) = nmr_core::peaks::read_peaks_str(&txt) {
+            if !hn_sub.is_empty() {
+                hn_peaks.extend(hn_sub);
+                parsed_any = true;
+            }
+        }
+        if let Ok(c13_sub) = parse_c13_detected_tsv_str(&txt, None) {
+            if !c13_sub.con_roots.is_empty()
+                || !c13_sub.caco_peaks.is_empty()
+                || !c13_sub.strip_peaks.is_empty()
+            {
+                merge_c13_datasets(&mut c13_ds, c13_sub);
+                parsed_any = true;
+            }
+        }
+        if !parsed_any {
+            return Err(format!(
+                "no valid 1H or 13C peaks could be parsed from {}",
+                pp.display()
+            ));
+        }
+    }
+
+    // 2. Load optional 2D HSQC (`--hsqc`)
+    if let Some(hp) = hsqc_path {
+        if is_probable_peak_tsv(hp) {
+            hn_peaks.extend(read_peaks(hp)?);
+        } else {
+            let sp2 = load_2d_spectrum_any(hp)?;
+            if sp2.axis_x.obs_mhz.is_finite() && sp2.axis_x.obs_mhz > 50.0 {
+                proton_mhz = sp2.axis_x.obs_mhz;
+            }
+            let pcfg = PickerConfig {
+                snr_threshold: snr,
+                ..PickerConfig::default()
+            };
+            hn_peaks.extend(pick_hsqc_2d(&sp2, &pcfg));
+        }
+    }
+
+    // 3. Load 1H triple-resonance `--triple` entries (`HNCO`, `HNCACO`, `HNCACB`, `CBCACONH`, ...)
+    let hsqc_roots: Vec<Peak> = hn_peaks
+        .iter()
+        .filter(|p| p.exp == "HSQC")
+        .cloned()
+        .collect();
+    for (exp_norm, path) in hn_triples {
+        let canon_exp = match exp_norm.as_str() {
+            "HNCOCACB" => "CBCACONH".to_string(),
+            other => other.to_string(),
+        };
+        if is_probable_peak_tsv(&path) {
+            for mut p in read_peaks(&path)? {
+                if p.exp.is_empty() {
+                    p.exp = canon_exp.clone();
+                }
+                hn_peaks.push(p);
+            }
+        } else {
+            let sp3 = load_3d_spectrum_any(&path, &canon_exp)?;
+            if sp3.axis_x.obs_mhz.is_finite() && sp3.axis_x.obs_mhz > 50.0 {
+                proton_mhz = sp3.axis_x.obs_mhz;
+            }
+            let pcfg = PickerConfig {
+                snr_threshold: snr,
+                ..PickerConfig::default()
+            };
+            for mut p in pick_triple_3d(&sp3, &hsqc_roots, &pcfg) {
+                p.exp = canon_exp.clone();
+                hn_peaks.push(p);
+            }
+        }
+    }
+
+    // 4. Load optional 13C-detected spectra (`--con`, `--caco`, `--canco`, `--cbcacon`, `--cccon`, `--ncaco`, 13C `--triple`)
+    let has_c13_flags = con_path.is_some()
+        || caco_path.is_some()
+        || canco_path.is_some()
+        || cbcacon_path.is_some()
+        || cccon_path.is_some()
+        || ncaco_path.is_some()
+        || !c13_triples.is_empty();
+    if has_c13_flags {
+        let sub_c13 = load_c13_input_bundle(
+            &[],
+            con_path,
+            caco_path,
+            canco_path,
+            cbcacon_path,
+            cccon_path,
+            ncaco_path,
+            &c13_triples,
+            snr,
+        )?;
+        merge_c13_datasets(&mut c13_ds, sub_c13);
+    }
+
+    // 5. Load `--cas`, directional `(H)N(CA)CON`, and reciprocal `BT_HNCACONH`
+    let mut cas_spectra = Vec::with_capacity(cas_specs.len());
+    for spec in cas_specs {
+        cas_spectra.push(load_cas_spectrum_from_cli(spec, snr)?);
+    }
+
+    let mut hncacon_nn_edges: Vec<DirectionalNnPeak> = Vec::new();
+    let mut hncacon_cubes: Vec<Spectrum3D> = Vec::new();
+    for np in &hncacon_paths {
+        if is_probable_peak_tsv(np) {
+            let parsed = parse_hncacon_tsv_links(np, &c13_ds.con_roots)?;
+            for (r_idx, links) in parsed.into_iter().enumerate() {
+                if let Some(root) = c13_ds.con_roots.get(r_idx) {
+                    for (n_prev, snr_v) in links {
+                        hncacon_nn_edges.push(DirectionalNnPeak {
+                            c_prev_ppm: root.c_prev_ppm,
+                            n_curr_ppm: root.n_curr_ppm,
+                            n_prev_ppm: n_prev,
+                            snr: snr_v,
+                        });
+                    }
+                }
+            }
+        } else {
+            hncacon_cubes.push(load_3d_spectrum_any(np, "HNCACON")?);
+        }
+    }
+    if !hncacon_cubes.is_empty() && !c13_ds.con_roots.is_empty() {
+        let cube_refs: Vec<&Spectrum3D> = hncacon_cubes.iter().collect();
+        let coadded = pick_hncacon_nn_coadded(&cube_refs, &c13_ds.con_roots, (snr as f64).max(3.5));
+        for (r_idx, links) in coadded.into_iter().enumerate() {
+            if let Some(root) = c13_ds.con_roots.get(r_idx) {
+                for (n_prev, snr_v) in links {
+                    hncacon_nn_edges.push(DirectionalNnPeak {
+                        c_prev_ppm: root.c_prev_ppm,
+                        n_curr_ppm: root.n_curr_ppm,
+                        n_prev_ppm: n_prev,
+                        snr: snr_v,
+                    });
+                }
+            }
+        }
+    }
+
+    let mut reciprocal_nn_pairs: Vec<(f64, f64)> = Vec::new();
+    let amide_roots: Vec<(f64, f64)> = hn_peaks
+        .iter()
+        .filter(|p| p.exp == "HNCO" || p.exp == "HSQC")
+        .map(|p| (p.h, p.n))
+        .collect();
+    for bp in &hncaconh_paths {
+        if is_probable_peak_tsv(bp) {
+            reciprocal_nn_pairs.extend(parse_hncaconh_tsv_pairs(bp)?);
+        } else if !amide_roots.is_empty() {
+            let sp3 = load_3d_spectrum_any(bp, "HNCACONH")?;
+            reciprocal_nn_pairs.extend(extract_reciprocal_hncaconh_pairs(
+                &sp3,
+                &amide_roots,
+                (snr as f64).max(4.0),
+            ));
+        } else {
+            eprintln!(
+                "Warning: --hncaconh {} skipped because no 1H amide roots were provided to anchor 3D HN(CA)CONH strips.",
+                bp.display()
+            );
+        }
+    }
+
+    if hn_peaks.is_empty() && c13_ds.con_roots.is_empty() {
+        return Err(
+            "assign --regime idp-joint requires 1H-detected peaks (--peaks / --hsqc / --triple) and/or 2D CON roots (--con)"
+                .to_string(),
+        );
+    }
+
+    Ok(JointIdpDataset {
+        hn_peaks,
+        c13_dataset: c13_ds,
+        cas_spectra,
+        hncacon_nn_edges,
+        hncaconh_peaks: Vec::new(),
+        reciprocal_nn_pairs,
+        proton_mhz,
+        user_locks: Vec::new(),
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn execute_idp_joint_workflow(
+    dataset: &JointIdpDataset,
+    sequence: &[String],
+    seq_ids: &[i32],
+    engine_req: EngineRequest,
+    temp_k: f64,
+    ph_opt: Option<f64>,
+    hncacb_polarity: HncacbPolarity,
+    auto_reference: bool,
+    runs: Option<usize>,
+    steps: Option<usize>,
+    seed: u64,
+) -> Result<JointIdpWorkflowOutput, String> {
+    if !temp_k.is_finite() || !(250.0..=360.0).contains(&temp_k) {
+        return Err(format!(
+            "invalid --temp-k {temp_k}: expected finite temperature in 250..=360 K"
+        ));
+    }
+    if let Some(ph) = ph_opt {
+        if !ph.is_finite() || !(1.0..=12.0).contains(&ph) {
+            return Err(format!(
+                "invalid --ph {ph}: expected finite pH in 1.0..=12.0"
+            ));
+        }
+    }
+
+    // Fail closed on explicit `--engine gpu` (`180.core:P1-4`; no silent CPU fallback!)
+    let engine_label = match engine_req {
+        EngineRequest::Gpu => {
+            return Err(
+                "--engine gpu is not supported with --regime idp-joint (CPU-only); use --engine cpu or --engine auto (no silent CPU fallback per docs/specs/14-regime-solvers.md)"
+                    .to_string(),
+            );
+        }
+        EngineRequest::Auto => {
+            eprintln!(
+                "Warning: --regime idp-joint is CPU-only; falling back to CPU (f64) unified joint IDP solver under --engine auto."
+            );
+            "idp-joint CPU (f64, auto-fallback)".to_string()
+        }
+        EngineRequest::Cpu => "idp-joint CPU (f64)".to_string(),
+    };
+
+    let mut cfg = JointIdpConfig {
+        temperature_k: temp_k,
+        ph: ph_opt.unwrap_or(6.5),
+        proton_mhz: dataset.proton_mhz,
+        hncacb_polarity,
+        auto_reference_offset: auto_reference,
+        seed,
+        ..JointIdpConfig::default()
+    };
+    if let Some(r) = runs {
+        cfg.replicas = r.max(4);
+    }
+    if let Some(st) = steps {
+        cfg.steps_per_system = st.max(200);
+    }
+
+    let result = assign_joint_idp_cpu(dataset, sequence, &cfg)?;
+    if let Some(ref hint) = result.auto_ref_report.tms_reference_hint {
+        eprintln!("[idp-joint] hint: {hint}");
+    }
+    for rsn in &result.qc_reasons {
+        eprintln!("[idp-joint] QC: {rsn}");
+    }
+
+    let (pred, conf) = joint_idp_to_reference(&result, sequence, seq_ids);
+    let (pro_ok, pro_tot) = result.proline_bridge_recovery;
+    let star_header = format!(
+        "# ferric solver: {engine_label}\n\
+         # regime: idp-joint (temp_k={temp_k:.2}, ph={:.2}, pro_bridges={pro_ok}/{pro_tot}, xval={}, hn_only={}, con_only={})\n\
+         # qc_verdict: {}\n\
+         # fitted_offsets (peak_ppm - BMRB_prior_ppm): dCA={:+.3}, dCB={:+.3}, dC={:+.3}, dN={:+.3} ppm",
+        cfg.ph,
+        result.n_cross_validated_hn_con,
+        result.n_hn_route_only,
+        result.n_con_route_only,
+        result.qc_verdict,
+        result.fitted_offsets.d_ca,
+        result.fitted_offsets.d_cb,
+        result.fitted_offsets.d_c,
+        result.fitted_offsets.d_n
+    );
+
+    Ok(JointIdpWorkflowOutput {
+        result,
+        pred,
+        conf,
+        engine_label,
+        star_header,
+    })
+}
+
+fn render_joint_idp_json(wf: &JointIdpWorkflowOutput) -> Result<String, String> {
+    let n_hc = wf.conf.values().filter(|&&c| c >= 0.8).count();
+    let payload = serde_json::json!({
+        "regime": "idp-joint",
+        "engine": wf.engine_label,
+        "qc_verdict": wf.result.qc_verdict.as_str(),
+        "qc_reasons": wf.result.qc_reasons,
+        "score": wf.result.score,
+        "pass1_score": wf.result.pass1_score,
+        "pass2_score_gain": wf.result.pass2_score_gain,
+        "n_nodes": wf.result.nodes.len(),
+        "n_residues_with_shifts": wf.conf.len(),
+        "n_high_confidence": n_hc,
+        "proline_bridge_recovery": {
+            "assigned": wf.result.proline_bridge_recovery.0,
+            "total": wf.result.proline_bridge_recovery.1,
+        },
+        "route_support": {
+            "cross_validated_hn_and_con": wf.result.n_cross_validated_hn_con,
+            "hn_route_only": wf.result.n_hn_route_only,
+            "con_pro_bridges": wf.result.n_con_pro_bridges,
+            "con_route_only": wf.result.n_con_route_only,
+        },
+        "fitted_offsets": wf.result.fitted_offsets,
+        "trosy_calibration": wf.result.trosy_calibration,
+        "proline_bridges": wf.result.proline_bridge_summaries(),
+        "cterm_anchors": wf.result.cterm_anchor_summaries(),
+        "residue_assignments": wf.result.residue_assignments,
+    });
+    serde_json::to_string_pretty(&payload).map_err(|e| format!("failed to serialize json: {e}"))
+}
+
 type PdbAtomCoordsBundle = (BTreeMap<(i32, String), Vec3>, Vec<Vec3>, Vec<Vec3>);
 
 fn cluster_metal_atoms_single_linkage(atoms: &[Vec3], cutoff_angstrom: f64) -> Vec<Vec3> {
@@ -3320,6 +3713,8 @@ fn cmd_assign(args: &[String]) -> Result<(), String> {
     let mut priors_path: Option<String> = None;
     let mut first_seq_id = 1i32;
     let mut regime = RegimeKind::Globular;
+    let mut regime_explicit = false;
+    let mut hsqc_path: Option<PathBuf> = None;
     let mut metal_ligands_spec: Option<String> = None;
     let mut r_bleach_opt: Option<f64> = None;
     let mut pdb_path: Option<PathBuf> = None;
@@ -3397,6 +3792,11 @@ fn cmd_assign(args: &[String]) -> Result<(), String> {
             "--regime" => {
                 i += 1;
                 regime = parse_regime(args.get(i).ok_or("missing --regime")?)?;
+                regime_explicit = true;
+            }
+            "--hsqc" => {
+                i += 1;
+                hsqc_path = Some(PathBuf::from(args.get(i).ok_or("missing --hsqc")?));
             }
             "--metal-ligands" => {
                 i += 1;
@@ -3602,12 +4002,26 @@ fn cmd_assign(args: &[String]) -> Result<(), String> {
         i += 1;
     }
 
+    // Auto-select `idp-joint` when `--regime` was omitted and BOTH `1H`-amide (`--peaks`/`--hsqc`/HN `--triple`)
+    // and `2D CON` (`--con`) inputs are supplied (`180.core:P1-4`).
+    if !regime_explicit && con_path.is_some() {
+        let has_hn_input = hsqc_path.is_some()
+            || !peaks_paths.is_empty()
+            || c13_triples.iter().any(|(exp, _)| is_hn_triple_name(exp));
+        if has_hn_input {
+            regime = RegimeKind::IdpJoint;
+            eprintln!(
+                "[auto-regime] Detected both 1H-amide and 2D CON inputs; auto-selecting --regime idp-joint."
+            );
+        }
+    }
+
     af_opts.validate(regime, solver)?;
 
     if regime != RegimeKind::Paramagnetic {
         if pdb_path.is_some() {
             return Err(
-                "--pdb is only supported with --regime paramagnetic (globular and idp-13c backbone assignment are strictly structure-free)"
+                "--pdb is only supported with --regime paramagnetic (globular, idp-13c, and idp-joint backbone assignment are strictly structure-free)"
                     .to_string(),
             );
         }
@@ -3621,7 +4035,8 @@ fn cmd_assign(args: &[String]) -> Result<(), String> {
             return Err("--r-bleach is only supported with --regime paramagnetic".to_string());
         }
     }
-    if regime != RegimeKind::Idp13C {
+    let is_idp_regime = matches!(regime, RegimeKind::Idp13C | RegimeKind::IdpJoint);
+    if !is_idp_regime {
         let has_c13_spectra = con_path.is_some()
             || caco_path.is_some()
             || canco_path.is_some()
@@ -3633,21 +4048,23 @@ fn cmd_assign(args: &[String]) -> Result<(), String> {
             || !c13_triples.is_empty();
         if has_c13_spectra {
             return Err(
-                "13C-detected spectrum flags (--con, --caco, --canco, --cbcacon, --cccon, --ncaco, --hncacon, --hncaconh, --triple) are only supported with --regime idp-13c"
+                "13C-detected spectrum flags (--con, --caco, --canco, --cbcacon, --cccon, --ncaco, --hncacon, --hncaconh, --triple) are only supported with --regime idp-13c or idp-joint"
                     .to_string(),
             );
         }
         if temp_k_explicit {
             return Err(
-                "--temp-k is only supported with --regime idp-13c in `ferric assign`".to_string(),
+                "--temp-k is only supported with --regime idp-13c or idp-joint in `ferric assign`"
+                    .to_string(),
             );
         }
         if ph_opt.is_some() {
             return Err(
-                "--ph is only supported with --regime idp-13c in `ferric assign`".to_string(),
+                "--ph is only supported with --regime idp-13c or idp-joint in `ferric assign`"
+                    .to_string(),
             );
         }
-    } else {
+    } else if regime == RegimeKind::Idp13C {
         if solver_explicit {
             return Err(
                 "--solver is not supported with --regime idp-13c (idp-13c uses its dedicated CON-dipeptide multi-replica annealer)"
@@ -3668,6 +4085,22 @@ fn cmd_assign(args: &[String]) -> Result<(), String> {
                 "--no-auto-ref / --locks / --tol-* are not supported with --regime idp-13c"
                     .to_string(),
             );
+        }
+    } else {
+        if solver_explicit {
+            return Err(
+                "--solver is not supported with --regime idp-joint (idp-joint uses its unified joint HN+CON multi-stage annealer)"
+                    .to_string(),
+            );
+        }
+        if priors_path.is_some() {
+            return Err(
+                "--priors is not supported with --regime idp-joint (idp-joint uses sequence-specific ncIDP random-coil priors)"
+                    .to_string(),
+            );
+        }
+        if assign_cost_explicit {
+            return Err("--assign-cost is not supported with --regime idp-joint".to_string());
         }
     }
 
@@ -3724,6 +4157,95 @@ fn cmd_assign(args: &[String]) -> Result<(), String> {
                 wf.result.qc_verdict,
                 wf.systems.len(),
                 wf.conf.len(),
+                wf.result.fitted_offsets.d_ca,
+                wf.result.fitted_offsets.d_cb,
+                wf.result.fitted_offsets.d_c,
+                wf.result.fitted_offsets.d_n,
+            );
+            println!("wrote {} and {}", str_out.display(), tsv_out.display());
+            Ok(())
+        }
+        RegimeKind::IdpJoint => {
+            let dataset = load_joint_idp_dataset_from_cli(
+                &peaks_paths,
+                hsqc_path.as_deref(),
+                con_path.as_deref(),
+                caco_path.as_deref(),
+                canco_path.as_deref(),
+                cbcacon_path.as_deref(),
+                cccon_path.as_deref(),
+                ncaco_path.as_deref(),
+                &c13_triples,
+                &hncacon_paths,
+                &hncaconh_paths,
+                &cas_specs,
+                snr,
+            )?;
+            let engine_req = engine_req_opt.unwrap_or(EngineRequest::Auto);
+            let t_solve = Instant::now();
+            let wf = execute_idp_joint_workflow(
+                &dataset,
+                &sequence,
+                &seq_ids,
+                engine_req,
+                temp_k,
+                ph_opt,
+                hncacb_polarity,
+                auto_reference,
+                runs,
+                steps,
+                seed,
+            )?;
+            let dt_solve = t_solve.elapsed().as_secs_f64();
+            write_star_with_header(&str_out, &wf.pred, Some(&wf.conf), Some(&wf.star_header))?;
+            write_shifts_tsv(&tsv_out, &wf.pred, &wf.conf)?;
+
+            if let Some(ref jp) = json_out_path {
+                if let Some(parent) = jp.parent() {
+                    if !parent.as_os_str().is_empty() {
+                        fs::create_dir_all(parent).map_err(|e| format!("{e}"))?;
+                    }
+                }
+                let json_txt = render_joint_idp_json(&wf)?;
+                fs::write(jp, format!("{json_txt}\n"))
+                    .map_err(|e| format!("failed to write {}: {e}", jp.display()))?;
+            }
+            if let Some(ref np) = nef_out_path {
+                let nef_doc = NefDocument::from_reference_and_peaks(
+                    "idp_joint",
+                    &wf.pred,
+                    Some(&wf.conf),
+                    &dataset.hn_peaks,
+                );
+                write_nef_file(np, &nef_doc)?;
+            }
+            if let Some(ref rp) = report_out_path {
+                let mut rep = ReportInput::new("idp_joint", wf.pred.clone(), wf.conf.clone());
+                rep.n_peaks = Some(
+                    dataset.hn_peaks.len()
+                        + dataset.c13_dataset.con_roots.len()
+                        + dataset.c13_dataset.strip_peaks.len(),
+                );
+                rep.n_spin_systems = Some(wf.result.nodes.len());
+                rep.solver_score = Some(wf.result.score);
+                rep.elapsed_secs = Some(dt_solve);
+                rep.engine_label = Some(wf.engine_label.clone());
+                let prop_cfg = build_propensity_config(temp_k, ph_opt)?;
+                rep = rep.with_propensity_report(compute_idp_propensity(&wf.pred, &prop_cfg));
+                write_quality_report_html(rp, &rep)?;
+            }
+
+            let n_hc = wf.conf.values().filter(|&&c| c >= 0.8).count();
+            let (pro_ok, pro_tot) = wf.result.proline_bridge_recovery;
+            println!(
+                "[{}] regime=idp-joint QC={} | {} unified nodes; {} residues with shifts ({n_hc} with confidence >= 0.8; {pro_ok}/{pro_tot} Pro bridged; XVal={}, HN={}, CON={}) | offsets: dCA={:+.3}, dCB={:+.3}, dC={:+.3}, dN={:+.3} ppm",
+                wf.engine_label,
+                wf.result.qc_verdict,
+                wf.result.nodes.len(),
+                wf.conf.len(),
+                wf.result.n_cross_validated_hn_con,
+                wf.result.n_hn_route_only,
+                wf.result.n_con_route_only,
                 wf.result.fitted_offsets.d_ca,
                 wf.result.fitted_offsets.d_cb,
                 wf.result.fitted_offsets.d_c,
@@ -7020,6 +7542,7 @@ fn cmd_pipeline(args: &[String]) -> Result<(), String> {
     let mut hncacb_polarity = HncacbPolarity::Auto;
     let mut root_mode = RootSelectionMode::All;
     let mut regime = RegimeKind::Globular;
+    let mut regime_explicit = false;
     let mut metal_ligands_spec: Option<String> = None;
     let mut r_bleach_opt: Option<f64> = None;
     let mut pdb_para_path: Option<PathBuf> = None;
@@ -7076,6 +7599,7 @@ fn cmd_pipeline(args: &[String]) -> Result<(), String> {
             "--regime" => {
                 i += 1;
                 regime = parse_regime(args.get(i).ok_or("missing --regime")?)?;
+                regime_explicit = true;
             }
             "--metal-ligands" => {
                 i += 1;
@@ -7354,7 +7878,14 @@ fn cmd_pipeline(args: &[String]) -> Result<(), String> {
         i += 1;
     }
 
-    if regime == RegimeKind::Idp13C {
+    let has_hn_input_for_auto = hsqc_path.is_some()
+        || peaks_path.is_some()
+        || triples.iter().any(|(exp, _)| is_hn_triple_name(exp));
+    if !regime_explicit && con_path.is_some() && has_hn_input_for_auto {
+        regime = RegimeKind::IdpJoint;
+    }
+
+    if matches!(regime, RegimeKind::Idp13C | RegimeKind::IdpJoint) {
         report_opts.include_idp_propensity_track = true;
     }
     if regime != RegimeKind::Paramagnetic {
@@ -7371,7 +7902,7 @@ fn cmd_pipeline(args: &[String]) -> Result<(), String> {
             return Err("--r-bleach is only supported with --regime paramagnetic".to_string());
         }
     }
-    if regime != RegimeKind::Idp13C {
+    if !matches!(regime, RegimeKind::Idp13C | RegimeKind::IdpJoint) {
         let has_c13_flag = con_path.is_some()
             || caco_path.is_some()
             || canco_path.is_some()
@@ -7380,30 +7911,31 @@ fn cmd_pipeline(args: &[String]) -> Result<(), String> {
             || ncaco_path.is_some()
             || !hncacon_paths.is_empty()
             || !hncaconh_paths.is_empty()
+            || !cas_specs.is_empty()
             || triples
                 .iter()
                 .any(|(exp, _)| C13DetectedExp::from_name(exp).is_some());
         if has_c13_flag {
             return Err(
-                "13C-detected spectrum flags (--con, --caco, --canco, --cbcacon, --cccon, --ncaco, --hncacon, --hncaconh) are only supported with --regime idp-13c"
+                "13C-detected spectrum flags (--con, --caco, --canco, --cbcacon, --cccon, --ncaco, --hncacon, --hncaconh, --cas) require --regime idp-13c or --regime idp-joint"
                     .to_string(),
             );
         }
         if !report_opts.include_idp_propensity_track {
             if temp_k_explicit {
                 return Err(
-                    "--temp-k in `ferric pipeline` requires --regime idp-13c or --idp-propensity"
+                    "--temp-k in `ferric pipeline` requires --regime idp-13c, --regime idp-joint, or --idp-propensity"
                         .to_string(),
                 );
             }
             if report_opts.ph.is_some() {
                 return Err(
-                    "--ph in `ferric pipeline` requires --regime idp-13c or --idp-propensity"
+                    "--ph in `ferric pipeline` requires --regime idp-13c, --regime idp-joint, or --idp-propensity"
                         .to_string(),
                 );
             }
         }
-    } else {
+    } else if regime == RegimeKind::Idp13C {
         if solver_explicit {
             return Err("--solver is not supported with --regime idp-13c".to_string());
         }
@@ -7425,7 +7957,7 @@ fn cmd_pipeline(args: &[String]) -> Result<(), String> {
             || !fid_triples.is_empty()
         {
             return Err(
-                "1H-detected --hsqc / --fid / --fid-hsqc / --fid-triple flags are not supported with --regime idp-13c"
+                "1H-detected --hsqc / --fid / --fid-hsqc / --fid-triple flags are not supported with --regime idp-13c (use --regime idp-joint for combined 1H + 13C IDP)"
                     .to_string(),
             );
         }
@@ -7444,6 +7976,44 @@ fn cmd_pipeline(args: &[String]) -> Result<(), String> {
         if method_explicit || prob_explicit {
             return Err(
                 "--method / --prob 1H neural-picker flags are not supported with --regime idp-13c"
+                    .to_string(),
+            );
+        }
+    } else {
+        // RegimeKind::IdpJoint
+        if solver_explicit {
+            return Err("--solver is not supported with --regime idp-joint".to_string());
+        }
+        if priors_path.is_some() {
+            return Err("--priors is not supported with --regime idp-joint".to_string());
+        }
+        if assign_cost_explicit {
+            return Err("--assign-cost is not supported with --regime idp-joint".to_string());
+        }
+        if locks_spec.is_some() || tol_overrides.is_any() {
+            return Err("--locks / --tol-* are not supported with --regime idp-joint".to_string());
+        }
+        if fid_bundle_path.is_some() || fid_hsqc_path.is_some() || !fid_triples.is_empty() {
+            return Err(
+                "--fid / --fid-hsqc / --fid-triple raw-FID flags are not supported with --regime idp-joint in `ferric pipeline` (process spectra first or supply Bruker pdata / NMRPipe / TSV inputs)"
+                    .to_string(),
+            );
+        }
+        if fold || pdb_ref_path.is_some() || noesy_peaks_path.is_some() {
+            return Err(
+                "--fold / --pdb-ref / --noesy-peaks globular NOESY folding flags are not supported with --regime idp-joint"
+                    .to_string(),
+            );
+        }
+        if nef_path.is_some() {
+            return Err(
+                "--nef input is not supported with --regime idp-joint in `ferric pipeline` (use --seq or --star)"
+                    .to_string(),
+            );
+        }
+        if method_explicit || prob_explicit {
+            return Err(
+                "--method / --prob neural-picker flags are not supported with --regime idp-joint"
                     .to_string(),
             );
         }
@@ -7595,6 +8165,115 @@ fn cmd_pipeline(args: &[String]) -> Result<(), String> {
             star_out.display(),
             tsv_out.display(),
             peaks_out.display(),
+            prop_out.display(),
+            nef_out.display(),
+            html_out.display()
+        );
+        return Ok(());
+    }
+
+    if regime == RegimeKind::IdpJoint {
+        let t_total = Instant::now();
+        let (sequence, seq_ids, project_name) = if let Some(sq) = &seq_arg {
+            let (s, ids) = parse_sequence_arg(sq, first_seq_id)?;
+            let nm = name_arg.unwrap_or_else(|| "idp_joint_pipeline".to_string());
+            (s, ids, nm)
+        } else if let Some(sp) = &star_path {
+            let r = read_star_all_atoms(sp, None)?;
+            let nm = name_arg.unwrap_or_else(|| {
+                sp.file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("idp_joint_pipeline")
+                    .to_string()
+            });
+            (r.sequence, r.seq_ids, nm)
+        } else {
+            return Err("pipeline --regime idp-joint requires --seq or --star".to_string());
+        };
+
+        let pp_vec: Vec<PathBuf> = peaks_path.into_iter().collect();
+        let dataset = load_joint_idp_dataset_from_cli(
+            &pp_vec,
+            hsqc_path.as_deref(),
+            con_path.as_deref(),
+            caco_path.as_deref(),
+            canco_path.as_deref(),
+            cbcacon_path.as_deref(),
+            cccon_path.as_deref(),
+            ncaco_path.as_deref(),
+            &triples,
+            &hncacon_paths,
+            &hncaconh_paths,
+            &cas_specs,
+            snr,
+        )?;
+
+        let t_solve = Instant::now();
+        let wf = execute_idp_joint_workflow(
+            &dataset,
+            &sequence,
+            &seq_ids,
+            engine_req_opt.unwrap_or(EngineRequest::Auto),
+            report_opts.temp_k,
+            report_opts.ph,
+            hncacb_polarity,
+            auto_reference,
+            runs,
+            steps,
+            seed,
+        )?;
+        let dt_solve = t_solve.elapsed().as_secs_f64();
+
+        let star_out = dir.join("shifts.str");
+        let tsv_out = dir.join("shifts.tsv");
+        let json_out = dir.join("joint_summary.json");
+        let nef_out = dir.join("result.nef");
+        let html_out = dir.join("report.html");
+        let prop_out = dir.join("propensity.tsv");
+
+        write_star_with_header(&star_out, &wf.pred, Some(&wf.conf), Some(&wf.star_header))?;
+        write_shifts_tsv(&tsv_out, &wf.pred, &wf.conf)?;
+        let json_txt = render_joint_idp_json(&wf)?;
+        fs::write(&json_out, format!("{json_txt}\n")).map_err(|e| format!("{e}"))?;
+        let nef_doc = NefDocument::from_reference_and_peaks(
+            &project_name,
+            &wf.pred,
+            Some(&wf.conf),
+            &dataset.hn_peaks,
+        );
+        write_nef_file(&nef_out, &nef_doc)?;
+
+        let prop_cfg = build_propensity_config(report_opts.temp_k, report_opts.ph)?;
+        let prop_rep = compute_idp_propensity(&wf.pred, &prop_cfg);
+        fs::write(&prop_out, format!("{}\n", format_propensity_tsv(&prop_rep)))
+            .map_err(|e| format!("{e}"))?;
+
+        let mut rep = ReportInput::new(&project_name, wf.pred.clone(), wf.conf.clone());
+        rep.n_peaks = Some(
+            dataset.hn_peaks.len()
+                + dataset.c13_dataset.con_roots.len()
+                + dataset.c13_dataset.strip_peaks.len(),
+        );
+        rep.n_spin_systems = Some(wf.result.nodes.len());
+        rep.solver_score = Some(wf.result.score);
+        rep.elapsed_secs = Some(dt_solve);
+        rep.engine_label = Some(wf.engine_label.clone());
+        rep.dihedrals = predict_csi_dihedrals(&wf.pred);
+        rep = rep.with_propensity_report(prop_rep);
+        write_quality_report_html(&html_out, &rep)?;
+
+        let dt_total = t_total.elapsed().as_secs_f64();
+        let (pro_ok, pro_tot) = wf.result.proline_bridge_recovery;
+        println!(
+            "[{}] Pipeline '{}' (idp-joint, QC={}, Pro={pro_ok}/{pro_tot}) completed in {:.2}s (solve {:.2}s) -> {}, {}, {}, {}, {}, {}",
+            wf.engine_label,
+            project_name,
+            wf.result.qc_verdict,
+            dt_total,
+            dt_solve,
+            star_out.display(),
+            tsv_out.display(),
+            json_out.display(),
             prop_out.display(),
             nef_out.display(),
             html_out.display()
@@ -10508,6 +11187,247 @@ seq#\tresidue\tH\tN\tC\tCA\tsidechains
             dir_err.contains("cacon") && dir_err.contains("canco"),
             "unexpected CAS direction error: {dir_err}"
         );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_v180_idp_joint_cli_regime_auto_select_and_gpu_fail_closed() {
+        assert_eq!(parse_regime("idp-joint").unwrap(), RegimeKind::IdpJoint);
+        assert_eq!(parse_regime("idp_joint").unwrap(), RegimeKind::IdpJoint);
+        assert_eq!(parse_regime("idpjoint").unwrap(), RegimeKind::IdpJoint);
+
+        let dir = env::temp_dir().join(format!("nmr_cli_v180_idp_joint_{}", process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let hn_tsv = dir.join("hn_peaks.tsv");
+        fs::write(
+            &hn_tsv,
+            "experiment\th\tn\tx\tintensity\n\
+             HSQC\t8.20\t124.20\t\t1000\n\
+             HSQC\t8.35\t115.80\t\t1000\n\
+             HSQC\t8.10\t113.50\t\t1000\n\
+             HSQC\t8.25\t121.00\t\t1000\n\
+             HNCO\t8.20\t124.20\t174.50\t900\n\
+             HNCO\t8.35\t115.80\t177.20\t900\n\
+             HNCO\t8.10\t113.50\t174.80\t900\n\
+             HNCO\t8.25\t121.00\t176.20\t900\n\
+             HNCACB\t8.20\t124.20\t52.60\t800\n\
+             HNCACB\t8.20\t124.20\t19.20\t-700\n\
+             HNCACB\t8.35\t115.80\t58.30\t800\n\
+             HNCACB\t8.35\t115.80\t63.90\t-700\n\
+             HNCACB\t8.25\t121.00\t56.70\t800\n\
+             HNCACB\t8.25\t121.00\t30.10\t-700\n",
+        )
+        .unwrap();
+
+        let con_tsv = dir.join("con.tsv");
+        fs::write(
+            &con_tsv,
+            "exp\tc_prev\tn_curr\theight\n\
+             CON\t174.50\t124.20\t1000\n\
+             CON\t177.20\t115.80\t1000\n\
+             CON\t174.80\t113.50\t1000\n\
+             CON\t173.10\t137.00\t1000\n\
+             CON\t176.20\t121.00\t1000\n",
+        )
+        .unwrap();
+
+        let cas_tsv = dir.join("cacon_ser.tsv");
+        fs::write(&cas_tsv, "c_prime\tn15\theight\n174.80\t113.50\t900\n").unwrap();
+
+        let out_prefix = dir.join("out_joint");
+        let json_out = dir.join("joint.json");
+
+        // 1. Explicit --engine gpu MUST fail closed on cmd_assign
+        let gpu_err = cmd_assign(&[
+            "--regime".into(),
+            "idp-joint".into(),
+            "--peaks".into(),
+            hn_tsv.to_string_lossy().into_owned(),
+            "--con".into(),
+            con_tsv.to_string_lossy().into_owned(),
+            "--seq".into(),
+            "MASTPE".into(),
+            "--engine".into(),
+            "gpu".into(),
+            "--runs".into(),
+            "4".into(),
+            "--steps".into(),
+            "200".into(),
+            "--out".into(),
+            out_prefix.to_string_lossy().into_owned(),
+        ])
+        .expect_err("--regime idp-joint --engine gpu must fail closed on cmd_assign");
+        assert!(
+            gpu_err.contains("--engine gpu") && gpu_err.contains("idp-joint"),
+            "unexpected gpu error: {gpu_err}"
+        );
+
+        // 2. Explicit --engine gpu MUST fail closed on cmd_pipeline
+        let pipe_dir = dir.join("pipe_joint");
+        let pipe_gpu_err = cmd_pipeline(&[
+            "--regime".into(),
+            "idp-joint".into(),
+            "--peaks".into(),
+            hn_tsv.to_string_lossy().into_owned(),
+            "--con".into(),
+            con_tsv.to_string_lossy().into_owned(),
+            "--seq".into(),
+            "MASTPE".into(),
+            "--engine".into(),
+            "gpu".into(),
+            "--runs".into(),
+            "4".into(),
+            "--steps".into(),
+            "200".into(),
+            "--out-dir".into(),
+            pipe_dir.to_string_lossy().into_owned(),
+        ])
+        .expect_err("--regime idp-joint --engine gpu must fail closed on cmd_pipeline");
+        assert!(
+            pipe_gpu_err.contains("--engine gpu") && pipe_gpu_err.contains("idp-joint"),
+            "unexpected pipeline gpu error: {pipe_gpu_err}"
+        );
+
+        // 3. Auto-select idp-joint when --regime is omitted and both HN (--peaks) and --con are given
+        cmd_assign(&[
+            "--peaks".into(),
+            hn_tsv.to_string_lossy().into_owned(),
+            "--con".into(),
+            con_tsv.to_string_lossy().into_owned(),
+            "--cas".into(),
+            format!("cacon_ser={}", cas_tsv.display()),
+            "--seq".into(),
+            "MASTPE".into(),
+            "--engine".into(),
+            "auto".into(),
+            "--runs".into(),
+            "4".into(),
+            "--steps".into(),
+            "200".into(),
+            "--json-out".into(),
+            json_out.to_string_lossy().into_owned(),
+            "--out".into(),
+            out_prefix.to_string_lossy().into_owned(),
+        ])
+        .expect("auto-selected idp-joint cmd_assign must succeed");
+
+        let json_txt = fs::read_to_string(&json_out).unwrap();
+        assert!(
+            json_txt.contains("\"regime\": \"idp-joint\""),
+            "expected regime idp-joint in json output: {json_txt}"
+        );
+        assert!(
+            json_txt.contains("\"proline_bridge_recovery\""),
+            "expected proline_bridge_recovery in json output: {json_txt}"
+        );
+        assert!(
+            dir.join("out_joint.str").exists() && dir.join("out_joint.tsv").exists(),
+            "expected .str and .tsv outputs from idp-joint assign"
+        );
+
+        // 4. Auto-select idp-joint on cmd_pipeline
+        cmd_pipeline(&[
+            "--peaks".into(),
+            hn_tsv.to_string_lossy().into_owned(),
+            "--con".into(),
+            con_tsv.to_string_lossy().into_owned(),
+            "--seq".into(),
+            "MASTPE".into(),
+            "--engine".into(),
+            "cpu".into(),
+            "--runs".into(),
+            "4".into(),
+            "--steps".into(),
+            "200".into(),
+            "--out-dir".into(),
+            pipe_dir.to_string_lossy().into_owned(),
+        ])
+        .expect("auto-selected idp-joint cmd_pipeline must succeed");
+        assert!(
+            pipe_dir.join("shifts.str").exists()
+                && pipe_dir.join("joint_summary.json").exists()
+                && pipe_dir.join("propensity.tsv").exists()
+                && pipe_dir.join("report.html").exists(),
+            "expected full idp-joint pipeline artifacts in {}",
+            pipe_dir.display()
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_v180_clec16a_real_cli_idp_joint_regression() {
+        let Ok(root_str) = env::var("NMR_REAL_DATA_DIR") else {
+            return;
+        };
+        let clec = PathBuf::from(root_str).join("private/clec16a");
+        let fasta = clec.join("clec16a_mouse_892-1050.fasta");
+        let con_dir = clec.join("13C15N_Clec16aIDPR2_MG_091119/10007/pdata/1");
+        let hsqc_dir = clec.join("13C15N_Clec16aIDPR2_MG_021320/9/pdata/1");
+        let hnco_dir = clec.join("13C15N_Clec16aIDPR2_MG_021320/7/pdata/1");
+        let hncacb_dir = clec.join("13C15N_Clec16aIDPR2_MG_021320/10/pdata/1");
+        let hncocacb_dir = clec.join("13C15N_Clec16aIDPR2_MG_021320/11/pdata/1");
+        let cas_ala = clec.join("13C15N_Clec16aIDPR2_MG_091119/10013/pdata/1");
+        let cas_gly = clec.join("13C15N_Clec16aIDPR2_MG_091119/10015/pdata/1");
+        if !fasta.exists() || !con_dir.exists() || !hsqc_dir.exists() {
+            return;
+        }
+
+        let seq_txt = fs::read_to_string(&fasta).unwrap();
+        let seq: String = seq_txt
+            .lines()
+            .filter(|l| !l.starts_with('>'))
+            .flat_map(|l| l.trim().chars())
+            .filter(|c| c.is_ascii_alphabetic())
+            .collect();
+
+        let dir = env::temp_dir().join(format!("nmr_cli_v180_clec16a_joint_{}", process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let out_prefix = dir.join("clec_joint");
+        let json_out = dir.join("clec_joint.json");
+
+        cmd_assign(&[
+            "--regime".into(),
+            "idp-joint".into(),
+            "--seq".into(),
+            seq,
+            "--hsqc".into(),
+            hsqc_dir.to_string_lossy().into_owned(),
+            "--con".into(),
+            con_dir.to_string_lossy().into_owned(),
+            "--triple".into(),
+            format!("HNCO={}", hnco_dir.display()),
+            "--triple".into(),
+            format!("HNCACB={}", hncacb_dir.display()),
+            "--triple".into(),
+            format!("HNCOCACB={}", hncocacb_dir.display()),
+            "--cas".into(),
+            format!("cacon_ala={}", cas_ala.display()),
+            "--cas".into(),
+            format!("cacon_gly={}", cas_gly.display()),
+            "--engine".into(),
+            "cpu".into(),
+            "--runs".into(),
+            "8".into(),
+            "--steps".into(),
+            "2500".into(),
+            "--seed".into(),
+            "0".into(),
+            "--json-out".into(),
+            json_out.to_string_lossy().into_owned(),
+            "--out".into(),
+            out_prefix.to_string_lossy().into_owned(),
+        ])
+        .expect("real Clec16a CLI --regime idp-joint must succeed cleanly");
+
+        let json_txt = fs::read_to_string(&json_out).unwrap();
+        assert!(json_txt.contains("\"regime\": \"idp-joint\""));
+        assert!(dir.join("clec_joint.str").exists());
+        assert!(dir.join("clec_joint.tsv").exists());
 
         let _ = fs::remove_dir_all(&dir);
     }

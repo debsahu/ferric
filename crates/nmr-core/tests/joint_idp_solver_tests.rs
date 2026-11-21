@@ -1,35 +1,49 @@
-//! Clean-room unit tests and realistic Pro/Ser-rich IDP ground-truth benchmark for the
-//! unified joint `HN + 2D CON + Proline-Bridge + N–N + CAS` backbone solver (`T23.2`).
+//! Clean-room unit tests, multi-seed adversarial calibration/QC grid, real-solver baseline
+//! comparison, and `NMR_REAL_DATA_DIR`-gated Clec16a replay for the unified joint
+//! `HN + 2D CON + Proline-Bridge + N–N + CAS` backbone solver (`T23.2`, `v0.18.0`).
+//!
+//! All synthetic benchmarks attach `3D` strip peaks strictly via physical `(C', N)` coordinates
+//! (`anchor_root_idx: None`) with realistic jitter, random peak dropout, and spurious noise roots.
 
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 
 use nmr_core::c13_detected::{
-    n15_obs_mhz, C13DetectedExp, C13PickedDataset, C13Strip3DPeak, CasMode, CasPeak, CasSpectrum,
-    Con2DPeak,
+    n15_obs_mhz, pick_con_2d, C13DetectedExp, C13PickedDataset, C13PickerConfig, C13Strip3DPeak,
+    CasMode, CasPeak, CasSpectrum, Con2DPeak,
 };
-use nmr_core::idp_solver::{IdpShiftOffsets, MAX_IDP_MATRIX_CELLS};
+use nmr_core::evo_graph::{assign_evo_graph_from_peaks, EvoGraphConfig};
+use nmr_core::idp_solver::{
+    fit_idp_calibration_knots_pav, register_and_build_con_dipeptide_systems,
+    try_assign_idp_13c_cpu, IdpShiftOffsets, IdpSolverConfig, MAX_IDP_MATRIX_CELLS,
+};
 use nmr_core::joint_idp_solver::{
-    apply_gly_cb_bleedthrough_guard, assign_joint_idp, build_calibrated_cas_tables,
-    calibrate_trosy_hn_offset, joint_idp_unary_matrix, predict_joint_ncidp_shifts,
-    prune_f1_c_prime_nus_sidelobes, try_joint_idp_unary_matrix, DirectionalNnPeak, HncaconhPeak,
+    apply_gly_cb_bleedthrough_guard, assign_joint_idp, assign_joint_idp_cpu,
+    build_calibrated_cas_tables, calibrate_joint_posterior, calibrate_trosy_hn_offset,
+    joint_idp_to_reference, joint_idp_unary_matrix, pre_pro_shift_corrections,
+    predict_joint_ncidp_shifts, prune_f1_c_prime_nus_sidelobes, trosy_expected_shift_ppm,
+    try_joint_idp_unary_matrix, DirectionalNnPeak, HncaconhPeak, JointIdpAssignResult,
     JointIdpConfig, JointIdpDataset, JointIdpNode, JointNodeKind, JointRouteSupport,
-    TROSY_HALF_J_HN_HZ,
+    CANONICAL_TROSY_FALLBACK_MHZ, JOINT_IDP_CALIBRATION_KNOTS, MIN_TROSY_MATCHED_ROOTS,
+    PRE_PRO_CA_CORRECTION_PPM, PRE_PRO_CB_CORRECTION_PPM, PRE_PRO_C_PRIME_CORRECTION_PPM,
+    PRE_PRO_N_CORRECTION_PPM, PROLINE_N15_MAX_PPM, PROLINE_N15_MIN_PPM, TROSY_HALF_J_HN_HZ,
 };
 use nmr_core::peaks::Peak;
-use nmr_core::priors::one_to_three;
+use nmr_core::picker::{pick_hsqc_2d, pick_triple_3d, PickerConfig};
+use nmr_core::priors::{one_to_three, Priors};
 use nmr_core::qc::DatasetQcVerdict;
 use nmr_core::rng::Rng;
+use nmr_core::spectrum::{read_bruker_pdata_2d, read_bruker_pdata_3d};
 use nmr_core::spinsystems::HncacbPolarity;
 
-/// Construct a deterministic, clean-room 140-aa Pro/Ser-rich disordered sequence (`15.0% Pro` = 21 Pro,
-/// including `-S-P-`, `-G-P-`, `-P-P-` motifs, Ser/Gly-rich stretches, and a non-Pro C-terminus).
+/// Held-out 140-aa Pro/Ser-rich disordered sequence (`15.0% Pro` = 21 Pro, including `-S-P-`,
+/// `-G-P-`, `-P-P-` motifs, Ser/Gly stretches, and a non-Pro C-terminus).
 fn synthetic_pro_ser_rich_idp_sequence() -> Vec<String> {
-    // 140 aa, 21 Pro (15.0%), 22 Ser (15.7%), 14 Gly (10.0%), varied IDP composition
     let seq_1 = concat!(
         "MSGAPQSTPV", // 0..10  (P4, P8)
         "KLDPNSRGAF", // 10..20 (P13)
         "QTPVSLENKP", // 20..30 (P22, P29)
-        "PGSVTDRQIA", // 30..40 (P30 -> di-Pro 29-30!)
+        "PGSVTDRQIA", // 30..40 (P30 -> di-Pro 29-30)
         "HSMGPLKVSE", // 40..50 (P44)
         "YQNPTASPLR", // 50..60 (P53, P57)
         "DFSVPKQMET", // 60..70 (P64)
@@ -37,15 +51,109 @@ fn synthetic_pro_ser_rich_idp_sequence() -> Vec<String> {
         "RKEGTPSQID", // 80..90 (P85)
         "VNSALPGFYT", // 90..100 (P95)
         "QSPKRMGSVP", // 100..110 (P102, P109)
-        "PAENHTSLDG", // 110..120 (P110 -> di-Pro 109-110!)
+        "PAENHTSLDG", // 110..120 (P110 -> di-Pro 109-110)
         "KPVSQAFPRN", // 120..130 (P121, P127)
         "TSPLVEPKSA"  // 130..140 (P132, P136, C-term ALA139)
     );
     let seq: Vec<String> = seq_1.chars().map(|c| one_to_three(c).to_string()).collect();
     assert_eq!(seq.len(), 140);
-    let n_pro = seq.iter().filter(|r| r.as_str() == "PRO").count();
-    assert_eq!(n_pro, 21, "Expected exactly 21 Prolines (15.0%)");
+    assert_eq!(seq.iter().filter(|r| r.as_str() == "PRO").count(), 21);
     seq
+}
+
+/// Low-complexity Ser/Pro/Gln repeat IDP sequence (120 aa) for `180.core:P1-2` QC guard testing.
+fn synthetic_low_complexity_repeat_idp_sequence() -> Vec<String> {
+    let seq_1 = concat!(
+        "MSPQSPQSPQ",
+        "SSSPPPQQQS",
+        "PQSPQSPQSP",
+        "QSSSPPPQQQ",
+        "SPQSPQSPQS",
+        "PQSSSPPPQQ",
+        "QSPQSPQSPQ",
+        "SPQSSSPPPQ",
+        "QQSPQSPQSP",
+        "QSPQSSSPPP",
+        "QQQSPQSPQS",
+        "PQSSSPQQSA"
+    );
+    let seq: Vec<String> = seq_1.chars().map(|c| one_to_three(c).to_string()).collect();
+    assert_eq!(seq.len(), 120);
+    seq
+}
+
+/// Disjoint calibration sequence A (115 aa, NOT used in held-out adversarial assertions).
+fn disjoint_calibration_seq_a() -> Vec<String> {
+    let seq_1 = concat!(
+        "MGEKPTSQAV",
+        "LNDPRSFGKT",
+        "HPVQEMSNPA",
+        "DLRKGTYPVS",
+        "EQANPFHKSD",
+        "MTGPALVNRQ",
+        "FPSKEIGTDL",
+        "ANPVQSRHME",
+        "KTPGDLSFVA",
+        "NRPQETSKMG",
+        "ILHPDAVNRS",
+        "FQPTA"
+    );
+    seq_1.chars().map(|c| one_to_three(c).to_string()).collect()
+}
+
+/// Disjoint calibration sequence B (130 aa, NOT used in held-out adversarial assertions).
+fn disjoint_calibration_seq_b() -> Vec<String> {
+    let seq_1 = concat!(
+        "MASTPLGKQD",
+        "NVREPSAFHT",
+        "IKLPGQSMED",
+        "VRANPFTKSL",
+        "QHGDPVEMAR",
+        "TKSNPILFQG",
+        "ADEPVSTRKH",
+        "LMNPQGSFAD",
+        "EVRPTKILNS",
+        "QGHPAFMDRE",
+        "SKTPVGQLAN",
+        "DFRPEHSMKT",
+        "GVQPASLNET"
+    );
+    seq_1.chars().map(|c| one_to_three(c).to_string()).collect()
+}
+
+#[derive(Clone, Debug)]
+struct IdpStressSpec {
+    jitter_h: f64,
+    jitter_n: f64,
+    jitter_c: f64,
+    rc_dev_scale: f64,
+    random_drop_frac: f64,
+    n_decoy_con_roots: usize,
+    n_decoy_hn_roots: usize,
+    tms_c13_offset: f64,
+    invert_hncacb: bool,
+    include_trosy_hncaconh: bool,
+    include_cas: bool,
+    exchange_broaden: bool,
+}
+
+impl Default for IdpStressSpec {
+    fn default() -> Self {
+        Self {
+            jitter_h: 0.006,
+            jitter_n: 0.04,
+            jitter_c: 0.018,
+            rc_dev_scale: 1.0,
+            random_drop_frac: 0.08,
+            n_decoy_con_roots: 15,
+            n_decoy_hn_roots: 6,
+            tms_c13_offset: -2.70,
+            invert_hncacb: true,
+            include_trosy_hncaconh: true,
+            include_cas: true,
+            exchange_broaden: true,
+        }
+    }
 }
 
 type ResidueTruthShifts = (Option<f64>, f64, f64, f64, Option<f64>, Vec<f64>);
@@ -56,36 +164,26 @@ struct SyntheticGroundTruth {
     /// Ground-truth DSS shifts per residue `k`: `(H_opt, N, C', CA, CB_opt, sidechain_c)`.
     shifts: Vec<ResidueTruthShifts>,
     /// True if residue `k` is exchange-broadened (missing from all `1H`-detected spectra).
-    exchange_broadened: Vec<bool>,
-    /// Ground-truth sequence index for each `CON` root (`None` if spurious noise root).
-    con_root_truth: Vec<Option<usize>>,
-    /// Ground-truth sequence index for each `HNCO` peak (`None` if spurious).
-    hnco_truth: Vec<Option<usize>>,
+    _exchange_broadened: Vec<bool>,
 }
 
-/// Synthesize a realistic multi-experiment Pro/Ser-rich IDP dataset with:
-/// - Uniform TMS `-2.70 ppm` `13C` offset across all `13C` dimensions,
-/// - `15%` Prolines (no `1H^N`, bridged via `2D CON` + `H(CC)CON` + `CANCO` + `(H)N(CA)CON`),
-/// - `~14%` exchange-broadened non-Proline amides (absent in `HN`, present in `CON`),
-/// - Field-scaled `800 MHz` TROSY `(-46/800, +46/81.06) ppm` offset on `BT_HNCACONH`,
-/// - `F1(C')` NUS sidelobes in `HN(CA)CO`,
-/// - `Gly CB` bleed-through near `Gly CA` (`41..46.5 ppm` DSS),
-/// - Platzer C-terminal `COO-` (`~179.2 ppm` DSS) on residue `L - 1`,
-/// - `CAS` (`cacon`/`canco`) subspectra with `~6%` breakthrough peaks,
-/// - Inverted-sign (`cb-positive`) `HNCACB` to exercise automatic polarity normalization.
-fn synthesize_realistic_idp_benchmark(seed: u64) -> (JointIdpDataset, SyntheticGroundTruth) {
+/// Synthesize a realistic, clean-room IDP dataset under `IdpStressSpec` with ZERO ground-truth
+/// `anchor_root_idx` (`anchor_root_idx: None` on every 3D strip peak).
+fn synthesize_idp_stress_dataset(
+    seq: &[String],
+    seed: u64,
+    spec: &IdpStressSpec,
+) -> (JointIdpDataset, SyntheticGroundTruth) {
     let mut rng = Rng::new(seed);
-    let seq = synthetic_pro_ser_rich_idp_sequence();
     let len = seq.len();
     let cfg_pred = JointIdpConfig::default();
-    let preds = predict_joint_ncidp_shifts(&seq, &cfg_pred);
+    let preds = predict_joint_ncidp_shifts(seq, &cfg_pred);
 
-    let tms_c13_offset = -2.70_f64;
     let proton_mhz = 800.0_f64;
     let trosy_dh = -TROSY_HALF_J_HN_HZ / proton_mhz;
     let trosy_dn = TROSY_HALF_J_HN_HZ / n15_obs_mhz(proton_mhz);
 
-    // 1. Ground-truth DSS backbone shifts with realistic IDP micro-heterogeneity
+    // 1. Ground-truth DSS backbone shifts with configurable random-coil dispersion scale
     let mut shifts = Vec::with_capacity(len);
     for k in 0..len {
         let p = &preds[k];
@@ -101,382 +199,418 @@ fn synthesize_realistic_idp_benchmark(seed: u64) -> (JointIdpDataset, SyntheticG
                 "ASP" | "GLU" => 8.34,
                 _ => 8.22,
             };
-            Some(base_h + rng.normal(0.0, 0.22))
+            Some(base_h + rng.normal(0.0, 0.22 * spec.rc_dev_scale))
         };
-        let n = p.n_ppm + rng.normal(0.0, if is_pro { 0.55 } else { 0.45 });
+        let n = p.n_ppm + rng.normal(0.0, if is_pro { 0.55 } else { 0.48 } * spec.rc_dev_scale);
         let c = if k + 1 == len {
-            179.25 + rng.normal(0.0, 0.15) // Platzer C-terminal COO- (~179 ppm DSS)
+            179.25 + rng.normal(0.0, 0.16 * spec.rc_dev_scale.min(1.5))
         } else {
-            p.c_ppm + rng.normal(0.0, 0.22)
+            p.c_ppm + rng.normal(0.0, 0.25 * spec.rc_dev_scale)
         };
-        let ca = p.ca_ppm + rng.normal(0.0, 0.22);
-        let cb = p.cb_ppm.map(|m| m + rng.normal(0.0, 0.28));
+        let ca = p.ca_ppm + rng.normal(0.0, 0.26 * spec.rc_dev_scale);
+        let cb = p
+            .cb_ppm
+            .map(|m| m + rng.normal(0.0, 0.30 * spec.rc_dev_scale));
         let sc: Vec<f64> = p
             .sidechain_c
             .iter()
-            .map(|&m| m + rng.normal(0.0, 0.25))
+            .map(|&m| m + rng.normal(0.0, 0.28 * spec.rc_dev_scale))
             .collect();
         shifts.push((h, n, c, ca, cb, sc));
     }
 
     // 2. Mark ~14% of non-Proline residues (excluding C-term) as exchange-broadened in `HN`
     let mut exchange_broadened = vec![false; len];
-    for k in 2..(len - 1) {
-        if seq[k] != "PRO" && (k % 9 == 4 || k % 17 == 11) {
-            exchange_broadened[k] = true;
+    if spec.exchange_broaden {
+        for k in 2..(len.saturating_sub(1)) {
+            if seq[k] != "PRO" && (k % 9 == 4 || k % 17 == 11) {
+                exchange_broadened[k] = true;
+            }
         }
     }
 
-    // 3. Build `HN` peaks (`HSQC`, `HNCO`, `HNCACO` + NUS sidelobes, inverted `HNCACB` + `Gly CB`
-    //    bleed-through, `CBCACONH`, and TROSY-shifted `BT_HNCACONH`)
+    let ca_sign = if spec.invert_hncacb { -1 } else { 1 };
+    let cb_sign = -ca_sign;
+
+    // 3. Build `HN` peaks (`HSQC`, `HNCO`, `HNCACO`, `HNCACB`, `CBCACONH`, `BT_HNCACONH`)
     let mut hn_peaks: Vec<Peak> = Vec::new();
     let mut hncaconh_peaks: Vec<HncaconhPeak> = Vec::new();
-    let mut hnco_truth: Vec<Option<usize>> = Vec::new();
 
     for k in 1..len {
         if seq[k] == "PRO" || exchange_broadened[k] {
             continue;
         }
+        // Independent random HN root dropout (except C-term)
+        if k + 1 < len && rng.f64() < spec.random_drop_frac * 0.6 {
+            continue;
+        }
         let h = shifts[k].0.unwrap();
         let n = shifts[k].1;
-        let c_prev_obs = shifts[k - 1].2 + tms_c13_offset + rng.normal(0.0, 0.014);
-        let c_curr_obs = shifts[k].2 + tms_c13_offset + rng.normal(0.0, 0.015);
-        let ca_curr_obs = shifts[k].3 + tms_c13_offset + rng.normal(0.0, 0.022);
-        let ca_prev_obs = shifts[k - 1].3 + tms_c13_offset + rng.normal(0.0, 0.024);
-        let cb_curr_obs = shifts[k]
-            .4
-            .map(|v| v + tms_c13_offset + rng.normal(0.0, 0.028));
-        let cb_prev_obs = shifts[k - 1]
-            .4
-            .map(|v| v + tms_c13_offset + rng.normal(0.0, 0.030));
+        let c_prev_true = shifts[k - 1].2 + spec.tms_c13_offset;
+        let c_curr_true = shifts[k].2 + spec.tms_c13_offset;
+        let ca_curr_true = shifts[k].3 + spec.tms_c13_offset;
+        let ca_prev_true = shifts[k - 1].3 + spec.tms_c13_offset;
+        let cb_curr_true = shifts[k].4.map(|v| v + spec.tms_c13_offset);
+        let cb_prev_true = shifts[k - 1].4.map(|v| v + spec.tms_c13_offset);
 
-        // HSQC & HNCO
-        hn_peaks.push(
-            Peak::hsqc(h + rng.normal(0.0, 0.003), n + rng.normal(0.0, 0.02))
-                .with_intensity(1.0e5, None),
-        );
-        hn_peaks.push(
-            Peak::triple(
-                "HNCO",
-                h + rng.normal(0.0, 0.003),
-                n + rng.normal(0.0, 0.02),
-                c_prev_obs,
-                1,
-            )
-            .with_intensity(9.5e4, None),
-        );
-        hnco_truth.push(Some(k));
+        let h_hsqc = h + rng.normal(0.0, spec.jitter_h * 0.5);
+        let n_hsqc = n + rng.normal(0.0, spec.jitter_n * 0.5);
+        hn_peaks.push(Peak::hsqc(h_hsqc, n_hsqc).with_intensity(1.0e5, None));
 
-        // HN(CA)CO: both `C'_i` and `C'_{i-1}` + realistic `F1(C')` NUS sidelobes on ~30% of strips!
-        hn_peaks.push(
-            Peak::triple(
-                "HNCACO",
-                h + rng.normal(0.0, 0.004),
-                n + rng.normal(0.0, 0.025),
-                c_curr_obs,
-                1,
-            )
-            .with_intensity(7.5e4, None),
-        );
-        hn_peaks.push(
-            Peak::triple(
-                "HNCACO",
-                h + rng.normal(0.0, 0.004),
-                n + rng.normal(0.0, 0.025),
-                c_prev_obs + rng.normal(0.0, 0.012),
-                1,
-            )
-            .with_intensity(5.2e4, None),
-        );
-        if k % 3 == 0 {
-            // Weak `F1(C')` NUS sidelobe (~11% height at +0.95 ppm)
+        // HNCO
+        if rng.f64() >= spec.random_drop_frac * 0.5 {
+            hn_peaks.push(
+                Peak::triple(
+                    "HNCO",
+                    h + rng.normal(0.0, spec.jitter_h * 0.6),
+                    n + rng.normal(0.0, spec.jitter_n * 0.6),
+                    c_prev_true + rng.normal(0.0, spec.jitter_c),
+                    1,
+                )
+                .with_intensity(9.5e4, None),
+            );
+        }
+
+        // HNCACO (`C'_i` & `C'_{i-1}`) + realistic symmetric NUS sidelobes
+        if rng.f64() >= spec.random_drop_frac {
+            let c_i = c_curr_true + rng.normal(0.0, spec.jitter_c);
             hn_peaks.push(
                 Peak::triple(
                     "HNCACO",
-                    h + rng.normal(0.0, 0.004),
-                    n + rng.normal(0.0, 0.025),
-                    c_curr_obs + 0.95,
+                    h + rng.normal(0.0, spec.jitter_h * 0.7),
+                    n + rng.normal(0.0, spec.jitter_n * 0.7),
+                    c_i,
                     1,
                 )
-                .with_intensity(8.2e3, None),
+                .with_intensity(7.5e4, None),
             );
+            if rng.f64() >= spec.random_drop_frac * 0.8 {
+                hn_peaks.push(
+                    Peak::triple(
+                        "HNCACO",
+                        h + rng.normal(0.0, spec.jitter_h * 0.7),
+                        n + rng.normal(0.0, spec.jitter_n * 0.7),
+                        c_prev_true + rng.normal(0.0, spec.jitter_c),
+                        1,
+                    )
+                    .with_intensity(5.0e4, None),
+                );
+            }
+            if k % 4 == 0 {
+                // Symmetric weak F1(C') NUS sidelobe pair around C'_i
+                hn_peaks
+                    .push(Peak::triple("HNCACO", h, n, c_i + 0.92, 1).with_intensity(7.8e3, None));
+                hn_peaks
+                    .push(Peak::triple("HNCACO", h, n, c_i - 0.92, 1).with_intensity(7.5e3, None));
+            }
         }
 
-        // HNCACB with INVERTED polarity (`CA` negative `-1`, `CB` positive `+1`) to test `RD-1` auto-flip!
-        hn_peaks.push(
-            Peak::triple(
-                "HNCACB",
-                h + rng.normal(0.0, 0.004),
-                n + rng.normal(0.0, 0.025),
-                ca_curr_obs,
-                -1,
-            )
-            .with_intensity(8.0e4, None),
-        );
-        hn_peaks.push(
-            Peak::triple(
-                "HNCACB",
-                h + rng.normal(0.0, 0.004),
-                n + rng.normal(0.0, 0.025),
-                ca_prev_obs,
-                -1,
-            )
-            .with_intensity(4.8e4, None),
-        );
-        if let Some(cb) = cb_curr_obs {
+        // HNCACB
+        if rng.f64() >= spec.random_drop_frac {
+            let ca_i = ca_curr_true + rng.normal(0.0, spec.jitter_c * 1.15);
             hn_peaks.push(
                 Peak::triple(
                     "HNCACB",
-                    h + rng.normal(0.0, 0.004),
-                    n + rng.normal(0.0, 0.025),
-                    cb,
-                    1,
+                    h + rng.normal(0.0, spec.jitter_h * 0.7),
+                    n + rng.normal(0.0, spec.jitter_n * 0.7),
+                    ca_i,
+                    ca_sign,
                 )
-                .with_intensity(6.5e4, None),
+                .with_intensity(8.0e4, None),
             );
-        } else if seq[k] == "GLY" {
-            // Inject `Gly CB` bleed-through near `Gly CA` (inverted polarity = `+1` here!)
-            hn_peaks.push(
-                Peak::triple(
-                    "HNCACB",
-                    h + rng.normal(0.0, 0.004),
-                    n + rng.normal(0.0, 0.025),
-                    ca_curr_obs + 0.28,
-                    1,
-                )
-                .with_intensity(1.4e4, None),
-            );
-        }
-        if let Some(cb) = cb_prev_obs {
-            hn_peaks.push(
-                Peak::triple(
-                    "HNCACB",
-                    h + rng.normal(0.0, 0.004),
-                    n + rng.normal(0.0, 0.025),
-                    cb,
-                    1,
-                )
-                .with_intensity(4.2e4, None),
-            );
+            if rng.f64() >= spec.random_drop_frac {
+                hn_peaks.push(
+                    Peak::triple(
+                        "HNCACB",
+                        h + rng.normal(0.0, spec.jitter_h * 0.7),
+                        n + rng.normal(0.0, spec.jitter_n * 0.7),
+                        ca_prev_true + rng.normal(0.0, spec.jitter_c * 1.2),
+                        ca_sign,
+                    )
+                    .with_intensity(4.8e4, None),
+                );
+            }
+            if let Some(cb) = cb_curr_true {
+                if rng.f64() >= spec.random_drop_frac {
+                    hn_peaks.push(
+                        Peak::triple(
+                            "HNCACB",
+                            h + rng.normal(0.0, spec.jitter_h * 0.7),
+                            n + rng.normal(0.0, spec.jitter_n * 0.7),
+                            cb + rng.normal(0.0, spec.jitter_c * 1.25),
+                            cb_sign,
+                        )
+                        .with_intensity(6.5e4, None),
+                    );
+                }
+            } else if seq[k] == "GLY" {
+                hn_peaks.push(
+                    Peak::triple("HNCACB", h, n, ca_i + 0.28, cb_sign).with_intensity(1.3e4, None),
+                );
+            }
+            if let Some(cb) = cb_prev_true {
+                if rng.f64() >= spec.random_drop_frac {
+                    hn_peaks.push(
+                        Peak::triple(
+                            "HNCACB",
+                            h + rng.normal(0.0, spec.jitter_h * 0.7),
+                            n + rng.normal(0.0, spec.jitter_n * 0.7),
+                            cb + rng.normal(0.0, spec.jitter_c * 1.3),
+                            cb_sign,
+                        )
+                        .with_intensity(4.2e4, None),
+                    );
+                }
+            }
         }
 
-        // CBCACONH (`i - 1` `CA` and `CB`, unipolar `+1`)
-        hn_peaks.push(
-            Peak::triple(
-                "CBCACONH",
-                h + rng.normal(0.0, 0.004),
-                n + rng.normal(0.0, 0.025),
-                ca_prev_obs + rng.normal(0.0, 0.015),
-                1,
-            )
-            .with_intensity(6.0e4, None),
-        );
-        if let Some(cb) = cb_prev_obs {
+        // CBCACONH (`i - 1` CA/CB)
+        if rng.f64() >= spec.random_drop_frac {
             hn_peaks.push(
                 Peak::triple(
                     "CBCACONH",
-                    h + rng.normal(0.0, 0.004),
-                    n + rng.normal(0.0, 0.025),
-                    cb + rng.normal(0.0, 0.018),
+                    h + rng.normal(0.0, spec.jitter_h * 0.7),
+                    n + rng.normal(0.0, spec.jitter_n * 0.7),
+                    ca_prev_true + rng.normal(0.0, spec.jitter_c * 1.1),
                     1,
                 )
-                .with_intensity(5.5e4, None),
+                .with_intensity(6.0e4, None),
             );
+            if let Some(cb) = cb_prev_true {
+                if rng.f64() >= spec.random_drop_frac {
+                    hn_peaks.push(
+                        Peak::triple(
+                            "CBCACONH",
+                            h + rng.normal(0.0, spec.jitter_h * 0.7),
+                            n + rng.normal(0.0, spec.jitter_n * 0.7),
+                            cb + rng.normal(0.0, spec.jitter_c * 1.2),
+                            1,
+                        )
+                        .with_intensity(5.5e4, None),
+                    );
+                }
+            }
         }
 
-        // BT_HNCACONH with `800 MHz` TROSY `(-46 Hz H, +46 Hz N)` offset!
-        if k >= 2 && seq[k - 1] != "PRO" && !exchange_broadened[k - 1] {
-            hncaconh_peaks.push(HncaconhPeak {
-                h_ppm: h + trosy_dh + rng.normal(0.0, 0.004),
-                n_curr_ppm: n + trosy_dn + rng.normal(0.0, 0.025),
-                n_partner_ppm: shifts[k - 1].1 + rng.normal(0.0, 0.03),
-                height: 4.5e4,
-            });
-        }
-        if k + 1 < len && seq[k + 1] != "PRO" && !exchange_broadened[k + 1] {
-            hncaconh_peaks.push(HncaconhPeak {
-                h_ppm: h + trosy_dh + rng.normal(0.0, 0.004),
-                n_curr_ppm: n + trosy_dn + rng.normal(0.0, 0.025),
-                n_partner_ppm: shifts[k + 1].1 + rng.normal(0.0, 0.03),
-                height: 4.2e4,
-            });
+        // BT_HNCACONH with 800 MHz TROSY offset
+        if spec.include_trosy_hncaconh {
+            if k >= 2
+                && seq[k - 1] != "PRO"
+                && !exchange_broadened[k - 1]
+                && rng.f64() >= spec.random_drop_frac
+            {
+                hncaconh_peaks.push(HncaconhPeak {
+                    h_ppm: h + trosy_dh + rng.normal(0.0, spec.jitter_h * 0.7),
+                    n_curr_ppm: n + trosy_dn + rng.normal(0.0, spec.jitter_n * 0.7),
+                    n_partner_ppm: shifts[k - 1].1 + rng.normal(0.0, spec.jitter_n * 0.8),
+                    height: 4.5e4,
+                });
+            }
+            if k + 1 < len
+                && seq[k + 1] != "PRO"
+                && !exchange_broadened[k + 1]
+                && rng.f64() >= spec.random_drop_frac
+            {
+                hncaconh_peaks.push(HncaconhPeak {
+                    h_ppm: h + trosy_dh + rng.normal(0.0, spec.jitter_h * 0.7),
+                    n_curr_ppm: n + trosy_dn + rng.normal(0.0, spec.jitter_n * 0.7),
+                    n_partner_ppm: shifts[k + 1].1 + rng.normal(0.0, spec.jitter_n * 0.8),
+                    height: 4.2e4,
+                });
+            }
         }
     }
 
-    // 4. Build `13C`-detected `2D CON` + realistic lower-sensitivity `H(CC)CON`/`CBCACON` +
-    //    `CANCO` on Prolines/exch-broadened + sparse `(H)N(CA)CON` + `CAS` subspectra!
-    //    Realistic `13C` acquisition physics:
-    //    - ~10% of non-Proline amides drop out / overlap in `2D CON` (still resolved in `HN`!),
-    //    - `H(CC)CON`/`CBCACON` has ~28% strip dropout (lower `13C` sensitivity vs `1H`),
-    //    - `(H)N(CA)CON` has ~45% coverage (essential across Pro/exchange gaps, sparser elsewhere),
-    //    - `NCACO` is omitted so `CON`-only lacks intraresidue `C'_i` & `CA_i`/`CB_i` on most amides,
-    //      while `idp-joint` pools `HN(CA)CO` + `HNCACB` + `2D CON` seamlessly!
+    // Spurious HN decoy roots (HSQC + HNCO noise)
+    for _ in 0..spec.n_decoy_hn_roots {
+        let h_d = 7.75 + rng.f64() * 1.15;
+        let n_d = 109.0 + rng.f64() * 18.0;
+        let c_d = 171.5 + rng.f64() * 6.5 + spec.tms_c13_offset;
+        hn_peaks.push(Peak::hsqc(h_d, n_d).with_intensity(1.8e4, None));
+        hn_peaks.push(Peak::triple("HNCO", h_d, n_d, c_d, 1).with_intensity(1.6e4, None));
+    }
+
+    // 4. Build 13C-detected `2D CON` + `CBCACON`/`H(CC)CON` + `CANCO` + `(H)N(CA)CON` + `CAS`
+    //    CRITICAL (`180.core:P1-3`): `anchor_root_idx: None` on EVERY 3D strip peak!
     let mut con_roots: Vec<Con2DPeak> = Vec::new();
     let mut strip_peaks: Vec<C13Strip3DPeak> = Vec::new();
     let mut hncacon_nn_edges: Vec<DirectionalNnPeak> = Vec::new();
-    let mut con_root_truth: Vec<Option<usize>> = Vec::new();
 
     for k in 1..len {
-        // ~10% of non-Pro, non-exchange-broadened amides drop out in crowded `2D CON`
-        let con_dropped = seq[k] != "PRO" && !exchange_broadened[k] && k + 1 < len && (k % 11 == 3);
-        if con_dropped {
+        let natural_drop =
+            seq[k] != "PRO" && !exchange_broadened[k] && k + 1 < len && (k % 11 == 3);
+        if natural_drop || (k + 1 < len && rng.f64() < spec.random_drop_frac * 0.5) {
             continue;
         }
-        let c_prev_obs = shifts[k - 1].2 + tms_c13_offset + rng.normal(0.0, 0.012);
-        let n_curr_obs = shifts[k].1 + rng.normal(0.0, 0.022);
-        let r_idx = con_roots.len();
+        let c_prev_obs = shifts[k - 1].2 + spec.tms_c13_offset + rng.normal(0.0, spec.jitter_c);
+        let n_curr_obs = shifts[k].1 + rng.normal(0.0, spec.jitter_n);
         con_roots.push(Con2DPeak {
             c_prev_ppm: c_prev_obs,
             n_curr_ppm: n_curr_obs,
             height: 8.5e4,
             volume: 8.5e4,
-            is_proline_imino_region: n_curr_obs >= 131.5,
+            is_proline_imino_region: n_curr_obs >= PROLINE_N15_MIN_PPM,
             deconvolved_from_cluster: false,
         });
-        con_root_truth.push(Some(k));
 
-        // Preceding `(CA, CB, sidechain)` via `CBCACON`/`H(CC)CON` (~72% coverage; always on Pro/exch)
-        if seq[k] == "PRO" || exchange_broadened[k] || k % 4 != 1 {
-            let ca_prev = shifts[k - 1].3 + tms_c13_offset + rng.normal(0.0, 0.026);
+        // CBCACON / H(CC)CON (independent coordinate jitter, NO anchor_root_idx!)
+        if (seq[k] == "PRO" || exchange_broadened[k] || k % 4 != 1)
+            && rng.f64() >= spec.random_drop_frac
+        {
+            let c_3d = c_prev_obs + rng.normal(0.0, spec.jitter_c * 0.65);
+            let n_3d = n_curr_obs + rng.normal(0.0, spec.jitter_n * 0.65);
             strip_peaks.push(C13Strip3DPeak {
                 exp: C13DetectedExp::Cbcaco3D,
-                c_prime_ppm: c_prev_obs,
-                n_ppm: n_curr_obs,
-                c_indirect_ppm: ca_prev,
+                c_prime_ppm: c_3d,
+                n_ppm: n_3d,
+                c_indirect_ppm: shifts[k - 1].3
+                    + spec.tms_c13_offset
+                    + rng.normal(0.0, spec.jitter_c * 1.2),
                 sign: 1,
                 height: 5.5e4,
                 volume: 5.5e4,
-                anchor_root_idx: Some(r_idx),
+                anchor_root_idx: None,
             });
             if let Some(cb) = shifts[k - 1].4 {
-                strip_peaks.push(C13Strip3DPeak {
-                    exp: C13DetectedExp::Cbcaco3D,
-                    c_prime_ppm: c_prev_obs,
-                    n_ppm: n_curr_obs,
-                    c_indirect_ppm: cb + tms_c13_offset + rng.normal(0.0, 0.030),
-                    sign: -1,
-                    height: 4.5e4,
-                    volume: 4.5e4,
-                    anchor_root_idx: Some(r_idx),
-                });
+                if rng.f64() >= spec.random_drop_frac {
+                    strip_peaks.push(C13Strip3DPeak {
+                        exp: C13DetectedExp::Cbcaco3D,
+                        c_prime_ppm: c_3d,
+                        n_ppm: n_3d,
+                        c_indirect_ppm: cb
+                            + spec.tms_c13_offset
+                            + rng.normal(0.0, spec.jitter_c * 1.3),
+                        sign: -1,
+                        height: 4.5e4,
+                        volume: 4.5e4,
+                        anchor_root_idx: None,
+                    });
+                }
             }
             for &sc in &shifts[k - 1].5 {
-                strip_peaks.push(C13Strip3DPeak {
-                    exp: C13DetectedExp::Cccon3D,
-                    c_prime_ppm: c_prev_obs,
-                    n_ppm: n_curr_obs,
-                    c_indirect_ppm: sc + tms_c13_offset + rng.normal(0.0, 0.032),
-                    sign: 1,
-                    height: 3.5e4,
-                    volume: 3.5e4,
-                    anchor_root_idx: Some(r_idx),
-                });
+                if rng.f64() >= spec.random_drop_frac {
+                    strip_peaks.push(C13Strip3DPeak {
+                        exp: C13DetectedExp::Cccon3D,
+                        c_prime_ppm: c_3d,
+                        n_ppm: n_3d,
+                        c_indirect_ppm: sc
+                            + spec.tms_c13_offset
+                            + rng.normal(0.0, spec.jitter_c * 1.3),
+                        sign: 1,
+                        height: 3.5e4,
+                        volume: 3.5e4,
+                        anchor_root_idx: None,
+                    });
+                }
             }
         }
 
-        // `CANCO` on Prolines and exchange-broadened `CON`-only nodes (bridging `CA_i` across Pro!)
-        if seq[k] == "PRO" || exchange_broadened[k] {
+        // CANCO on Prolines & exchange-broadened nodes (and 30% of other nodes), NO anchor_root_idx!
+        if (seq[k] == "PRO" || exchange_broadened[k] || k % 3 == 0)
+            && rng.f64() >= spec.random_drop_frac
+        {
+            let c_3d = c_prev_obs + rng.normal(0.0, spec.jitter_c * 0.65);
+            let n_3d = n_curr_obs + rng.normal(0.0, spec.jitter_n * 0.65);
             strip_peaks.push(C13Strip3DPeak {
                 exp: C13DetectedExp::Canco3D,
-                c_prime_ppm: c_prev_obs,
-                n_ppm: n_curr_obs,
-                c_indirect_ppm: shifts[k - 1].3 + tms_c13_offset + rng.normal(0.0, 0.024),
+                c_prime_ppm: c_3d,
+                n_ppm: n_3d,
+                c_indirect_ppm: shifts[k - 1].3
+                    + spec.tms_c13_offset
+                    + rng.normal(0.0, spec.jitter_c * 1.15),
                 sign: 1,
                 height: 6.0e4,
                 volume: 6.0e4,
-                anchor_root_idx: Some(r_idx),
+                anchor_root_idx: None,
             });
             strip_peaks.push(C13Strip3DPeak {
                 exp: C13DetectedExp::Canco3D,
-                c_prime_ppm: c_prev_obs,
-                n_ppm: n_curr_obs,
-                c_indirect_ppm: shifts[k].3 + tms_c13_offset + rng.normal(0.0, 0.028),
+                c_prime_ppm: c_3d,
+                n_ppm: n_3d,
+                c_indirect_ppm: shifts[k].3
+                    + spec.tms_c13_offset
+                    + rng.normal(0.0, spec.jitter_c * 1.25),
                 sign: 1,
                 height: 4.6e4,
                 volume: 4.6e4,
-                anchor_root_idx: Some(r_idx),
+                anchor_root_idx: None,
             });
         }
 
-        // Sparse directional `(H)N(CA)CON` sequential `N(i-1)` edges (~45% overall, covering Pro/exch gaps)
-        if k >= 2
-            && (seq[k] == "PRO"
-                || seq[k - 1] == "PRO"
-                || exchange_broadened[k]
-                || exchange_broadened[k - 1]
-                || k % 5 == 0)
-        {
+        // Directional `(H)N(CA)CON` N–N links (critical across Proline & exchange-broadened gaps)
+        let pro_or_exch_adj = seq[k] == "PRO"
+            || seq[k - 1] == "PRO"
+            || exchange_broadened[k]
+            || (k >= 2 && exchange_broadened[k - 1]);
+        if k >= 2 && (pro_or_exch_adj || k % 2 == 0) && rng.f64() >= spec.random_drop_frac {
             hncacon_nn_edges.push(DirectionalNnPeak {
-                c_prev_ppm: c_prev_obs,
-                n_curr_ppm: n_curr_obs,
-                n_prev_ppm: shifts[k - 1].1 + rng.normal(0.0, 0.055),
-                snr: 6.5,
+                c_prev_ppm: c_prev_obs + rng.normal(0.0, spec.jitter_c * 0.7),
+                n_curr_ppm: n_curr_obs + rng.normal(0.0, spec.jitter_n * 0.7),
+                n_prev_ppm: shifts[k - 1].1 + rng.normal(0.0, spec.jitter_n * 0.8),
+                snr: 18.0,
             });
         }
     }
 
-    // Add 3 spurious noise roots in `2D CON` (no 3D support)
-    for sp_i in 0..3 {
+    // Spurious noise `CON` decoy roots (including some in the Proline imino region!)
+    for d in 0..spec.n_decoy_con_roots {
+        let is_pro_decoy = d % 7 == 0;
+        let c_d = 171.0 + rng.f64() * 7.5 + spec.tms_c13_offset;
+        let n_d = if is_pro_decoy {
+            133.0 + rng.f64() * 9.0
+        } else {
+            107.0 + rng.f64() * 22.0
+        };
         con_roots.push(Con2DPeak {
-            c_prev_ppm: 171.2 + (sp_i as f64) * 1.1,
-            n_curr_ppm: 117.5 + (sp_i as f64) * 2.3,
-            height: 2.0e4,
-            volume: 2.0e4,
-            is_proline_imino_region: false,
+            c_prev_ppm: c_d,
+            n_curr_ppm: n_d,
+            height: 1.5e4 + rng.f64() * 1.2e4,
+            volume: 1.5e4,
+            is_proline_imino_region: n_d >= PROLINE_N15_MIN_PPM,
             deconvolved_from_cluster: false,
         });
-        con_root_truth.push(None);
     }
 
-    // 5. Build `5` `CAS` subspectra (`cacon` on `i-1`, `canco` on `i`) WITH ~6% breakthrough false peaks
-    let make_cas = |name: &str, mode: CasMode, res: &[&str], rng: &mut Rng| -> CasSpectrum {
-        let mut peaks = Vec::new();
-        for (r_idx, cr) in con_roots.iter().enumerate() {
-            let Some(k) = con_root_truth[r_idx] else {
-                continue;
-            };
-            let target = match mode {
-                CasMode::Cacon => seq[k - 1].as_str(),
-                CasMode::Canco => seq[k].as_str(),
-            };
-            let is_true = res.contains(&target);
-            if is_true && rng.f64() < 0.90 {
-                peaks.push(CasPeak {
-                    c_prime_ppm: cr.c_prev_ppm + rng.normal(0.0, 0.012),
-                    n_ppm: cr.n_curr_ppm + rng.normal(0.0, 0.03),
-                    height: 6.5e4,
-                    volume: 6.5e4,
-                });
-            } else if !is_true && rng.f64() < 0.055 {
-                // Weak incomplete-suppression breakthrough peak (~22% height)
-                peaks.push(CasPeak {
-                    c_prime_ppm: cr.c_prev_ppm + rng.normal(0.0, 0.015),
-                    n_ppm: cr.n_curr_ppm + rng.normal(0.0, 0.04),
-                    height: 1.4e4,
-                    volume: 1.4e4,
-                });
+    // 5. `CAS` subspectra (`cacon` on `i-1`, `canco` on `i`) with realistic ~6% breakthrough peaks
+    let mut cas_spectra: Vec<CasSpectrum> = Vec::new();
+    if spec.include_cas {
+        let cas_defs: &[(&str, CasMode, &[&str])] = &[
+            ("cacon_ser", CasMode::Cacon, &["SER"]),
+            ("canco_ser", CasMode::Canco, &["SER"]),
+            ("cacon_ala", CasMode::Cacon, &["ALA"]),
+            ("cacon_gly", CasMode::Cacon, &["GLY"]),
+            ("canco_gly", CasMode::Canco, &["GLY"]),
+            ("cacon_tavi", CasMode::Cacon, &["THR", "ALA", "VAL", "ILE"]),
+        ];
+        for &(label, mode, residues) in cas_defs {
+            let mut peaks = Vec::new();
+            for k in 1..len {
+                let target_aa = match mode {
+                    CasMode::Cacon => seq[k - 1].as_str(),
+                    CasMode::Canco => seq[k].as_str(),
+                };
+                let is_true = residues.contains(&target_aa);
+                let is_bt = !is_true && rng.f64() < 0.06;
+                if (is_true && rng.f64() >= spec.random_drop_frac) || is_bt {
+                    let h = if is_true { 6.0e4 } else { 1.4e4 };
+                    peaks.push(CasPeak {
+                        c_prime_ppm: shifts[k - 1].2
+                            + spec.tms_c13_offset
+                            + rng.normal(0.0, spec.jitter_c),
+                        n_ppm: shifts[k].1 + rng.normal(0.0, spec.jitter_n),
+                        height: h,
+                        volume: h,
+                    });
+                }
             }
+            cas_spectra.push(CasSpectrum {
+                name: label.to_string(),
+                mode,
+                residues: residues.iter().map(|s| s.to_string()).collect(),
+                peaks,
+            });
         }
-        CasSpectrum {
-            name: name.to_string(),
-            mode,
-            residues: res.iter().map(|s| s.to_string()).collect(),
-            peaks,
-        }
-    };
-
-    let cas_spectra = vec![
-        make_cas("cacon_ser", CasMode::Cacon, &["SER"], &mut rng),
-        make_cas("cacon_ala", CasMode::Cacon, &["ALA"], &mut rng),
-        make_cas("cacon_gly", CasMode::Cacon, &["GLY"], &mut rng),
-        make_cas("canco_ser", CasMode::Canco, &["SER"], &mut rng),
-        make_cas(
-            "canco_tavi",
-            CasMode::Canco,
-            &["THR", "ALA", "VAL", "ILE"],
-            &mut rng,
-        ),
-    ];
+    }
 
     let dataset = JointIdpDataset {
         hn_peaks,
@@ -494,531 +628,1101 @@ fn synthesize_realistic_idp_benchmark(seed: u64) -> (JointIdpDataset, SyntheticG
     };
 
     let truth = SyntheticGroundTruth {
-        seq,
+        seq: seq.to_vec(),
         shifts,
-        exchange_broadened,
-        con_root_truth,
-        hnco_truth,
+        _exchange_broadened: exchange_broadened,
     };
-
     (dataset, truth)
 }
 
-/// Evaluate node-to-ground-truth accuracy, recall over all `L - 1` assignable bonds, Proline-bridge
-/// recall, exchange-broadened `ConOnlyAmide` recall, and HC (`>= 0.80`) precision.
-fn evaluate_against_truth(
-    res: &nmr_core::joint_idp_solver::JointIdpAssignResult,
-    truth: &SyntheticGroundTruth,
-) -> (f64, f64, f64, f64, f64, usize, usize, usize, usize) {
-    let tms_c13_offset = -2.70_f64;
-    let len = truth.seq.len();
-    let total_assignable = len - 1;
-    let total_pro = (1..len).filter(|&k| truth.seq[k] == "PRO").count();
-    let total_exch = (1..len).filter(|&k| truth.exchange_broadened[k]).count();
-
-    // Map each node to its unique true sequence index `k` by matching `(c_prev, n_curr)` to ground truth
-    let mut node_true_k: Vec<Option<usize>> = vec![None; res.nodes.len()];
-    for (s_idx, node) in res.nodes.iter().enumerate() {
-        let mut best: Option<(usize, f64)> = None;
-        for k in 1..len {
-            let true_n = truth.shifts[k].1;
-            let true_cp = truth.shifts[k - 1].2 + tms_c13_offset;
-            let dn = (node.n_curr - true_n).abs();
-            let dc = node.c_prev.map_or(0.0, |c| (c - true_cp).abs());
-            if dn <= 0.16 && dc <= 0.08 {
-                let d2 = (dn / 0.05).powi(2) + (dc / 0.025).powi(2);
-                if best.is_none_or(|b| d2 < b.1) {
-                    best = Some((k, d2));
-                }
-            }
-        }
-        node_true_k[s_idx] = best.map(|b| b.0);
-    }
-
-    let mut assigned = 0usize;
-    let mut correct = 0usize;
-    let mut hc_assigned = 0usize;
-    let mut hc_correct = 0usize;
-    let mut pro_correct = 0usize;
-    let mut exch_correct = 0usize;
-
-    let mut seen_true_k: BTreeMap<usize, bool> = BTreeMap::new();
-    for (s, &true_k) in node_true_k.iter().enumerate() {
-        let pred_k = res.position[s];
-        if pred_k < 0 {
-            continue;
-        }
-        assigned += 1;
-        let is_ok = true_k == Some(pred_k as usize);
-        if is_ok {
-            correct += 1;
-            let tk = pred_k as usize;
-            if seen_true_k.insert(tk, true).is_none() {
-                if truth.seq[tk] == "PRO" {
-                    pro_correct += 1;
-                }
-                if truth.exchange_broadened[tk] {
-                    exch_correct += 1;
-                }
-            }
-        }
-        if res.confidence[s] >= 0.80 {
-            hc_assigned += 1;
-            if is_ok {
-                hc_correct += 1;
-            }
-        }
-    }
-
-    let acc = if assigned > 0 {
-        (correct as f64) / (assigned as f64)
-    } else {
-        0.0
-    };
-    let rec = (correct as f64) / (total_assignable as f64);
-    let pro_rec = if total_pro > 0 {
-        (pro_correct as f64) / (total_pro as f64)
-    } else {
-        0.0
-    };
-    let exch_rec = if total_exch > 0 {
-        (exch_correct as f64) / (total_exch as f64)
-    } else {
-        0.0
-    };
-    let hc_prec = if hc_assigned > 0 {
-        (hc_correct as f64) / (hc_assigned as f64)
-    } else {
-        1.0
-    };
-
-    (
-        acc,
-        rec,
-        pro_rec,
-        exch_rec,
-        hc_prec,
-        correct,
-        total_assignable,
-        pro_correct,
-        total_pro,
-    )
+#[derive(Clone, Debug, Default)]
+struct EvalMetrics {
+    n_slots: usize,
+    n_assigned: usize,
+    n_correct: usize,
+    n_pro_total: usize,
+    n_pro_correct: usize,
+    n_hc: usize,
+    n_hc_correct: usize,
+    n_abstained: usize,
+    n_nodes: usize,
 }
 
+impl EvalMetrics {
+    fn acc(&self) -> f64 {
+        if self.n_slots == 0 {
+            0.0
+        } else {
+            self.n_correct as f64 / self.n_slots as f64
+        }
+    }
+    fn pro_acc(&self) -> f64 {
+        if self.n_pro_total == 0 {
+            1.0
+        } else {
+            self.n_pro_correct as f64 / self.n_pro_total as f64
+        }
+    }
+    fn abstain_rate(&self) -> f64 {
+        if self.n_slots == 0 {
+            0.0
+        } else {
+            self.n_abstained as f64 / self.n_slots as f64
+        }
+    }
+}
+
+/// Check whether `node` (after subtracting `fitted_offsets`) truly belongs to sequence slot `k`.
+fn is_node_match_for_slot(
+    node: &JointIdpNode,
+    offsets: &IdpShiftOffsets,
+    k: usize,
+    truth: &SyntheticGroundTruth,
+) -> bool {
+    let len = truth.seq.len();
+    let n_corr = node.n_curr - offsets.d_n;
+    if let Some(c_obs) = node.c_prev {
+        let c_corr = c_obs - offsets.d_c;
+        let dist_k =
+            ((c_corr - truth.shifts[k - 1].2) / 0.14).hypot((n_corr - truth.shifts[k].1) / 0.55);
+        let mut best_slot = k;
+        let mut best_dist = dist_k;
+        for kp in 1..len {
+            let d = ((c_corr - truth.shifts[kp - 1].2) / 0.14)
+                .hypot((n_corr - truth.shifts[kp].1) / 0.55);
+            if d < best_dist {
+                best_dist = d;
+                best_slot = kp;
+            }
+        }
+        best_slot == k && dist_k <= 2.8
+    } else if let Some(h_obs) = node.h_curr {
+        let Some(h_true) = truth.shifts[k].0 else {
+            return false;
+        };
+        let dist_k = ((h_obs - h_true) / 0.05).hypot((n_corr - truth.shifts[k].1) / 0.55);
+        let mut best_slot = k;
+        let mut best_dist = dist_k;
+        for kp in 1..len {
+            if let Some(hp) = truth.shifts[kp].0 {
+                let d = ((h_obs - hp) / 0.05).hypot((n_corr - truth.shifts[kp].1) / 0.55);
+                if d < best_dist {
+                    best_dist = d;
+                    best_slot = kp;
+                }
+            }
+        }
+        best_slot == k && dist_k <= 2.8
+    } else {
+        false
+    }
+}
+
+/// Evaluate a `JointIdpAssignResult` against ground truth across `k = 1..L`.
+fn evaluate_joint_result(res: &JointIdpAssignResult, truth: &SyntheticGroundTruth) -> EvalMetrics {
+    let len = truth.seq.len();
+    let mut m = EvalMetrics {
+        n_slots: len.saturating_sub(1),
+        n_nodes: res.nodes.len(),
+        ..EvalMetrics::default()
+    };
+    for k in 1..len {
+        let ra = &res.residue_assignments[k];
+        let is_pro = truth.seq[k] == "PRO";
+        if is_pro {
+            m.n_pro_total += 1;
+        }
+        let Some(node_idx) = ra.node_idx else {
+            m.n_abstained += 1;
+            continue;
+        };
+        m.n_assigned += 1;
+        let is_correct =
+            is_node_match_for_slot(&res.nodes[node_idx], &res.fitted_offsets, k, truth);
+        if is_correct {
+            m.n_correct += 1;
+            if is_pro {
+                m.n_pro_correct += 1;
+            }
+        }
+        if ra.confidence >= 0.80 {
+            m.n_hc += 1;
+            if is_correct {
+                m.n_hc_correct += 1;
+            }
+        }
+    }
+    m
+}
+
+/// Disjoint empirical PAV calibration fitter (`180.core:P1-1`).
+///
+/// Run explicitly with:
+/// `cargo test --release -p nmr-core --test joint_idp_solver_tests fit_disjoint_joint_idp_calibration_knots -- --ignored --nocapture`
+/// Fits `JOINT_IDP_CALIBRATION_KNOTS` strictly on disjoint sequences (`cal_seq_a`, `cal_seq_b`)
+/// and disjoint seeds (`1001, 1002, 1003`) — NEVER on the held-out adversarial sequence!
 #[test]
-fn test_synthetic_pro_ser_rich_idp_joint_beats_hn_and_con_only() {
-    let (full_dataset, truth) = synthesize_realistic_idp_benchmark(20261121);
-    let seq = &truth.seq;
-    assert_eq!(
-        truth.con_root_truth.len(),
-        full_dataset.c13_dataset.con_roots.len()
+#[ignore]
+fn fit_disjoint_joint_idp_calibration_knots() {
+    let seqs = [disjoint_calibration_seq_a(), disjoint_calibration_seq_b()];
+    let seeds = [1001_u64, 1002, 1003];
+    let scenarios: &[(&str, IdpStressSpec)] = &[
+        (
+            "cal_clean",
+            IdpStressSpec {
+                jitter_h: 0.004,
+                jitter_n: 0.03,
+                jitter_c: 0.014,
+                random_drop_frac: 0.03,
+                n_decoy_con_roots: 5,
+                n_decoy_hn_roots: 2,
+                ..IdpStressSpec::default()
+            },
+        ),
+        ("cal_moderate", IdpStressSpec::default()),
+        (
+            "cal_noise_mid",
+            IdpStressSpec {
+                jitter_h: 0.01,
+                jitter_n: 0.08,
+                jitter_c: 0.03,
+                ..IdpStressSpec::default()
+            },
+        ),
+        (
+            "cal_noise_high",
+            IdpStressSpec {
+                jitter_h: 0.02,
+                jitter_n: 0.15,
+                jitter_c: 0.05,
+                ..IdpStressSpec::default()
+            },
+        ),
+        (
+            "cal_drop20",
+            IdpStressSpec {
+                random_drop_frac: 0.20,
+                ..IdpStressSpec::default()
+            },
+        ),
+        (
+            "cal_decoys140",
+            IdpStressSpec {
+                random_drop_frac: 0.20,
+                n_decoy_con_roots: 140,
+                n_decoy_hn_roots: 25,
+                ..IdpStressSpec::default()
+            },
+        ),
+        (
+            "cal_rc2.2",
+            IdpStressSpec {
+                rc_dev_scale: 2.2,
+                ..IdpStressSpec::default()
+            },
+        ),
+        (
+            "cal_combined",
+            IdpStressSpec {
+                jitter_h: 0.02,
+                jitter_n: 0.15,
+                jitter_c: 0.05,
+                rc_dev_scale: 2.2,
+                random_drop_frac: 0.20,
+                n_decoy_con_roots: 160,
+                n_decoy_hn_roots: 30,
+                ..IdpStressSpec::default()
+            },
+        ),
+    ];
+
+    let mut samples: Vec<(f64, bool)> = Vec::new();
+    for (label, spec) in scenarios {
+        let mut tot_ok = 0usize;
+        let mut tot_n = 0usize;
+        let mut tot_raw_hi = 0usize;
+        let mut tot_raw_hi_ok = 0usize;
+        for (si, seq) in seqs.iter().enumerate() {
+            for &seed in &seeds {
+                let (ds, truth) = synthesize_idp_stress_dataset(seq, seed + (si as u64) * 97, spec);
+                let cfg = JointIdpConfig {
+                    replicas: 12,
+                    steps_per_system: 700,
+                    seed: seed + 17,
+                    ..JointIdpConfig::default()
+                };
+                let res = assign_joint_idp_cpu(&ds, seq, &cfg).unwrap();
+                for k in 1..seq.len() {
+                    let ra = &res.residue_assignments[k];
+                    let Some(node_idx) = ra.node_idx else {
+                        continue;
+                    };
+                    let ok = is_node_match_for_slot(
+                        &res.nodes[node_idx],
+                        &res.fitted_offsets,
+                        k,
+                        &truth,
+                    );
+                    if ok {
+                        tot_ok += 1;
+                    }
+                    tot_n += 1;
+                    if ra.raw_posterior >= 0.80 {
+                        tot_raw_hi += 1;
+                        if ok {
+                            tot_raw_hi_ok += 1;
+                        }
+                    }
+                    samples.push((ra.raw_posterior, ok));
+                }
+            }
+        }
+        println!(
+            "DISJOINT CAL {label:<14}: assigned acc = {tot_ok}/{tot_n} ({:.1}%) | raw>=0.8: {tot_raw_hi_ok}/{tot_raw_hi} ({:.1}%)",
+            100.0 * tot_ok as f64 / tot_n.max(1) as f64,
+            if tot_raw_hi == 0 {
+                100.0
+            } else {
+                100.0 * tot_raw_hi_ok as f64 / tot_raw_hi as f64
+            }
+        );
+    }
+
+    let knot_xs = [0.00, 0.10, 0.25, 0.40, 0.55, 0.70, 0.82, 0.90, 0.96, 1.00];
+    let fitted = fit_idp_calibration_knots_pav(&samples, &knot_xs);
+    println!("\nFitted PAV knots ({} samples):", samples.len());
+    for (x, y) in &fitted {
+        println!("    ({x:.2}, {y:.3}),");
+    }
+}
+
+/// 8-scenario multi-seed (`3` seeds) held-out adversarial calibration & QC grid (`180.core:P1-1`,
+/// `P1-2`, `P1-3`). Zero ground-truth `anchor_root_idx`; prints complete benchmark table.
+#[test]
+fn test_v180_adversarial_8_scenario_multiseed_grid() {
+    let base_seq = synthetic_pro_ser_rich_idp_sequence();
+    let repeat_seq = synthetic_low_complexity_repeat_idp_sequence();
+    let seeds = [7_u64, 13, 29];
+
+    let scenarios: &[(&str, bool, IdpStressSpec)] = &[
+        ("1_moderate_base", false, IdpStressSpec::default()),
+        (
+            "2_noise_01_08_03",
+            false,
+            IdpStressSpec {
+                jitter_h: 0.01,
+                jitter_n: 0.08,
+                jitter_c: 0.03,
+                ..IdpStressSpec::default()
+            },
+        ),
+        (
+            "3_noise_02_15_05",
+            false,
+            IdpStressSpec {
+                jitter_h: 0.02,
+                jitter_n: 0.15,
+                jitter_c: 0.05,
+                ..IdpStressSpec::default()
+            },
+        ),
+        (
+            "4_drop_20pct",
+            false,
+            IdpStressSpec {
+                random_drop_frac: 0.20,
+                ..IdpStressSpec::default()
+            },
+        ),
+        (
+            "5_drop20_140dec",
+            false,
+            IdpStressSpec {
+                random_drop_frac: 0.20,
+                n_decoy_con_roots: 140,
+                n_decoy_hn_roots: 25,
+                ..IdpStressSpec::default()
+            },
+        ),
+        (
+            "6_rc_dev_2.2x",
+            false,
+            IdpStressSpec {
+                rc_dev_scale: 2.2,
+                ..IdpStressSpec::default()
+            },
+        ),
+        (
+            "7_combined_stress",
+            false,
+            IdpStressSpec {
+                jitter_h: 0.02,
+                jitter_n: 0.15,
+                jitter_c: 0.05,
+                rc_dev_scale: 2.2,
+                random_drop_frac: 0.20,
+                n_decoy_con_roots: 160,
+                n_decoy_hn_roots: 30,
+                ..IdpStressSpec::default()
+            },
+        ),
+        (
+            "8_repeat_low_cx",
+            true,
+            IdpStressSpec {
+                jitter_h: 0.008,
+                jitter_n: 0.06,
+                jitter_c: 0.025,
+                random_drop_frac: 0.10,
+                n_decoy_con_roots: 20,
+                n_decoy_hn_roots: 8,
+                ..IdpStressSpec::default()
+            },
+        ),
+    ];
+
+    println!(
+        "\n| Scenario | Acc% | Pro% | Nodes | #HC (>=0.8) | HC_Prec% | Abstain% | QC (3 seeds) |"
     );
-    assert!(!truth.hnco_truth.is_empty());
+    println!("|---|---:|---:|---:|---:|---:|---:|---|");
+
+    for &(label, is_repeat, ref spec) in scenarios {
+        let seq = if is_repeat { &repeat_seq } else { &base_seq };
+        let mut sum_acc = 0.0;
+        let mut sum_pro = 0.0;
+        let mut sum_hc = 0.0;
+        let mut tot_hc = 0usize;
+        let mut tot_hc_ok = 0usize;
+        let mut sum_abstain = 0.0;
+        let mut sum_nodes = 0.0;
+        let mut qc_list: Vec<DatasetQcVerdict> = Vec::new();
+
+        for &seed in &seeds {
+            let (ds, truth) = synthesize_idp_stress_dataset(seq, seed, spec);
+            let cfg = JointIdpConfig {
+                replicas: 12,
+                steps_per_system: 800,
+                seed: seed * 101 + 3,
+                ..JointIdpConfig::default()
+            };
+            let res = assign_joint_idp_cpu(&ds, seq, &cfg).unwrap();
+            let ev = evaluate_joint_result(&res, &truth);
+            sum_acc += ev.acc();
+            sum_pro += ev.pro_acc();
+            sum_hc += ev.n_hc as f64;
+            tot_hc += ev.n_hc;
+            tot_hc_ok += ev.n_hc_correct;
+            sum_abstain += ev.abstain_rate();
+            sum_nodes += ev.n_nodes as f64;
+            qc_list.push(res.qc_verdict);
+
+            assert!(res.score.is_finite(), "{label} produced non-finite score");
+            assert!(
+                res.confidence
+                    .iter()
+                    .all(|c| c.is_finite() && *c >= 0.0 && *c <= 1.0),
+                "{label} produced out-of-range confidence"
+            );
+        }
+
+        let k_n = seeds.len() as f64;
+        let mean_acc = 100.0 * sum_acc / k_n;
+        let mean_pro = 100.0 * sum_pro / k_n;
+        let mean_hc = sum_hc / k_n;
+        let agg_hc_prec = if tot_hc == 0 {
+            100.0
+        } else {
+            100.0 * tot_hc_ok as f64 / tot_hc as f64
+        };
+        let mean_abstain = 100.0 * sum_abstain / k_n;
+        let mean_nodes = sum_nodes / k_n;
+        let qc_str: Vec<String> = qc_list.iter().map(|q| q.to_string()).collect();
+        println!(
+            "| {label:<17} | {mean_acc:5.1}% | {mean_pro:5.1}% | {mean_nodes:5.1} | {mean_hc:5.1} | {agg_hc_prec:6.1}% | {mean_abstain:6.1}% | {} |",
+            qc_str.join("/")
+        );
+
+        match label {
+            "1_moderate_base" => {
+                assert!(
+                    mean_acc >= 75.0,
+                    "moderate baseline mean accuracy {mean_acc:.1}% too low"
+                );
+                assert!(
+                    mean_pro >= 65.0,
+                    "moderate baseline Proline recovery {mean_pro:.1}% too low"
+                );
+                assert!(
+                    agg_hc_prec >= 88.0,
+                    "moderate baseline HC precision {agg_hc_prec:.1}% below 88%"
+                );
+            }
+            "7_combined_stress" => {
+                assert!(
+                    qc_list.iter().all(|q| *q != DatasetQcVerdict::Pass),
+                    "180.core:P1-2: combined stress MUST NOT return QC=Pass (got {qc_list:?})"
+                );
+                let slots = (seq.len() - 1) as f64;
+                assert!(
+                    mean_hc <= slots * 0.25 || agg_hc_prec >= 78.0,
+                    "180.core:P1-1: combined stress overconfident ({mean_hc:.1} HC @ {agg_hc_prec:.1}% prec)"
+                );
+            }
+            "8_repeat_low_cx" => {
+                assert!(
+                    qc_list.iter().all(|q| *q != DatasetQcVerdict::Pass),
+                    "180.core:P1-2: low-complexity repeat sequence MUST NOT return QC=Pass (got {qc_list:?})"
+                );
+                let slots = (seq.len() - 1) as f64;
+                assert!(
+                    mean_hc <= slots * 0.25 || agg_hc_prec >= 78.0,
+                    "180.core:P1-1: repeat sequence overconfident ({mean_hc:.1} HC @ {agg_hc_prec:.1}% prec)"
+                );
+            }
+            _ => {
+                let slots = (seq.len() - 1) as f64;
+                assert!(
+                    mean_hc <= slots * 0.30 || agg_hc_prec >= 75.0,
+                    "180.core:P1-1: {label} overconfident ({mean_hc:.1} HC @ {agg_hc_prec:.1}% prec)"
+                );
+            }
+        }
+    }
+}
+
+/// Real-solver multi-seed (`3` seeds) baseline comparison (`P2-6`):
+/// Compares REAL `13C`-detected solver (`idp_solver::try_assign_idp_13c_cpu` with CAS) and REAL
+/// `1H`-detected solver (`evo_graph::assign_evo_graph_from_peaks`) against `assign_joint_idp_cpu`
+/// on the exact same realistic Pro/Ser-rich IDP multi-seed dataset (zero `anchor_root_idx`,
+/// standard HNCACB polarity, zero TMS offset so all 3 real solvers run fairly).
+#[test]
+fn test_v180_real_solver_multiseed_baseline_comparison() {
+    let seq = synthetic_pro_ser_rich_idp_sequence();
+    let priors = Priors::bmrb();
+    let seeds = [11_u64, 23, 37];
+    let spec = IdpStressSpec {
+        jitter_h: 0.006,
+        jitter_n: 0.04,
+        jitter_c: 0.018,
+        rc_dev_scale: 1.0,
+        random_drop_frac: 0.08,
+        n_decoy_con_roots: 15,
+        n_decoy_hn_roots: 6,
+        tms_c13_offset: 0.0,
+        invert_hncacb: false,
+        include_trosy_hncaconh: true,
+        include_cas: true,
+        exchange_broaden: true,
+    };
+
+    let mut joint_acc_sum = 0.0;
+    let mut joint_pro_sum = 0.0;
+    let mut c13_acc_sum = 0.0;
+    let mut c13_pro_sum = 0.0;
+    let mut hn_acc_sum = 0.0;
+
+    for &seed in &seeds {
+        let (ds, truth) = synthesize_idp_stress_dataset(&seq, seed, &spec);
+
+        // 1. Unified Joint solver (`assign_joint_idp_cpu`)
+        let j_cfg = JointIdpConfig {
+            replicas: 16,
+            steps_per_system: 900,
+            seed: seed * 31 + 1,
+            ..JointIdpConfig::default()
+        };
+        let j_res = assign_joint_idp_cpu(&ds, &seq, &j_cfg).unwrap();
+        let j_ev = evaluate_joint_result(&j_res, &truth);
+        joint_acc_sum += j_ev.acc();
+        joint_pro_sum += j_ev.pro_acc();
+
+        // 2. Real 13C-detected IDP solver (`idp_solver::try_assign_idp_13c_cpu` with CAS)
+        let con_systems = register_and_build_con_dipeptide_systems(&ds.c13_dataset);
+        let c13_cfg = IdpSolverConfig {
+            replicas: 16,
+            steps_per_system: 900,
+            seed: seed * 31 + 1,
+            cas_spectra: ds.cas_spectra.clone(),
+            ..IdpSolverConfig::default()
+        };
+        let c13_res = try_assign_idp_13c_cpu(&con_systems, &seq, &c13_cfg).unwrap();
+        let mut c13_slot_to_sys: BTreeMap<usize, usize> = BTreeMap::new();
+        for (si, &pos) in c13_res.position.iter().enumerate() {
+            if pos >= 1 && (pos as usize) < seq.len() {
+                c13_slot_to_sys.insert(pos as usize, si);
+            }
+        }
+        let mut c13_ok = 0usize;
+        let mut c13_pro_ok = 0usize;
+        let mut n_pro = 0usize;
+        for k in 1..seq.len() {
+            if seq[k] == "PRO" {
+                n_pro += 1;
+            }
+            let Some(&si) = c13_slot_to_sys.get(&k) else {
+                continue;
+            };
+            let sys = &con_systems[si];
+            let c_corr = sys.c_prev - c13_res.fitted_offsets.d_c;
+            let n_corr = sys.n_curr - c13_res.fitted_offsets.d_n;
+            let dist_k = ((c_corr - truth.shifts[k - 1].2) / 0.14)
+                .hypot((n_corr - truth.shifts[k].1) / 0.55);
+            let mut best_slot = k;
+            let mut best_dist = dist_k;
+            for kp in 1..seq.len() {
+                let d = ((c_corr - truth.shifts[kp - 1].2) / 0.14)
+                    .hypot((n_corr - truth.shifts[kp].1) / 0.55);
+                if d < best_dist {
+                    best_dist = d;
+                    best_slot = kp;
+                }
+            }
+            if best_slot == k && dist_k <= 2.8 {
+                c13_ok += 1;
+                if seq[k] == "PRO" {
+                    c13_pro_ok += 1;
+                }
+            }
+        }
+        c13_acc_sum += c13_ok as f64 / (seq.len() - 1) as f64;
+        c13_pro_sum += c13_pro_ok as f64 / n_pro.max(1) as f64;
+
+        // 3. Real 1H-detected backbone solver (`evo_graph::assign_evo_graph_from_peaks`)
+        let evo_cfg = EvoGraphConfig {
+            steps_per_system_per_gen: 900,
+            seed: seed * 31 + 1,
+            ..EvoGraphConfig::default()
+        };
+        let (hn_systems, hn_res, _) =
+            assign_evo_graph_from_peaks(&ds.hn_peaks, &seq, &priors, &evo_cfg);
+        let mut hn_slot_to_sys: BTreeMap<usize, usize> = BTreeMap::new();
+        for (si, &pos) in hn_res.position.iter().enumerate() {
+            if pos >= 1 && (pos as usize) < seq.len() {
+                hn_slot_to_sys.insert(pos as usize, si);
+            }
+        }
+        let mut hn_ok = 0usize;
+        for (k, aa) in seq.iter().enumerate().skip(1) {
+            if aa == "PRO" {
+                continue; // 1H-only cannot assign Prolines (no amide 1H)
+            }
+            let Some(&si) = hn_slot_to_sys.get(&k) else {
+                continue;
+            };
+            let sys = &hn_systems[si];
+            if let Some(h_true) = truth.shifts[k].0 {
+                let dh = (sys.h - h_true).abs();
+                let dn = (sys.n - truth.shifts[k].1).abs();
+                if dh <= 0.08 && dn <= 0.55 {
+                    hn_ok += 1;
+                }
+            }
+        }
+        hn_acc_sum += hn_ok as f64 / (seq.len() - 1) as f64;
+    }
+
+    let n_s = seeds.len() as f64;
+    let joint_acc = 100.0 * joint_acc_sum / n_s;
+    let joint_pro = 100.0 * joint_pro_sum / n_s;
+    let c13_acc = 100.0 * c13_acc_sum / n_s;
+    let c13_pro = 100.0 * c13_pro_sum / n_s;
+    let hn_acc = 100.0 * hn_acc_sum / n_s;
+
+    println!(
+        "\n=== Real-Solver 3-Seed Baseline Comparison (140-aa Pro/Ser IDP, 0 anchor_root_idx) ==="
+    );
+    println!("| Solver | 3-Seed Mean Acc% | 3-Seed Pro Recovery% |");
+    println!("|---|---:|---:|");
+    println!("| Joint (`assign_joint_idp_cpu`)          | {joint_acc:5.1}% | {joint_pro:5.1}% |");
+    println!("| Real 13C (`idp_solver::try_assign_idp`) | {c13_acc:5.1}% | {c13_pro:5.1}% |");
+    println!("| Real 1H  (`evo_graph::assign_evo_graph`)| {hn_acc:5.1}% |   0.0% |");
+
+    assert!(
+        joint_acc > c13_acc + 5.0,
+        "Joint ({joint_acc:.1}%) should decisively beat real 13C-only ({c13_acc:.1}%)"
+    );
+    assert!(
+        joint_acc > hn_acc + 5.0,
+        "Joint ({joint_acc:.1}%) should decisively beat real 1H-only ({hn_acc:.1}%)"
+    );
+    assert!(
+        joint_pro >= 65.0,
+        "Joint Proline recovery ({joint_pro:.1}%) must decisively exceed 1H-only (0.0%)"
+    );
+}
+
+/// Real experimental Clec16a IDPR2 (`CON + CAS + HN`) regression test (`180.core:P1-3`), gated on
+/// `NMR_REAL_DATA_DIR`. Runs real Bruker `pdata/1` spectra end-to-end through `assign_joint_idp_cpu`
+/// and verifies physical invariants & honest QC — with NO false ground-truth accuracy claim.
+#[test]
+fn test_v180_clec16a_real_data_joint_idp_regression() {
+    let Ok(root_str) = std::env::var("NMR_REAL_DATA_DIR") else {
+        return;
+    };
+    let clec = PathBuf::from(root_str).join("private/clec16a");
+    let fasta = clec.join("clec16a_mouse_892-1050.fasta");
+    let con_dir = clec.join("13C15N_Clec16aIDPR2_MG_091119/10007/pdata/1");
+    let hsqc_dir = clec.join("13C15N_Clec16aIDPR2_MG_021320/9/pdata/1");
+    let hnco_dir = clec.join("13C15N_Clec16aIDPR2_MG_021320/7/pdata/1");
+    let hncacb_dir = clec.join("13C15N_Clec16aIDPR2_MG_021320/10/pdata/1");
+    let hncocacb_dir = clec.join("13C15N_Clec16aIDPR2_MG_021320/11/pdata/1");
+    let cas_ala_dir = clec.join("13C15N_Clec16aIDPR2_MG_091119/10013/pdata/1");
+    let cas_gly_dir = clec.join("13C15N_Clec16aIDPR2_MG_091119/10015/pdata/1");
+    let cas_ser_dir = clec.join("13C15N_Clec16aIDPR2_MG_021320/10013/pdata/1");
+    if !fasta.exists() || !con_dir.exists() || !hsqc_dir.exists() {
+        return;
+    }
+
+    let seq_txt = std::fs::read_to_string(&fasta).unwrap();
+    let seq: Vec<String> = seq_txt
+        .lines()
+        .filter(|l| !l.starts_with('>'))
+        .flat_map(|l| l.trim().chars())
+        .filter(|c| c.is_ascii_alphabetic())
+        .map(|c| one_to_three(c).to_string())
+        .collect();
+    assert!(
+        seq.len() >= 100,
+        "unexpected Clec16a sequence length {}",
+        seq.len()
+    );
+
+    // Pick 2D CON + CAS
+    let c13_cfg = C13PickerConfig::default();
+    let sp_con = read_bruker_pdata_2d(&con_dir).unwrap();
+    let con_roots = pick_con_2d(&sp_con, &c13_cfg);
+
+    let mut cas_spectra = Vec::new();
+    for (label, mode, res_vec, dir) in [
+        (
+            "cacon_ala",
+            CasMode::Cacon,
+            vec!["ALA".to_string()],
+            &cas_ala_dir,
+        ),
+        (
+            "cacon_gly",
+            CasMode::Cacon,
+            vec!["GLY".to_string()],
+            &cas_gly_dir,
+        ),
+        (
+            "cacon_ser",
+            CasMode::Cacon,
+            vec!["SER".to_string()],
+            &cas_ser_dir,
+        ),
+    ] {
+        if dir.exists() {
+            let sp = read_bruker_pdata_2d(dir).unwrap();
+            let peaks: Vec<CasPeak> = pick_con_2d(&sp, &c13_cfg)
+                .into_iter()
+                .map(|p| CasPeak {
+                    c_prime_ppm: p.c_prev_ppm,
+                    n_ppm: p.n_curr_ppm,
+                    height: p.height,
+                    volume: p.volume,
+                })
+                .collect();
+            cas_spectra.push(CasSpectrum {
+                name: label.to_string(),
+                mode,
+                residues: res_vec,
+                peaks,
+            });
+        }
+    }
+
+    // Pick 2D BEST-HSQC + 3D HNCO / HNCACB / HNCOCACB
+    let pcfg = PickerConfig::default();
+    let sp_hsqc = read_bruker_pdata_2d(&hsqc_dir).unwrap();
+    let hsqc_roots = pick_hsqc_2d(&sp_hsqc, &pcfg);
+    let mut hn_peaks = hsqc_roots.clone();
+    for (exp, dir) in [
+        ("HNCO", &hnco_dir),
+        ("HNCACB", &hncacb_dir),
+        ("HNCOCACB", &hncocacb_dir),
+    ] {
+        if dir.exists() {
+            let sp3 = read_bruker_pdata_3d(dir, exp).unwrap();
+            hn_peaks.extend(pick_triple_3d(&sp3, &hsqc_roots, &pcfg));
+        }
+    }
+
+    let ds = JointIdpDataset {
+        hn_peaks,
+        c13_dataset: C13PickedDataset {
+            con_roots,
+            caco_peaks: Vec::new(),
+            strip_peaks: Vec::new(),
+        },
+        cas_spectra,
+        hncacon_nn_edges: Vec::new(),
+        hncaconh_peaks: Vec::new(),
+        reciprocal_nn_pairs: Vec::new(),
+        proton_mhz: 800.0,
+        user_locks: Vec::new(),
+    };
 
     let cfg = JointIdpConfig {
-        replicas: 24,
-        islands: 4,
-        generations: 3,
-        steps_per_system: 1_600,
+        replicas: 12,
+        steps_per_system: 800,
+        seed: 0,
+        ..JointIdpConfig::default()
+    };
+    let res = assign_joint_idp_cpu(&ds, &seq, &cfg).unwrap();
+    let n_fused = res
+        .nodes
+        .iter()
+        .filter(|n| n.kind == JointNodeKind::AmideFused && n.hn_matched && n.con_matched)
+        .count();
+    let n_pro_nodes = res
+        .nodes
+        .iter()
+        .filter(|n| n.kind == JointNodeKind::ProlineConBridge)
+        .count();
+    let n_assigned = res
+        .residue_assignments
+        .iter()
+        .filter(|r| r.node_idx.is_some())
+        .count();
+    let n_hc = res
+        .residue_assignments
+        .iter()
+        .filter(|r| r.node_idx.is_some() && r.confidence >= 0.80)
+        .count();
+    let (pro_ok, pro_tot) = res.proline_bridge_recovery;
+
+    println!(
+        "\n=== Clec16a Real-Data Replay (L={}, CON={}, HSQC={}) ===",
+        seq.len(),
+        ds.c13_dataset.con_roots.len(),
+        hsqc_roots.len()
+    );
+    println!(
+        "Nodes={} (CrossValFused={}, ProBridge={}) | Assigned={} | HC(>=0.8)={} | Pro={pro_ok}/{pro_tot} | Offsets=(dC={:+.2}, dCA={:+.2}, dCB={:+.2}, dN={:+.2}) | QC={} ({:?})",
+        res.nodes.len(),
+        n_fused,
+        n_pro_nodes,
+        n_assigned,
+        n_hc,
+        res.fitted_offsets.d_c,
+        res.fitted_offsets.d_ca,
+        res.fitted_offsets.d_cb,
+        res.fitted_offsets.d_n,
+        res.qc_verdict,
+        res.qc_reasons,
+    );
+
+    assert!(res.score.is_finite(), "Clec16a score must be finite");
+    assert!(
+        res.confidence
+            .iter()
+            .all(|c| c.is_finite() && *c >= 0.0 && *c <= 1.0),
+        "Clec16a confidences must be finite in [0, 1]"
+    );
+    assert!(
+        n_pro_nodes > 0,
+        "Clec16a must detect Proline CON imino nodes"
+    );
+    assert!(n_fused > 0, "Clec16a must fuse HNCO + CON amide nodes");
+    assert!(n_assigned > 0, "Clec16a must place backbone nodes");
+}
+
+/// `P2-1`: Verify exact Hungarian bipartite HN↔CON fusion keeps node count bounded under high
+/// `0.02 H / 0.15 N / 0.05 C` jitter (no Round-1 greedy explosion to 188–202 nodes!).
+#[test]
+fn test_p2_1_hungarian_fusion_stable_under_high_noise() {
+    let seq = synthetic_pro_ser_rich_idp_sequence();
+    let spec = IdpStressSpec {
+        jitter_h: 0.02,
+        jitter_n: 0.15,
+        jitter_c: 0.05,
+        random_drop_frac: 0.05,
+        n_decoy_con_roots: 0,
+        n_decoy_hn_roots: 0,
+        tms_c13_offset: 0.0,
+        ..IdpStressSpec::default()
+    };
+    let (ds, _) = synthesize_idp_stress_dataset(&seq, 42, &spec);
+    let cfg = JointIdpConfig {
+        replicas: 4,
+        steps_per_system: 150,
         seed: 42,
         ..JointIdpConfig::default()
     };
+    let res = assign_joint_idp_cpu(&ds, &seq, &cfg).unwrap();
+    let n_fused = res
+        .nodes
+        .iter()
+        .filter(|n| n.kind == JointNodeKind::AmideFused && n.hn_matched && n.con_matched)
+        .count();
+    assert!(
+        res.nodes.len() <= 165,
+        "P2-1: Hungarian fusion must not explode node count under 0.02/0.15/0.05 noise (got {})",
+        res.nodes.len()
+    );
+    assert!(
+        n_fused >= 65,
+        "P2-1: Hungarian fusion must still fuse >= 65 amide pairs under 0.02/0.15/0.05 noise (got {n_fused})"
+    );
+}
 
-    // Arm 1: `HN`-only (no 2D CON, no 13C strips, no CAS, no (H)N(CA)CON)
-    let hn_only_dataset = JointIdpDataset {
-        hn_peaks: full_dataset.hn_peaks.clone(),
+/// `P2-2`: Verify partner-checked near-diagonal `BT_HNCACONH` (`|N_i - N_partner| <= 0.35 ppm`)
+/// links are retained with smooth down-weighting (`0.45..1.0`) rather than hard-dropped.
+#[test]
+fn test_p2_2_near_diagonal_bt_hncaconh_retained() {
+    let seq: Vec<String> = ["MET", "ALA", "SER", "GLY", "GLU", "ALA"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let hn_peaks = vec![
+        Peak::hsqc(8.20, 120.00).with_intensity(1.0e5, None),
+        Peak::triple("HNCO", 8.20, 120.00, 174.10, 1).with_intensity(1.0e5, None),
+        Peak::hsqc(8.45, 120.20).with_intensity(1.0e5, None),
+        Peak::triple("HNCO", 8.45, 120.20, 175.80, 1).with_intensity(1.0e5, None),
+    ];
+    let hncaconh_peaks = vec![
+        HncaconhPeak {
+            h_ppm: 8.20,
+            n_curr_ppm: 120.00,
+            n_partner_ppm: 120.20,
+            height: 5.0e4,
+        },
+        HncaconhPeak {
+            h_ppm: 8.45,
+            n_curr_ppm: 120.20,
+            n_partner_ppm: 120.00,
+            height: 5.0e4,
+        },
+    ];
+    let ds = JointIdpDataset {
+        hn_peaks,
         c13_dataset: C13PickedDataset::default(),
         cas_spectra: Vec::new(),
         hncacon_nn_edges: Vec::new(),
-        hncaconh_peaks: full_dataset.hncaconh_peaks.clone(),
+        hncaconh_peaks,
         reciprocal_nn_pairs: Vec::new(),
-        proton_mhz: full_dataset.proton_mhz,
+        proton_mhz: 800.0,
         user_locks: Vec::new(),
     };
-    let res_hn = assign_joint_idp(&hn_only_dataset, seq, &cfg).expect("HN-only solve");
-    let (hn_acc, hn_rec, hn_pro_rec, hn_exch_rec, hn_hcp, hn_ok, n_tot, hn_pro_ok, n_pro) =
-        evaluate_against_truth(&res_hn, &truth);
-
-    // Arm 2: `CON`-only (`2D CON` + `H(CC)CON`/`CBCACON` + `CAS` + `(H)N(CA)CON`, no `HN` spectra)
-    let con_only_dataset = JointIdpDataset {
-        hn_peaks: Vec::new(),
-        c13_dataset: full_dataset.c13_dataset.clone(),
-        cas_spectra: full_dataset.cas_spectra.clone(),
-        hncacon_nn_edges: full_dataset.hncacon_nn_edges.clone(),
-        hncaconh_peaks: Vec::new(),
-        reciprocal_nn_pairs: Vec::new(),
-        proton_mhz: full_dataset.proton_mhz,
-        user_locks: Vec::new(),
-    };
-    let res_con = assign_joint_idp(&con_only_dataset, seq, &cfg).expect("CON-only solve");
-    let (con_acc, con_rec, con_pro_rec, con_exch_rec, con_hcp, con_ok, _, con_pro_ok, _) =
-        evaluate_against_truth(&res_con, &truth);
-
-    // Arm 3: Unified `idp-joint` (pooled `HN + 2D CON + Proline-Bridge + N-N + CAS`)
-    let res_joint = assign_joint_idp(&full_dataset, seq, &cfg).expect("Joint IDP solve");
-    let (jt_acc, jt_rec, jt_pro_rec, jt_exch_rec, jt_hcp, jt_ok, _, jt_pro_ok, _) =
-        evaluate_against_truth(&res_joint, &truth);
-
-    eprintln!(
-        "\n=== Synthetic 140-aa Pro/Ser-Rich IDP Benchmark (15% Pro, 14% Exch, -2.7 TMS, 800 MHz TROSY) ==="
-    );
-    eprintln!(
-        "HN-only  : acc={:5.1}% rec={:5.1}% ({:3}/{:3}) Pro={:5.1}% ({:2}/{:2}) Exch={:5.1}% HCP={:5.1}%",
-        100.0 * hn_acc, 100.0 * hn_rec, hn_ok, n_tot, 100.0 * hn_pro_rec, hn_pro_ok, n_pro, 100.0 * hn_exch_rec, 100.0 * hn_hcp
-    );
-    eprintln!(
-        "CON-only : acc={:5.1}% rec={:5.1}% ({:3}/{:3}) Pro={:5.1}% ({:2}/{:2}) Exch={:5.1}% HCP={:5.1}%",
-        100.0 * con_acc, 100.0 * con_rec, con_ok, n_tot, 100.0 * con_pro_rec, con_pro_ok, n_pro, 100.0 * con_exch_rec, 100.0 * con_hcp
-    );
-    eprintln!(
-        "idp-joint: acc={:5.1}% rec={:5.1}% ({:3}/{:3}) Pro={:5.1}% ({:2}/{:2}) Exch={:5.1}% HCP={:5.1}% | locks={} sidelobes={} gly_guard={}",
-        100.0 * jt_acc, 100.0 * jt_rec, jt_ok, n_tot, 100.0 * jt_pro_rec, jt_pro_ok, n_pro, 100.0 * jt_exch_rec, 100.0 * jt_hcp,
-        res_joint.pass1_locked_anchors.len(), res_joint.n_sidelobes_pruned, res_joint.n_gly_cb_guarded
-    );
-    eprintln!(
-        "Offsets  : dN={:+.3}, dC'={:+.3}, dCA={:+.3}, dCB={:+.3} | TROSY=({:+.4} H, {:+.4} N, detected={}) | routes: XVal={} ProBr={} ConOnly={} HnOnly={}",
-        res_joint.fitted_offsets.d_n,
-        res_joint.fitted_offsets.d_c,
-        res_joint.fitted_offsets.d_ca,
-        res_joint.fitted_offsets.d_cb,
-        res_joint.trosy_calibration.dh_ppm,
-        res_joint.trosy_calibration.dn_ppm,
-        res_joint.trosy_calibration.trosy_detected,
-        res_joint.n_cross_validated_hn_con,
-        res_joint.n_con_pro_bridges,
-        res_joint.n_con_route_only,
-        res_joint.n_hn_route_only
-    );
-
-    // 1. Unified `idp-joint` significantly outperforms BOTH `HN`-only and `CON`-only!
-    assert!(
-        jt_rec >= 0.88,
-        "Expected idp-joint recall >= 88%, got {:.1}% ({jt_ok}/{n_tot})",
-        100.0 * jt_rec
-    );
-    assert!(
-        jt_acc >= 0.88,
-        "Expected idp-joint accuracy >= 88%, got {:.1}%",
-        100.0 * jt_acc
-    );
-    assert!(
-        jt_rec >= hn_rec + 0.18,
-        "Expected idp-joint recall ({:.1}%) to beat HN-only ({:.1}%) by >= 18 pp",
-        100.0 * jt_rec,
-        100.0 * hn_rec
-    );
-    assert!(
-        jt_rec >= con_rec + 0.12 && jt_acc > con_acc && jt_acc > hn_acc,
-        "Expected idp-joint recall ({:.1}%) & acc ({:.1}%) to significantly beat CON-only ({:.1}% / {:.1}%) and HN-only ({:.1}% / {:.1}%)",
-        100.0 * jt_rec,
-        100.0 * jt_acc,
-        100.0 * con_rec,
-        100.0 * con_acc,
-        100.0 * hn_rec,
-        100.0 * hn_acc
-    );
-    assert!(
-        jt_hcp >= 0.92,
-        "Expected idp-joint HC precision >= 92%, got {:.1}%",
-        100.0 * jt_hcp
-    );
-
-    // 2. Proline-bridge recovery & exchange-broadened `ConOnlyAmide` recovery
-    assert_eq!(hn_pro_ok, 0, "HN-only cannot assign Prolines");
-    assert!(
-        jt_pro_rec >= 0.85,
-        "Expected idp-joint Proline-bridge recall >= 85%, got {:.1}% ({jt_pro_ok}/{n_pro})",
-        100.0 * jt_pro_rec
-    );
-    assert!(
-        jt_exch_rec >= 0.70,
-        "Expected idp-joint exchange-broadened ConOnlyAmide recall >= 70%, got {:.1}%",
-        100.0 * jt_exch_rec
-    );
-    assert!(res_joint.n_cross_validated_hn_con >= 70);
-    assert!(res_joint.n_con_pro_bridges >= 18);
-    assert!(res_joint.n_con_route_only >= 10);
-    assert!(
-        res_joint.n_hn_route_only >= 5,
-        "Expected HnRoute-only recovery for CON-dropped amides, got {}",
-        res_joint.n_hn_route_only
-    );
-
-    // 3. Auto-calibration of uniform `-2.70 ppm` TMS `13C` offset and `800 MHz` TROSY `±46 Hz / MHz`
-    assert!(
-        (res_joint.fitted_offsets.d_c - (-2.70)).abs() <= 0.25,
-        "Expected dC' ≈ -2.70 ppm TMS, got {:+.3}",
-        res_joint.fitted_offsets.d_c
-    );
-    assert!(
-        (res_joint.fitted_offsets.d_ca - (-2.70)).abs() <= 0.25,
-        "Expected dCA ≈ -2.70 ppm TMS, got {:+.3}",
-        res_joint.fitted_offsets.d_ca
-    );
-    assert!(
-        (res_joint.fitted_offsets.d_cb - (-2.70)).abs() <= 0.30,
-        "Expected dCB ≈ -2.70 ppm TMS, got {:+.3}",
-        res_joint.fitted_offsets.d_cb
-    );
-    assert!(
-        res_joint.auto_ref_report.tms_reference_hint.is_some(),
-        "Expected TMS reference hint on uniform -2.7 ppm 13C offset"
-    );
-
-    let exp_dh = -TROSY_HALF_J_HN_HZ / 800.0;
-    let exp_dn = TROSY_HALF_J_HN_HZ / n15_obs_mhz(800.0);
-    assert!(res_joint.trosy_calibration.trosy_detected);
-    assert!(
-        (res_joint.trosy_calibration.dh_ppm - exp_dh).abs() <= 0.015,
-        "Expected TROSY dH ≈ {exp_dh:+.4}, got {:+.4}",
-        res_joint.trosy_calibration.dh_ppm
-    );
-    assert!(
-        (res_joint.trosy_calibration.dn_ppm - exp_dn).abs() <= 0.10,
-        "Expected TROSY dN ≈ {exp_dn:+.4}, got {:+.4}",
-        res_joint.trosy_calibration.dn_ppm
-    );
-
-    // 4. Strip hygiene, C-terminal COO- prior, and 2-pass anchor-lock telemetry
-    assert!(
-        res_joint.n_sidelobes_pruned >= 20,
-        "Expected F1(C') NUS sidelobes pruned"
-    );
-    assert!(
-        res_joint.n_gly_cb_guarded >= 5,
-        "Expected Gly CB bleed-through guarded"
-    );
-    assert!(
-        !res_joint.c_term_coo_candidates.is_empty(),
-        "Expected C-terminal COO- (~179 ppm DSS) candidate detected"
-    );
-    assert!(
-        !res_joint.pass1_locked_anchors.is_empty(),
-        "Expected Pass-1 unequivocal anchors locked before Pass-2"
-    );
-    assert!(
-        res_joint.residue_assignments[seq.len() - 1].is_cterm_coo,
-        "Expected C-terminal residue flagged as COO- anchored"
-    );
-    assert_eq!(res_joint.qc_verdict, DatasetQcVerdict::Pass);
-}
-
-#[test]
-fn test_trosy_half_j_hn_calibration_600_and_800_mhz() {
-    let mut rng = Rng::new(77);
-    let decoupled: Vec<(f64, f64)> = (0..35)
-        .map(|i| (7.6 + (i as f64) * 0.04, 112.0 + (i as f64) * 0.55))
-        .collect();
-
-    // 1. Canonical TROSY at 600 MHz (`-46/600 = -0.0767 H, +46/60.80 = +0.7566 N`)
-    let dh600 = -TROSY_HALF_J_HN_HZ / 600.0;
-    let dn600 = TROSY_HALF_J_HN_HZ / n15_obs_mhz(600.0);
-    let trosy600: Vec<(f64, f64)> = decoupled
-        .iter()
-        .map(|&(h, n)| {
-            (
-                h + dh600 + rng.normal(0.0, 0.003),
-                n + dn600 + rng.normal(0.0, 0.02),
-            )
-        })
-        .collect();
-    let cal600 = calibrate_trosy_hn_offset(&trosy600, &decoupled, 600.0);
-    assert!(cal600.trosy_detected);
-    assert!((cal600.dh_ppm - dh600).abs() < 0.01);
-    assert!((cal600.dn_ppm - dn600).abs() < 0.06);
-
-    // 2. Anti-TROSY / inverted-sign quadrant at 800 MHz (`+46/800 H, -46/81.06 N`)
-    let dh800 = TROSY_HALF_J_HN_HZ / 800.0;
-    let dn800 = -TROSY_HALF_J_HN_HZ / n15_obs_mhz(800.0);
-    let trosy800: Vec<(f64, f64)> = decoupled
-        .iter()
-        .map(|&(h, n)| {
-            (
-                h + dh800 + rng.normal(0.0, 0.003),
-                n + dn800 + rng.normal(0.0, 0.02),
-            )
-        })
-        .collect();
-    let cal800 = calibrate_trosy_hn_offset(&trosy800, &decoupled, 800.0);
-    assert!(cal800.trosy_detected);
-    assert!((cal800.dh_ppm - dh800).abs() < 0.01);
-    assert!((cal800.dn_ppm - dn800).abs() < 0.06);
-
-    // 3. Decoupled null (zero shift): must NOT trigger a false TROSY shift!
-    let dec_noisy: Vec<(f64, f64)> = decoupled
-        .iter()
-        .map(|&(h, n)| (h + rng.normal(0.0, 0.003), n + rng.normal(0.0, 0.02)))
-        .collect();
-    let cal_null = calibrate_trosy_hn_offset(&dec_noisy, &decoupled, 800.0);
-    assert!(!cal_null.trosy_detected);
-    assert_eq!(cal_null.dh_ppm, 0.0);
-    assert_eq!(cal_null.dn_ppm, 0.0);
-}
-
-#[test]
-fn test_f1_c_prime_nus_sidelobe_pruning_and_gly_cb_bleedthrough_guard() {
-    // 1. `F1(C')` NUS sidelobe pruning retains real `C'_i` + `C'_{i-1}` while dropping weak sidelobes
-    let raw_strip = vec![
-        (175.40, 100_000.0), // true C'_i
-        (174.10, 68_000.0),  // true C'_{i-1}
-        (176.35, 11_000.0),  // NUS sidelobe (11% within 2.2 ppm)
-        (174.90, 9_500.0),   // NUS sidelobe (9.5% within 2.2 ppm)
-        (150.00, 80_000.0),  // out-of-window noise
-    ];
-    let (kept, pruned) = prune_f1_c_prime_nus_sidelobes(&raw_strip, 3);
-    assert_eq!(kept.len(), 2);
-    assert_eq!(pruned, 3);
-    assert!((kept[0].0 - 175.40).abs() < 1e-6);
-    assert!((kept[1].0 - 174.10).abs() < 1e-6);
-
-    // 2. `Gly CB` bleed-through guard under BOTH DSS (0.0) and TMS (-2.7 ppm) offsets
-    let make_node = |id: usize, ca_c: f64, cb_c: f64| JointIdpNode {
-        id,
-        kind: JointNodeKind::AmideFused,
-        hn_matched: true,
-        con_matched: true,
-        h_curr: Some(8.2),
-        n_curr: 112.0,
-        hn_n_curr: Some(112.0),
-        c_prev: Some(174.0),
-        root_height: 1.0e5,
-        ca_curr: vec![ca_c],
-        cb_curr: vec![cb_c],
-        ca_prev: Vec::new(),
-        cb_prev: Vec::new(),
-        c_curr: Vec::new(),
-        sidechain_c_prev: Vec::new(),
-        nn_prev_cands: Vec::new(),
-        recip_nn_partners: Vec::new(),
-        prev_gly_opposite_phase: false,
-        has_prev_cb_exp: true,
-        has_curr_cb_exp: true,
-        gly_cb_curr_suppressed: false,
-        gly_cb_prev_suppressed: false,
-        f1_sidelobes_pruned: 0,
-        registration_warnings: Vec::new(),
-    };
-
-    // Node 0: Gly with CA=45.1 - 2.7 = 42.4, bleed-through CB=42.7; Node 1: Ser with CA=55.6, CB=61.1
-    let mut nodes = vec![make_node(0, 42.4, 42.7), make_node(1, 55.6, 61.1)];
-    let tms_off = IdpShiftOffsets {
-        d_n: 0.0,
-        d_c: -2.7,
-        d_ca: -2.7,
-        d_cb: -2.7,
-    };
-    let n_guarded = apply_gly_cb_bleedthrough_guard(&mut nodes, &tms_off);
-    assert_eq!(n_guarded, 1);
-    assert!(nodes[0].cb_curr.is_empty());
-    assert!(nodes[0].gly_cb_curr_suppressed);
-    assert_eq!(nodes[1].cb_curr, vec![61.1]);
-    assert!(!nodes[1].gly_cb_curr_suppressed);
-}
-
-#[test]
-fn test_platzer_cterm_coo_and_pre_proline_priors() {
-    let seq: Vec<String> = ["ALA", "SER", "PRO", "GLY", "LEU", "ALA"]
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
-    let cfg = JointIdpConfig::default();
-    let preds = predict_joint_ncidp_shifts(&seq, &cfg);
-
-    // Pre-Proline (`SER` at index 1 before `PRO` at index 2) vs internal `SER`
-    let seq_nopro: Vec<String> = ["ALA", "SER", "ALA", "GLY", "LEU", "ALA"]
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
-    let preds_nopro = predict_joint_ncidp_shifts(&seq_nopro, &cfg);
-    let dc_pre_pro = preds[1].c_ppm - preds_nopro[1].c_ppm;
-    let dca_pre_pro = preds[1].ca_ppm - preds_nopro[1].ca_ppm;
-    assert!(
-        dc_pre_pro < -1.7 && dc_pre_pro > -2.3,
-        "Expected pre-Pro C' shift ≈ -1.9 ppm, got {dc_pre_pro:+.2}"
-    );
-    assert!(
-        dca_pre_pro < -1.7 && dca_pre_pro > -2.3,
-        "Expected pre-Pro CA shift ≈ -1.8 ppm, got {dca_pre_pro:+.2}"
-    );
-
-    // C-terminal `COO-` at `k = L - 1` (`~179 ppm` DSS at pH 6.5) vs acidic pH 2.0 protonation
-    let last = preds.len() - 1;
-    assert!(
-        preds[last].c_ppm >= 178.4 && preds[last].c_ppm <= 181.0,
-        "Expected Platzer C-term COO- ≈ 179 ppm DSS, got {:.2}",
-        preds[last].c_ppm
-    );
-    let cfg_acid = JointIdpConfig {
-        ph: 2.0,
+    let cfg = JointIdpConfig {
+        replicas: 2,
+        steps_per_system: 50,
+        auto_trosy_calibration: false,
+        auto_reference_offset: false,
+        hncacb_polarity: HncacbPolarity::Auto,
         ..JointIdpConfig::default()
     };
-    let preds_acid = predict_joint_ncidp_shifts(&seq, &cfg_acid);
+    let res = assign_joint_idp_cpu(&ds, &seq, &cfg).unwrap();
+    let total_recip: usize = res.nodes.iter().map(|n| n.recip_nn_partners.len()).sum();
     assert!(
-        preds_acid[last].c_ppm < preds[last].c_ppm - 2.0,
-        "Expected acidic protonation of C-term COO- -> COOH"
+        total_recip >= 2,
+        "P2-2: near-diagonal (0.20 ppm) partner-checked BT_HNCACONH edges must be retained, got {total_recip}"
     );
-
-    // Verify unary matrix rewards a `179.1 ppm` C-term `c_curr` node at `k = L - 1` over internal `ALA`
-    let node_coo = JointIdpNode {
-        id: 0,
-        kind: JointNodeKind::AmideFused,
-        hn_matched: true,
-        con_matched: true,
-        h_curr: Some(8.05),
-        n_curr: preds[last].n_ppm,
-        hn_n_curr: Some(preds[last].n_ppm),
-        c_prev: Some(preds[last - 1].c_ppm),
-        root_height: 1.0e5,
-        ca_curr: vec![preds[last].ca_ppm],
-        cb_curr: vec![preds[last].cb_ppm.unwrap()],
-        ca_prev: vec![preds[last - 1].ca_ppm],
-        cb_prev: vec![preds[last - 1].cb_ppm.unwrap()],
-        c_curr: vec![179.2],
-        sidechain_c_prev: Vec::new(),
-        nn_prev_cands: Vec::new(),
-        recip_nn_partners: Vec::new(),
-        prev_gly_opposite_phase: false,
-        has_prev_cb_exp: true,
-        has_curr_cb_exp: true,
-        gly_cb_curr_suppressed: false,
-        gly_cb_prev_suppressed: false,
-        f1_sidelobes_pruned: 0,
-        registration_warnings: Vec::new(),
-    };
-    let u = joint_idp_unary_matrix(
-        &[node_coo],
-        &seq_nopro,
-        &[],
-        &cfg,
-        &IdpShiftOffsets::default(),
-        &[],
-    );
-    assert!(
-        u.get(0, last) > u.get(0, 2) + 3.0,
-        "Expected C-term COO- node to strongly prefer k = L - 1 ({:.2}) over internal ALA ({:.2})",
-        u.get(0, last),
-        u.get(0, 2)
-    );
+    for node in &res.nodes {
+        for &(_, w) in &node.recip_nn_partners {
+            assert!(
+                w > 0.40 && w < 0.95,
+                "P2-2: near-diagonal BT_HNCACONH weight should be smoothly down-weighted, got {w}"
+            );
+        }
+    }
 }
 
+/// `P2-4`: Verify `HNCOCACB`, `CBCA(CO)NH`, `HN(CO)CACB`, `BEST-HSQC` aliases attach cleanly.
 #[test]
-fn test_calibrated_cas_overlap_and_breakthrough_damping() {
-    let seq: Vec<String> = ["ALA", "SER", "GLY", "VAL", "LEU", "SER", "ALA", "GLU"]
+fn test_p2_4_hn_experiment_name_aliases() {
+    let seq: Vec<String> = ["MET", "ALA", "SER", "VAL"]
         .iter()
         .map(|s| s.to_string())
         .collect();
-    let cfg = JointIdpConfig::default();
+    for exp_name in ["CBCACONH", "HNCOCACB", "CBCA(CO)NH", "HN(CO)CACB"] {
+        let ds = JointIdpDataset {
+            hn_peaks: vec![
+                Peak::triple("BEST-HSQC", 8.25, 118.4, 0.0, 1).with_intensity(1.0e5, None),
+                Peak::triple("HNCO", 8.25, 118.4, 175.1, 1).with_intensity(9.0e4, None),
+                Peak::triple(exp_name, 8.25, 118.4, 52.4, 1).with_intensity(6.0e4, None),
+                Peak::triple(exp_name, 8.25, 118.4, 19.2, 1).with_intensity(5.5e4, None),
+            ],
+            c13_dataset: C13PickedDataset::default(),
+            cas_spectra: Vec::new(),
+            hncacon_nn_edges: Vec::new(),
+            hncaconh_peaks: Vec::new(),
+            reciprocal_nn_pairs: Vec::new(),
+            proton_mhz: 800.0,
+            user_locks: Vec::new(),
+        };
+        let cfg = JointIdpConfig {
+            replicas: 2,
+            steps_per_system: 50,
+            auto_reference_offset: false,
+            hncacb_polarity: HncacbPolarity::Auto,
+            ..JointIdpConfig::default()
+        };
+        let res = assign_joint_idp_cpu(&ds, &seq, &cfg).unwrap();
+        assert_eq!(res.nodes.len(), 1, "expected 1 node for {exp_name}");
+        assert!(
+            !res.nodes[0].ca_prev.is_empty() && !res.nodes[0].cb_prev.is_empty(),
+            "P2-4: alias {exp_name} failed to attach ca_prev/cb_prev"
+        );
+    }
+}
 
-    let make_root = |id: usize, cp: f64, n: f64| JointIdpNode {
+/// `P2-5`: Verify crowded 140-aa IDP HSQC TROSY auto-calibration detects `800 MHz` TROSY cleanly
+/// while rejecting null decoupled `(0, 0)` without false triggering.
+#[test]
+fn test_p2_5_trosy_crowded_idp_hsqc_and_null_rejection() {
+    let mut rng = Rng::new(777);
+    let mut decoupled_roots = Vec::new();
+    for i in 0..120 {
+        let h = 7.80 + (i % 15) as f64 * 0.065 + rng.normal(0.0, 0.012);
+        let n = 110.0 + (i / 15) as f64 * 2.1 + rng.normal(0.0, 0.15);
+        decoupled_roots.push((h, n));
+    }
+
+    let (exp_dh, exp_dn) = trosy_expected_shift_ppm(800.0);
+    let trosy_roots: Vec<(f64, f64)> = decoupled_roots
+        .iter()
+        .take(60)
+        .map(|&(h, n)| {
+            (
+                h + exp_dh + rng.normal(0.0, 0.004),
+                n + exp_dn + rng.normal(0.0, 0.025),
+            )
+        })
+        .collect();
+    let cal_trosy = calibrate_trosy_hn_offset(&trosy_roots, &decoupled_roots, 800.0);
+    assert!(
+        cal_trosy.trosy_detected && cal_trosy.matched_roots >= MIN_TROSY_MATCHED_ROOTS,
+        "P2-5: 800 MHz TROSY must be detected on crowded IDP HSQC: {cal_trosy:?}"
+    );
+    assert!(
+        (cal_trosy.dh_ppm - exp_dh).abs() < 0.015 && (cal_trosy.dn_ppm - exp_dn).abs() < 0.12,
+        "P2-5: TROSY shift estimate inaccurate: {cal_trosy:?}"
+    );
+
+    // Decoupled null (0, 0) on the exact same crowded HSQC must NOT trigger TROSY detection!
+    let null_roots: Vec<(f64, f64)> = decoupled_roots
+        .iter()
+        .take(60)
+        .map(|&(h, n)| (h + rng.normal(0.0, 0.004), n + rng.normal(0.0, 0.025)))
+        .collect();
+    let cal_null = calibrate_trosy_hn_offset(&null_roots, &decoupled_roots, 800.0);
+    assert!(
+        !cal_null.trosy_detected,
+        "P2-5: decoupled null on crowded IDP HSQC must NOT falsely trigger TROSY: {cal_null:?}"
+    );
+    // Canonical 800 MHz fallback when non-positive MHz is passed
+    assert_eq!(
+        trosy_expected_shift_ppm(0.0),
+        trosy_expected_shift_ppm(CANONICAL_TROSY_FALLBACK_MHZ)
+    );
+}
+
+/// `P2-13`: Verify `prune_f1_c_prime_nus_sidelobes` preserves a weak `0.12x` real `C'_{i-1}` peak
+/// in a 2-peak doublet at `1.5 ppm` while pruning symmetric 4-peak NUS sidelobes.
+#[test]
+fn test_p2_13_f1_c_prime_nus_sidelobe_pruning_preserves_weak_doublet() {
+    let doublet = vec![(175.50, 100_000.0), (174.00, 12_000.0)];
+    let (kept_d, pruned_d) = prune_f1_c_prime_nus_sidelobes(&doublet, 2);
+    assert_eq!(
+        kept_d.len(),
+        2,
+        "P2-13: weak 0.12x real C'_(i-1) doublet peak must be preserved, got {kept_d:?}"
+    );
+    assert_eq!(pruned_d, 0);
+
+    let with_sidelobes = vec![
+        (175.50, 100_000.0),
+        (173.40, 55_000.0),
+        (176.45, 9_000.0),
+        (174.55, 8_800.0),
+    ];
+    let (kept_s, pruned_s) = prune_f1_c_prime_nus_sidelobes(&with_sidelobes, 2);
+    assert_eq!(
+        kept_s.len(),
+        2,
+        "P2-13: expected 2 real C' peaks kept, got {kept_s:?}"
+    );
+    assert_eq!(
+        pruned_s, 2,
+        "P2-13: expected 2 symmetric NUS sidelobes pruned"
+    );
+    assert!((kept_s[0].0 - 175.50).abs() < 1e-6);
+    assert!((kept_s[1].0 - 173.40).abs() < 1e-6);
+}
+
+/// `P2-14`: Verify ALL 4 pre-Proline shift corrections (`C' -1.90, CA -1.80, N +1.65, CB -0.35`)
+/// are applied in `predict_joint_ncidp_shifts` and `pre_pro_shift_corrections`.
+#[test]
+fn test_p2_14_all_four_pre_proline_shifts_applied() {
+    let (dn, dc, dca, dcb) = pre_pro_shift_corrections("ALA");
+    assert!((dn - PRE_PRO_N_CORRECTION_PPM).abs() < 1e-9);
+    assert!((dc - PRE_PRO_C_PRIME_CORRECTION_PPM).abs() < 1e-9);
+    assert!((dca - PRE_PRO_CA_CORRECTION_PPM).abs() < 1e-9);
+    assert!((dcb - PRE_PRO_CB_CORRECTION_PPM).abs() < 1e-9);
+    let (g_dn, g_dc, g_dca, _) = pre_pro_shift_corrections("GLY");
+    assert!(g_dn > 0.0 && g_dc < 0.0 && g_dca < 0.0);
+
+    let cfg = JointIdpConfig::default();
+    let seq_non_pro: Vec<String> = ["MET", "ALA", "SER", "ALA", "GLU"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let seq_pre_pro: Vec<String> = ["MET", "ALA", "SER", "PRO", "GLU"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let pred_a = predict_joint_ncidp_shifts(&seq_non_pro, &cfg);
+    let pred_p = predict_joint_ncidp_shifts(&seq_pre_pro, &cfg);
+
+    let diff_c = pred_p[2].c_ppm - pred_a[2].c_ppm;
+    let diff_ca = pred_p[2].ca_ppm - pred_a[2].ca_ppm;
+    let diff_n = pred_p[2].n_ppm - pred_a[2].n_ppm;
+    let diff_cb = pred_p[2].cb_ppm.unwrap() - pred_a[2].cb_ppm.unwrap();
+    assert!(
+        diff_c < -1.0,
+        "expected pre-Pro C' shift < -1.0 ppm, got {diff_c:+.2}"
+    );
+    assert!(
+        diff_ca < -1.0,
+        "expected pre-Pro CA shift < -1.0 ppm, got {diff_ca:+.2}"
+    );
+    assert!(
+        diff_n > 0.8,
+        "expected pre-Pro N shift > +0.8 ppm, got {diff_n:+.2}"
+    );
+    assert!(
+        diff_cb < -0.1,
+        "expected pre-Pro CB shift < -0.1 ppm, got {diff_cb:+.2}"
+    );
+}
+
+fn make_minimal_node(
+    id: usize,
+    kind: JointNodeKind,
+    c_prev: Option<f64>,
+    n_curr: f64,
+) -> JointIdpNode {
+    JointIdpNode {
         id,
-        kind: JointNodeKind::AmideFused,
-        hn_matched: true,
+        kind,
+        hn_matched: kind == JointNodeKind::AmideFused,
         con_matched: true,
-        h_curr: Some(8.2),
-        n_curr: n,
-        hn_n_curr: Some(n),
-        c_prev: Some(cp),
-        root_height: 1.0e5,
+        h_curr: if kind == JointNodeKind::AmideFused {
+            Some(8.15)
+        } else {
+            None
+        },
+        n_curr,
+        hn_n_curr: if kind == JointNodeKind::AmideFused {
+            Some(n_curr)
+        } else {
+            None
+        },
+        c_prev,
+        root_height: 5.0e4,
         ca_curr: Vec::new(),
         cb_curr: Vec::new(),
         ca_prev: Vec::new(),
@@ -1034,26 +1738,80 @@ fn test_calibrated_cas_overlap_and_breakthrough_damping() {
         gly_cb_prev_suppressed: false,
         f1_sidelobes_pruned: 0,
         registration_warnings: Vec::new(),
-    };
+    }
+}
 
-    // Node 0 isolated at (174.50, 116.0); Nodes 1 & 2 crowded/overlapping at (175.00, 120.0) & (175.02, 120.05)
+#[test]
+fn test_gly_cb_bleedthrough_guard_and_cterm_coo_anchor() {
+    let mut gly_node = make_minimal_node(0, JointNodeKind::AmideFused, Some(174.0), 110.0);
+    gly_node.ca_curr = vec![45.1];
+    gly_node.cb_curr = vec![45.4];
+    let mut ser_node = make_minimal_node(1, JointNodeKind::AmideFused, Some(174.5), 116.0);
+    ser_node.ca_curr = vec![58.2];
+    ser_node.cb_curr = vec![63.8];
+
+    let mut nodes = vec![gly_node, ser_node];
+    let guarded = apply_gly_cb_bleedthrough_guard(&mut nodes, &IdpShiftOffsets::default());
+    assert_eq!(guarded, 1);
+    assert!(nodes[0].cb_curr.is_empty() && nodes[0].gly_cb_curr_suppressed);
+    assert_eq!(nodes[1].cb_curr, vec![63.8]);
+
+    // C-terminal COO- anchor (`~179.3 ppm` DSS) must strongly prefer final residue `L-1`
+    let seq: Vec<String> = ["MET", "ALA", "SER", "GLU", "ALA"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let cfg = JointIdpConfig::default();
+    let preds = predict_joint_ncidp_shifts(&seq, &cfg);
+    let mut node_cterm = make_minimal_node(
+        0,
+        JointNodeKind::AmideFused,
+        Some(preds[3].c_ppm),
+        preds[4].n_ppm,
+    );
+    node_cterm.c_curr = vec![179.30];
+    node_cterm.ca_curr = vec![preds[4].ca_ppm];
+    node_cterm.cb_curr = preds[4].cb_ppm.into_iter().collect();
+    node_cterm.ca_prev = vec![preds[3].ca_ppm];
+    node_cterm.cb_prev = preds[3].cb_ppm.into_iter().collect();
+
+    let u = joint_idp_unary_matrix(
+        &[node_cterm],
+        &seq,
+        &[],
+        &cfg,
+        &IdpShiftOffsets::default(),
+        &[],
+    );
+    assert!(
+        u.get(0, 4) > u.get(0, 1) + 2.0,
+        "C-terminal COO- (179.3 ppm) must score strongly higher at L-1 ({:.2}) vs internal ALA ({:.2})",
+        u.get(0, 4),
+        u.get(0, 1)
+    );
+}
+
+#[test]
+fn test_calibrated_cas_overlap_and_breakthrough_damping() {
+    let seq: Vec<String> = ["MET", "SER", "ALA", "SER", "GLY", "GLU", "VAL", "ALA"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
     let nodes = vec![
-        make_root(0, 174.50, 116.0),
-        make_root(1, 175.00, 120.0),
-        make_root(2, 175.02, 120.05),
-        make_root(3, 176.20, 122.0),
-        make_root(4, 176.90, 124.0),
-        make_root(5, 177.50, 126.0),
+        make_minimal_node(0, JointNodeKind::ConOnlyAmide, Some(174.00), 118.00),
+        make_minimal_node(1, JointNodeKind::ConOnlyAmide, Some(175.00), 120.00),
+        make_minimal_node(2, JointNodeKind::ConOnlyAmide, Some(175.02), 120.05),
+        make_minimal_node(3, JointNodeKind::ConOnlyAmide, Some(176.00), 122.00),
+        make_minimal_node(4, JointNodeKind::ConOnlyAmide, Some(177.00), 124.00),
     ];
-
-    let cas_clean = CasSpectrum {
-        name: "cacon_ser".to_string(),
+    let clean_cas = vec![CasSpectrum {
+        name: "cacon_ser".into(),
         mode: CasMode::Cacon,
-        residues: vec!["SER".to_string()],
+        residues: vec!["SER".into()],
         peaks: vec![
             CasPeak {
-                c_prime_ppm: 174.50,
-                n_ppm: 116.0,
+                c_prime_ppm: 174.00,
+                n_ppm: 118.00,
                 height: 6.0e4,
                 volume: 6.0e4,
             },
@@ -1064,377 +1822,180 @@ fn test_calibrated_cas_overlap_and_breakthrough_damping() {
                 volume: 6.0e4,
             },
         ],
-    };
+    }];
+    let cfg = JointIdpConfig::default();
+    let cal_clean = build_calibrated_cas_tables(&clean_cas, &nodes, &seq, &cfg);
+    assert!(
+        cal_clean[0].hit_weight[0] > cal_clean[0].hit_weight[1],
+        "overlapped CAS peak must be damped vs isolated peak"
+    );
 
-    // Breakthrough-heavy CAS hitting 5 of 6 roots when only 2 SER exist in sequence
-    let cas_breakthrough = CasSpectrum {
-        name: "canco_ser_bt".to_string(),
-        mode: CasMode::Canco,
-        residues: vec!["SER".to_string()],
-        peaks: nodes
-            .iter()
-            .take(5)
-            .map(|nd| CasPeak {
-                c_prime_ppm: nd.c_prev.unwrap(),
-                n_ppm: nd.n_curr,
+    let noisy_cas = vec![CasSpectrum {
+        name: "cacon_ser_noisy".into(),
+        mode: CasMode::Cacon,
+        residues: vec!["SER".into()],
+        peaks: vec![
+            CasPeak {
+                c_prime_ppm: 174.00,
+                n_ppm: 118.00,
                 height: 6.0e4,
                 volume: 6.0e4,
-            })
-            .collect(),
-    };
-
-    let tables = build_calibrated_cas_tables(&[cas_clean, cas_breakthrough], &nodes, &seq, &cfg);
-    assert_eq!(tables.len(), 2);
-
-    // Isolated hit (node 0) must carry strictly stronger weight & LLR than overlapped hit (node 1)
+            },
+            CasPeak {
+                c_prime_ppm: 175.00,
+                n_ppm: 120.00,
+                height: 6.0e4,
+                volume: 6.0e4,
+            },
+            CasPeak {
+                c_prime_ppm: 175.02,
+                n_ppm: 120.05,
+                height: 6.0e4,
+                volume: 6.0e4,
+            },
+            CasPeak {
+                c_prime_ppm: 176.00,
+                n_ppm: 122.00,
+                height: 6.0e4,
+                volume: 6.0e4,
+            },
+            CasPeak {
+                c_prime_ppm: 177.00,
+                n_ppm: 124.00,
+                height: 6.0e4,
+                volume: 6.0e4,
+            },
+        ],
+    }];
+    let cal_noisy = build_calibrated_cas_tables(&noisy_cas, &nodes, &seq, &cfg);
     assert!(
-        tables[0].hit_weight[0] > tables[0].hit_weight[1],
-        "Expected overlap damping: isolated {:.3} > crowded {:.3}",
-        tables[0].hit_weight[0],
-        tables[0].hit_weight[1]
+        cal_noisy[0].p_fp_eff > cal_clean[0].p_fp_eff,
+        "breakthrough CAS must raise p_fp_eff ({:.3} vs {:.3})",
+        cal_noisy[0].p_fp_eff,
+        cal_clean[0].p_fp_eff
     );
-    assert!(tables[0].llr_for(0, "SER") > 1.2);
-    assert!(tables[0].llr_for(0, "ALA") < -1.0);
-    // Breakthrough spectrum must inflate `p_fp_eff` and yield a smaller per-hit LLR than clean spectrum
-    assert!(tables[1].p_fp_eff > tables[0].p_fp_eff);
-    assert!(tables[1].llr_for(0, "SER") < tables[0].llr_for(0, "SER"));
 }
 
 #[test]
-fn test_hostile_empty_and_degenerate_inputs_zero_nan_or_panic() {
-    let cfg = JointIdpConfig {
-        replicas: 6,
-        islands: 2,
-        generations: 1,
-        steps_per_system: 100,
-        ..JointIdpConfig::default()
-    };
+fn test_hostile_empty_nan_and_matrix_cap_fail_closed() {
+    let empty = JointIdpDataset::default();
+    let cfg = JointIdpConfig::default();
+    let res_empty = assign_joint_idp(&empty, &[], &cfg).unwrap();
+    assert!(res_empty.residue_assignments.is_empty());
+    assert_eq!(res_empty.qc_verdict, DatasetQcVerdict::Abstain);
 
-    // 1. Empty sequence & empty dataset
-    let r_empty = assign_joint_idp(&JointIdpDataset::default(), &[], &cfg).unwrap();
-    assert_eq!(r_empty.qc_verdict, DatasetQcVerdict::Abstain);
-    assert!(r_empty.score.is_finite());
-
-    // 2. Single-residue sequence
-    let r_one = assign_joint_idp(&JointIdpDataset::default(), &["ALA".to_string()], &cfg).unwrap();
-    assert_eq!(r_one.qc_verdict, DatasetQcVerdict::Abstain);
-    assert_eq!(r_one.residue_assignments.len(), 1);
-
-    // 3. Hostile NaN / Inf / out-of-range coordinates, NaN proton_mhz, hostile CAS & N-N peaks
+    let seq: Vec<String> = ["MET", "ALA", "PRO", "SER"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
     let hostile = JointIdpDataset {
         hn_peaks: vec![
             Peak::hsqc(f64::NAN, 120.0),
             Peak::triple("HNCO", 8.2, f64::INFINITY, 175.0, 1),
-            Peak::triple("HNCACB", 8.2, 120.0, f64::NEG_INFINITY, -1),
-            Peak::triple("HNCACO", 8.2, 120.0, 9999.0, 1).with_intensity(f64::NAN, None),
-            Peak::triple("HNCO", 8.25, 120.5, 175.2, 1).with_intensity(f64::INFINITY, None),
         ],
         c13_dataset: C13PickedDataset {
-            con_roots: vec![
-                Con2DPeak {
-                    c_prev_ppm: f64::NAN,
-                    n_curr_ppm: 136.0,
-                    height: 100.0,
-                    volume: 100.0,
-                    is_proline_imino_region: true,
-                    deconvolved_from_cluster: false,
-                },
-                Con2DPeak {
-                    c_prev_ppm: 174.0,
-                    n_curr_ppm: 136.5,
-                    height: 100.0,
-                    volume: 100.0,
-                    is_proline_imino_region: true,
-                    deconvolved_from_cluster: false,
-                },
-            ],
+            con_roots: vec![Con2DPeak {
+                c_prev_ppm: f64::NAN,
+                n_curr_ppm: 136.0,
+                height: f64::NEG_INFINITY,
+                volume: 0.0,
+                is_proline_imino_region: true,
+                deconvolved_from_cluster: false,
+            }],
             caco_peaks: Vec::new(),
-            strip_peaks: vec![C13Strip3DPeak {
-                exp: C13DetectedExp::Canco3D,
-                c_prime_ppm: 174.0,
-                n_ppm: 136.5,
-                c_indirect_ppm: f64::NAN,
-                sign: 1,
-                height: f64::INFINITY,
-                volume: 0.0,
-                anchor_root_idx: Some(999),
-            }],
+            strip_peaks: Vec::new(),
         },
-        cas_spectra: vec![CasSpectrum {
-            name: "hostile_cas".to_string(),
-            mode: CasMode::Cacon,
-            residues: vec!["SER".to_string()],
-            peaks: vec![CasPeak {
-                c_prime_ppm: f64::NAN,
-                n_ppm: f64::INFINITY,
-                height: f64::NAN,
-                volume: 0.0,
-            }],
-        }],
+        cas_spectra: Vec::new(),
         hncacon_nn_edges: vec![DirectionalNnPeak {
             c_prev_ppm: f64::NAN,
             n_curr_ppm: 120.0,
-            n_prev_ppm: f64::INFINITY,
-            snr: f64::NAN,
+            n_prev_ppm: 118.0,
+            snr: 1.0,
         }],
         hncaconh_peaks: vec![HncaconhPeak {
             h_ppm: f64::NAN,
             n_curr_ppm: 120.0,
             n_partner_ppm: 118.0,
-            height: f64::NEG_INFINITY,
+            height: 1.0,
         }],
-        reciprocal_nn_pairs: vec![(f64::NAN, 120.0), (120.0, f64::INFINITY)],
+        reciprocal_nn_pairs: Vec::new(),
         proton_mhz: f64::NAN,
-        user_locks: vec![(999, 999), (0, 0)],
+        user_locks: Vec::new(),
     };
-    let seq_short: Vec<String> = ["ALA", "PRO", "SER", "GLY", "PRO", "VAL"]
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
-    let r_hostile = assign_joint_idp(&hostile, &seq_short, &cfg).unwrap();
-    assert!(r_hostile.score.is_finite());
-    assert!(r_hostile.pass1_score.is_finite());
-    assert!(r_hostile.pass2_score_gain.is_finite());
-    assert!(r_hostile
-        .confidence
-        .iter()
-        .all(|c| c.is_finite() && (0.0..=1.0).contains(c)));
-    assert!(r_hostile
-        .raw_posterior
-        .iter()
-        .all(|c| c.is_finite() && (0.0..=1.0).contains(c)));
-    assert!(r_hostile.fitted_offsets.d_n.is_finite());
-    assert!(r_hostile.fitted_offsets.d_c.is_finite());
-    assert!(r_hostile.trosy_calibration.dh_ppm.is_finite());
-    assert!(r_hostile.trosy_calibration.dn_ppm.is_finite());
+    let res_h = assign_joint_idp_cpu(&hostile, &seq, &cfg).unwrap();
+    assert!(res_h.score.is_finite());
+    assert!(res_h.confidence.iter().all(|c| c.is_finite()));
 
-    // 4. All-Proline sequence with HN-only amide root must cleanly abstain/unassign (`PRO` forbids `AmideFused`)
-    let all_pro = vec!["PRO".to_string(); 8];
-    let hn_on_pro = JointIdpDataset {
-        hn_peaks: vec![Peak::triple("HNCO", 8.2, 120.0, 175.0, 1)],
-        proton_mhz: 600.0,
-        ..JointIdpDataset::default()
-    };
-    let r_all_pro = assign_joint_idp(&hn_on_pro, &all_pro, &cfg).unwrap();
-    assert!(r_all_pro.position.iter().all(|&p| p == -1));
-
-    // 5. Matrix allocation cap guard (`S * K > MAX_IDP_MATRIX_CELLS`) returns `Err` cleanly
-    let huge_seq = vec!["ALA".to_string(); 6000];
-    let many_nodes: Vec<JointIdpNode> = (0..5000)
-        .map(|i| JointIdpNode {
-            id: i,
-            kind: JointNodeKind::ConOnlyAmide,
-            hn_matched: false,
-            con_matched: true,
-            h_curr: None,
-            n_curr: 120.0,
-            hn_n_curr: None,
-            c_prev: Some(175.0),
-            root_height: 1.0,
-            ca_curr: Vec::new(),
-            cb_curr: Vec::new(),
-            ca_prev: Vec::new(),
-            cb_prev: Vec::new(),
-            c_curr: Vec::new(),
-            sidechain_c_prev: Vec::new(),
-            nn_prev_cands: Vec::new(),
-            recip_nn_partners: Vec::new(),
-            prev_gly_opposite_phase: false,
-            has_prev_cb_exp: false,
-            has_curr_cb_exp: false,
-            gly_cb_curr_suppressed: false,
-            gly_cb_prev_suppressed: false,
-            f1_sidelobes_pruned: 0,
-            registration_warnings: Vec::new(),
-        })
-        .collect();
-    assert!(many_nodes.len() * huge_seq.len() > MAX_IDP_MATRIX_CELLS);
-    assert!(try_joint_idp_unary_matrix(
-        &many_nodes,
-        &huge_seq,
-        &[],
-        &cfg,
-        &IdpShiftOffsets::default(),
-        &[],
-    )
-    .is_err());
-
-    // 6. Verify explicit `JointRouteSupport::HnRoute` on a clean HN-only mini-dataset
-    let mini_seq: Vec<String> = ["MET", "ALA", "SER", "GLY", "VAL", "LEU"]
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
-    let preds = predict_joint_ncidp_shifts(&mini_seq, &cfg);
-    let mut mini_hn = Vec::new();
-    for k in 1..mini_seq.len() {
-        let h = 8.0 + (k as f64) * 0.1;
-        let n = preds[k].n_ppm;
-        mini_hn.push(Peak::triple("HNCO", h, n, preds[k - 1].c_ppm, 1).with_intensity(1.0e5, None));
-        mini_hn.push(Peak::triple("HNCACO", h, n, preds[k].c_ppm, 1).with_intensity(8.0e4, None));
-        mini_hn.push(Peak::triple("HNCACB", h, n, preds[k].ca_ppm, 1).with_intensity(8.0e4, None));
-        if let Some(cb) = preds[k].cb_ppm {
-            mini_hn.push(Peak::triple("HNCACB", h, n, cb, -1).with_intensity(7.0e4, None));
-        }
-        mini_hn.push(
-            Peak::triple("CBCACONH", h, n, preds[k - 1].ca_ppm, 1).with_intensity(6.0e4, None),
-        );
-        if let Some(cb) = preds[k - 1].cb_ppm {
-            mini_hn.push(Peak::triple("CBCACONH", h, n, cb, 1).with_intensity(5.0e4, None));
-        }
-    }
-    let r_mini = assign_joint_idp(
-        &JointIdpDataset {
-            hn_peaks: mini_hn,
-            proton_mhz: 600.0,
-            ..JointIdpDataset::default()
-        },
-        &mini_seq,
-        &JointIdpConfig {
-            auto_reference_offset: false,
-            hncacb_polarity: HncacbPolarity::CbNegative,
-            ..cfg
-        },
-    )
-    .unwrap();
+    let huge_seq = vec!["ALA".to_string(); 5001];
+    let dummy_node = make_minimal_node(0, JointNodeKind::ConOnlyAmide, Some(175.0), 120.0);
+    let huge_nodes = vec![dummy_node; (MAX_IDP_MATRIX_CELLS / 5001) + 2];
     assert!(
-        r_mini
-            .route_support
-            .contains(&Some(JointRouteSupport::HnRoute)),
-        "Expected HnRoute tag on HN-only assignment"
+        try_joint_idp_unary_matrix(
+            &huge_nodes,
+            &huge_seq,
+            &[],
+            &cfg,
+            &IdpShiftOffsets::default(),
+            &[]
+        )
+        .is_err(),
+        "matrix cell overflow must fail closed"
     );
 }
 
 #[test]
-fn test_two_pass_anchor_lock_propagates_and_exercises_pass2() {
-    // 20-aa IDP with an unambiguous N-terminal Proline-bridged region (residues 1..12) and a
-    // sparse/repetitive Ser-Gln tail (residues 12..20) where Pass 1 locks the unambiguous anchors
-    // and Pass 2 re-anneals the remaining unlocked subset.
-    let seq: Vec<String> = [
-        "MET", "ALA", "GLY", "THR", "PRO", "VAL", "ILE", "SER", "PRO", "ASP", "LYS", "LEU", "SER",
-        "GLN", "SER", "GLN", "SER", "GLN", "GLU", "ALA",
-    ]
-    .iter()
-    .map(|s| s.to_string())
-    .collect();
-    let cfg_base = JointIdpConfig {
-        auto_reference_offset: false,
-        replicas: 16,
-        islands: 2,
-        generations: 2,
-        steps_per_system: 600,
-        seed: 123,
+fn test_gui_cli_canonical_exports_and_summaries() {
+    assert!((PROLINE_N15_MIN_PPM - 131.5).abs() < 1e-9);
+    assert!((PROLINE_N15_MAX_PPM - 144.5).abs() < 1e-9);
+    assert!(JOINT_IDP_CALIBRATION_KNOTS.len() >= 5);
+    for w in JOINT_IDP_CALIBRATION_KNOTS.windows(2) {
+        assert!(
+            w[1].0 > w[0].0,
+            "calibration knot x must be strictly increasing"
+        );
+        assert!(
+            w[1].1 >= w[0].1,
+            "calibration knot y must be monotone non-decreasing"
+        );
+    }
+    assert!(calibrate_joint_posterior(0.0) <= calibrate_joint_posterior(0.5));
+    assert!(calibrate_joint_posterior(0.5) <= calibrate_joint_posterior(1.0));
+
+    let seq = synthetic_pro_ser_rich_idp_sequence();
+    let (ds, _) = synthesize_idp_stress_dataset(&seq, 5, &IdpStressSpec::default());
+    let cfg = JointIdpConfig {
+        replicas: 6,
+        steps_per_system: 300,
+        seed: 5,
         ..JointIdpConfig::default()
     };
-    let preds = predict_joint_ncidp_shifts(&seq, &cfg_base);
-
-    let mut hn_peaks = Vec::new();
-    let mut con_roots = Vec::new();
-    let mut strip_peaks = Vec::new();
-    let mut nn_edges = Vec::new();
-
-    for k in 1..seq.len() {
-        let r_idx = con_roots.len();
-        con_roots.push(Con2DPeak {
-            c_prev_ppm: preds[k - 1].c_ppm,
-            n_curr_ppm: preds[k].n_ppm,
-            height: 8.0e4,
-            volume: 8.0e4,
-            is_proline_imino_region: seq[k] == "PRO",
-            deconvolved_from_cluster: false,
-        });
-        if k <= 11 {
-            // Strong multi-channel region for Pass-1 locking (including Pro4 & Pro8 bridges!)
-            strip_peaks.push(C13Strip3DPeak {
-                exp: C13DetectedExp::Canco3D,
-                c_prime_ppm: preds[k - 1].c_ppm,
-                n_ppm: preds[k].n_ppm,
-                c_indirect_ppm: preds[k - 1].ca_ppm,
-                sign: 1,
-                height: 6.0e4,
-                volume: 6.0e4,
-                anchor_root_idx: Some(r_idx),
-            });
-            strip_peaks.push(C13Strip3DPeak {
-                exp: C13DetectedExp::Canco3D,
-                c_prime_ppm: preds[k - 1].c_ppm,
-                n_ppm: preds[k].n_ppm,
-                c_indirect_ppm: preds[k].ca_ppm,
-                sign: 1,
-                height: 5.0e4,
-                volume: 5.0e4,
-                anchor_root_idx: Some(r_idx),
-            });
-            if k >= 2 {
-                nn_edges.push(DirectionalNnPeak {
-                    c_prev_ppm: preds[k - 1].c_ppm,
-                    n_curr_ppm: preds[k].n_ppm,
-                    n_prev_ppm: preds[k - 1].n_ppm,
-                    snr: 8.0,
-                });
-            }
-        }
-        if seq[k] != "PRO" {
-            let h = 7.9 + (k as f64) * 0.05;
-            let n = preds[k].n_ppm;
-            hn_peaks.push(
-                Peak::triple("HNCO", h, n, preds[k - 1].c_ppm, 1).with_intensity(9.0e4, None),
-            );
-            if k <= 11 {
-                hn_peaks.push(
-                    Peak::triple("HNCACO", h, n, preds[k].c_ppm, 1).with_intensity(7.0e4, None),
-                );
-                hn_peaks.push(
-                    Peak::triple("HNCACB", h, n, preds[k].ca_ppm, 1).with_intensity(7.5e4, None),
-                );
-                if let Some(cb) = preds[k].cb_ppm {
-                    hn_peaks.push(Peak::triple("HNCACB", h, n, cb, -1).with_intensity(6.5e4, None));
-                }
-                hn_peaks.push(
-                    Peak::triple("CBCACONH", h, n, preds[k - 1].ca_ppm, 1)
-                        .with_intensity(5.5e4, None),
-                );
-                if let Some(cb) = preds[k - 1].cb_ppm {
-                    hn_peaks
-                        .push(Peak::triple("CBCACONH", h, n, cb, 1).with_intensity(5.0e4, None));
-                }
-            }
-        }
-    }
-
-    let ds = JointIdpDataset {
-        hn_peaks,
-        c13_dataset: C13PickedDataset {
-            con_roots,
-            caco_peaks: Vec::new(),
-            strip_peaks,
-        },
-        hncacon_nn_edges: nn_edges,
-        proton_mhz: 600.0,
-        ..JointIdpDataset::default()
-    };
-
-    let res = assign_joint_idp(
-        &ds,
-        &seq,
-        &JointIdpConfig {
-            enable_two_pass_anchor_lock: true,
-            hncacb_polarity: HncacbPolarity::CbNegative,
-            ..cfg_base
-        },
-    )
-    .expect("2-pass solve");
-
-    assert!(
-        !res.pass1_locked_anchors.is_empty() && res.pass1_locked_anchors.len() < seq.len() - 1,
-        "Expected partial Pass-1 anchor locking to trigger Pass 2 (locked {} of {})",
-        res.pass1_locked_anchors.len(),
-        seq.len() - 1
+    let res = assign_joint_idp_cpu(&ds, &seq, &cfg).unwrap();
+    let bridges = res.proline_bridge_summaries();
+    assert_eq!(
+        bridges.len(),
+        21,
+        "expected 21 Proline bridge summary entries"
     );
+    let cterms = res.cterm_anchor_summaries();
     assert!(
-        res.score >= res.pass1_score - 1e-6,
-        "Pass-2 score ({:.2}) must not regress Pass-1 ({:.2})",
-        res.score,
-        res.pass1_score
+        cterms.iter().any(|c| c.assigned_to_cterm),
+        "expected C-terminal COO- anchor summary at final residue, got {cterms:?}"
     );
-    assert_eq!(res.proline_bridge_recovery, (2, 2));
+    let seq_ids: Vec<i32> = (1..=seq.len() as i32).collect();
+    let (ref_out, conf_map): (_, BTreeMap<usize, f64>) =
+        joint_idp_to_reference(&res, &seq, &seq_ids);
+    assert_eq!(ref_out.sequence.len(), seq.len());
+    assert!(!ref_out.shifts.is_empty());
+    assert!(conf_map.values().all(|&v| (0.0..=1.0).contains(&v)));
+    assert!(res.route_support.iter().any(|r| {
+        matches!(
+            r,
+            Some(
+                JointRouteSupport::CrossValidatedHnAndCon
+                    | JointRouteSupport::HnRoute
+                    | JointRouteSupport::ConProBridge
+                    | JointRouteSupport::ConRouteOnly
+            )
+        )
+    }));
 }

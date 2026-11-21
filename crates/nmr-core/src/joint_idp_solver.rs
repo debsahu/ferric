@@ -9,16 +9,19 @@
 //! - Bermel, W., Bertini, I., Felli, I. C. & Pierattelli, R. (*J. Am. Chem. Soc.* 2009, 131,
 //!   15339–15345 — `CANCO`, `(H)N(CA)CON`, `H(CC)CON`, `CBCACON`, and continuous through-Proline
 //!   IDP backbone assignment).
-//! - Sahu, D., Bastidas, M. & Showalter, S. A. (*J. Biomol. NMR* 2014, 59, 63–74 — `CAS-NMR`
-//!   amino-acid-selective `(C'_{i-1}, N_i)` `CACON` and `CANCO` subspectra for disordered proteins).
+//! - Sahu, D., Bastidas, M. & Showalter, S. A. (*Anal. Biochem.* 2014, 449, 17–25; *J. Biomol.
+//!   NMR* 2014, 59, 63–74 — `CAS-NMR` amino-acid-selective `(C'_{i-1}, N_i)` `CACON` and `CANCO`
+//!   subspectra for disordered proteins).
 //! - Pervushin, K., Riek, R., Wider, G. & Wüthrich, K. (*Proc. Natl. Acad. Sci. USA* 1997, 94,
-//!   12366–12371 — TROSY `±1/2 1J_HN` (`±46 Hz`) component shift relative to decoupled amide spectra).
+//!   12366–12371 — TROSY `46 Hz (1/2 1J_NH)`, field-scaled to ppm relative to decoupled spectra).
 //! - Tamiola, K., Acar, B. & Mulder, F. A. A. (*J. Am. Chem. Soc.* 2010, 132, 18000–18003 — `ncIDP`
 //!   neighbor-corrected random-coil chemical shifts and pre-Proline shift offsets).
 //! - Platzer, G., Okon, M. & McIntosh, L. P. (*J. Biomol. NMR* 2014, 60, 109–129 — pH-dependent
 //!   random-coil and C-terminal `COO-` (`~179 ppm` DSS) chemical shifts).
+//! - Kuhn, H. W. (*Nav. Res. Logist. Q.* 1955, 2, 83–97 — exact polynomial-time Hungarian
+//!   maximum-cardinality minimum-cost bipartite matching for `HN ↔ CON` root fusion).
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::f64::consts::TAU;
 #[cfg(not(target_arch = "wasm32"))]
 use std::thread;
@@ -26,16 +29,18 @@ use std::thread;
 use serde::{Deserialize, Serialize};
 
 use crate::c13_detected::{
-    n15_obs_mhz, C13DetectedExp, C13PickedDataset, CasMode, CasSpectrum, Con2DPeak,
-    CAS_MATCH_TOL_C_PRIME_PPM, CAS_MATCH_TOL_N15_PPM,
+    cas_llr_adjustment, n15_obs_mhz, C13DetectedExp, C13PickedDataset, CasMode, CasSpectrum,
+    Con2DPeak, CAS_LOG_LIKELIHOOD_NATS, CAS_MATCH_TOL_C_PRIME_PPM, CAS_MATCH_TOL_N15_PPM,
 };
 use crate::idp_solver::{
-    check_idp_matrix_bounds, evaluate_idp_auto_reference_safety, predict_ncidp_shifts,
-    register_and_build_con_dipeptide_systems, ConDipeptideSystem, IdpAutoRefSafetyReport,
-    IdpShiftOffsets, IdpSolverConfig, NcIdpResiduePrediction, IDP_BG_CA_MUS, IDP_BG_CB_MUS,
-    IDP_BG_C_MUS, IDP_BG_N_MUS, IDP_BG_SC_MUS, IDP_CALIBRATION_KNOTS, MAX_IDP_CANDS,
+    check_idp_matrix_bounds, evaluate_idp_auto_reference_safety, fit_1d_unlabelled_marginal_offset,
+    predict_ncidp_shifts, register_and_build_con_dipeptide_systems,
+    select_hncacb_intra_and_backfill_prev, sequence_complexity_metrics, ConDipeptideSystem,
+    IdpAutoRefSafetyReport, IdpShiftOffsets, IdpSolverConfig, NcIdpResiduePrediction,
+    IDP_BG_CA_MUS, IDP_BG_CB_MUS, IDP_BG_C_MUS, IDP_BG_N_MUS, IDP_BG_SC_MUS, MAX_IDP_CANDS,
     MAX_IDP_CB_CANDS, MAX_IDP_SC_CANDS,
 };
+use crate::nmrstar::Reference;
 use crate::peaks::Peak;
 use crate::priors::one_to_three;
 use crate::qc::DatasetQcVerdict;
@@ -44,18 +49,32 @@ use crate::solver::{AssignResult, Matrix2D, FORBID};
 use crate::spinsystems::{normalize_hncacb_and_cbcaconh_polarity, HncacbPolarity, PolarityReport};
 
 // ============================================================================
-// Physical Constants (DSS Scale & TROSY 1/2 1J_HN)
+// Canonical Physical Constants (Shared by Core, CLI & GUI)
 // ============================================================================
 
-/// Canonical half scalar coupling `1/2 |1J_HN|` (`46.0 Hz`, from `1J_HN ≈ -92 Hz`; Pervushin et al.,
-/// *PNAS* 1997) shifting TROSY relative to decoupled `1H-15N` amide resonances by `±46 Hz / MHz`.
+/// Canonical half scalar coupling `46 Hz (1/2 1J_NH)`, field-scaled to ppm
+/// (Pervushin et al., *PNAS* 1997; `1J_NH ≈ -92 Hz`), shifting TROSY resonances relative to
+/// decoupled `1H–15N` amide peaks by `(-46.0 / nu_H, +46.0 / nu_N)` ppm.
 pub const TROSY_HALF_J_HN_HZ: f64 = 46.0;
 
-/// Lower `15N` DSS boundary (`131.5 ppm`) for Proline tertiary imino roots in `2D CON`.
-pub const PROLINE_N_DSS_MIN_PPM: f64 = 131.5;
+/// Canonical fallback `1H` Larmor frequency (`800.0 MHz`) used by [`trosy_expected_shift_ppm`]
+/// when spectrometer frequency is unspecified (`<= 50.0 MHz` or non-finite).
+pub const CANONICAL_TROSY_FALLBACK_MHZ: f64 = 800.0;
 
-/// Upper `15N` DSS boundary (`144.5 ppm`) for Proline tertiary imino roots in `2D CON`.
-pub const PROLINE_N_DSS_MAX_PPM: f64 = 144.5;
+/// Minimum matched distinct amide roots required for TROSY offset detection (`>= 5`).
+pub const MIN_TROSY_MATCHED_ROOTS: usize = 5;
+
+/// Canonical lower `15N` DSS boundary (`131.5 ppm`) for Proline tertiary imino roots in `2D CON`.
+pub const PROLINE_N15_MIN_PPM: f64 = 131.5;
+
+/// Canonical upper `15N` DSS boundary (`144.5 ppm`) for Proline tertiary imino roots in `2D CON`.
+pub const PROLINE_N15_MAX_PPM: f64 = 144.5;
+
+/// Backwards-compatible alias for [`PROLINE_N15_MIN_PPM`].
+pub const PROLINE_N_DSS_MIN_PPM: f64 = PROLINE_N15_MIN_PPM;
+
+/// Backwards-compatible alias for [`PROLINE_N15_MAX_PPM`].
+pub const PROLINE_N_DSS_MAX_PPM: f64 = PROLINE_N15_MAX_PPM;
 
 /// Lower `13CA` DSS boundary (`41.0 ppm`) of the Glycine `CA` band for `Gly CB` bleed-through guard.
 pub const GLY_CA_DSS_MIN_PPM: f64 = 41.0;
@@ -73,11 +92,17 @@ pub const CTERM_COO_DSS_MIN_PPM: f64 = 177.6;
 /// Upper DSS `13C'` threshold (`181.8 ppm`) for flagging a candidate C-terminal `COO-` carbonyl.
 pub const CTERM_COO_DSS_MAX_PPM: f64 = 181.8;
 
-/// Canonical pre-Proline carbonyl shift offset (`-1.90 ppm`; Wishart 1995 / Tamiola 2010).
+/// Canonical pre-Proline carbonyl `13C'` shift correction (`-1.90 ppm`; Wishart 1995 / Tamiola 2010).
 pub const PRE_PRO_C_PRIME_CORRECTION_PPM: f64 = -1.90;
 
-/// Canonical pre-Proline `CA` shift offset (`-1.80 ppm`; Wishart 1995 / Tamiola 2010).
+/// Canonical pre-Proline `13CA` shift correction (`-1.80 ppm`; Wishart 1995 / Tamiola 2010).
 pub const PRE_PRO_CA_CORRECTION_PPM: f64 = -1.80;
+
+/// Canonical pre-Proline `15N` shift correction (`+1.65 ppm`; Schwarzinger 2001 / Tamiola 2010).
+pub const PRE_PRO_N_CORRECTION_PPM: f64 = 1.65;
+
+/// Canonical pre-Proline `13CB` shift correction (`-0.35 ppm`; Tamiola 2010).
+pub const PRE_PRO_CB_CORRECTION_PPM: f64 = -0.35;
 
 /// Maximum per-channel candidate shifts packed per `JointIdpNode`.
 pub const MAX_JOINT_CANDS: usize = MAX_IDP_CANDS;
@@ -91,8 +116,57 @@ pub const MAX_JOINT_SC_CANDS: usize = MAX_IDP_SC_CANDS;
 /// Half of `chi^2_{1, 0.95}` (`1.9207294`) for Wilks look-elsewhere hypothesis gating.
 const WILKS_HALF_CHI2_1_95: f64 = 1.920_729_410_347_062;
 
+/// Dedicated monotone PAV calibration knots `(raw_posterior, calibrated_confidence)` empirically
+/// fitted via `fit_idp_calibration_knots_pav` (`5,737` assignments across `8` stress regimes) on
+/// two disjoint synthetic IDP sequences (`cal_seq_a` 115 aa, `cal_seq_b` 130 aa; seeds `1001..1003`)
+/// strictly separate from all held-out evaluation sequences and seeds (`180.core:P1-1`).
+pub const JOINT_IDP_CALIBRATION_KNOTS: &[(f64, f64)] = &[
+    (0.00, 0.000),
+    (0.10, 0.184),
+    (0.25, 0.296),
+    (0.40, 0.442),
+    (0.55, 0.686),
+    (0.70, 0.847),
+    (0.82, 0.889),
+    (0.90, 0.906),
+    (0.96, 0.912),
+    (1.00, 0.914),
+];
+
+/// Compute the canonical TROSY `46 Hz (1/2 1J_NH)`, field-scaled to ppm shift `(dH_ppm, dN_ppm)`
+/// relative to a decoupled `1H–15N` amide spectrum (`-46 / nu_H` in `1H`, `+46 / nu_N` in `15N`).
+///
+/// Falls back canonically to `800.0 MHz` whenever `obs_mhz_1h` is non-finite or `<= 50.0 MHz`.
+#[inline]
+pub fn trosy_expected_shift_ppm(obs_mhz_1h: f64) -> (f64, f64) {
+    let mhz = if obs_mhz_1h.is_finite() && obs_mhz_1h > 50.0 {
+        obs_mhz_1h
+    } else {
+        CANONICAL_TROSY_FALLBACK_MHZ
+    };
+    let dh = -TROSY_HALF_J_HN_HZ / mhz;
+    let dn = TROSY_HALF_J_HN_HZ / n15_obs_mhz(mhz);
+    (dh, dn)
+}
+
+/// Canonical pre-Proline random-coil chemical-shift offsets `(dN, dC', dCA, dCB)` in ppm
+/// exerted on residue `k` when `seq[k + 1] == "PRO"` (`P2-14`).
+#[inline]
+pub fn pre_pro_shift_corrections(curr_aa: &str) -> (f64, f64, f64, f64) {
+    match curr_aa {
+        "GLY" => (1.45, -1.50, -1.05, 0.00),
+        "PRO" => (0.90, -1.80, -1.80, 0.12),
+        _ => (
+            PRE_PRO_N_CORRECTION_PPM,
+            PRE_PRO_C_PRIME_CORRECTION_PPM,
+            PRE_PRO_CA_CORRECTION_PPM,
+            PRE_PRO_CB_CORRECTION_PPM,
+        ),
+    }
+}
+
 // ============================================================================
-// Core Public Data Structures
+// Core Public Data Structures (Canonical Core/CLI/GUI Contract)
 // ============================================================================
 
 /// Classification of a unified peptide-bond / residue node keyed on `(C'_{i-1}, N_i)`.
@@ -101,7 +175,7 @@ pub enum JointNodeKind {
     /// Amide root `(H_i, N_i, C'_{i-1})` supported by `HNCO`/`HSQC`, fused with a matching
     /// `2D CON(C'_{i-1}, N_i)` root when present (or `HN`-only when `con_matched == false`).
     AmideFused,
-    /// Proline-only `2D CON(C'_{i-1}, N_i)` bridge (`N_i ≈ 132–143 ppm` DSS, no `1H^N`), directly
+    /// Proline-only `2D CON(C'_{i-1}, N_i)` bridge (`N_i ≈ 131.5–144.5 ppm` DSS, no `1H^N`), directly
     /// linking preceding `HN` `C'_{i-1}` across `Pro_i` into following `HN` `C'_i` and `(CA/CB)_i`.
     ProlineConBridge,
     /// Exchange-broadened non-Proline `2D CON(C'_{i-1}, N_i)` root missing from `1H-15N` spectra.
@@ -115,10 +189,35 @@ pub enum JointRouteSupport {
     CrossValidatedHnAndCon,
     /// Assigned residue supported by `1H`-detected (`HN`) triple-resonance experiments only.
     HnRoute,
-    /// Proline residue bridged directly via the `2D CON` tertiary imino (`132–143 ppm`) pathway.
+    /// Proline residue bridged directly via the `2D CON` tertiary imino (`131.5–144.5 ppm`) pathway.
     ConProBridge,
     /// Non-Proline residue recovered via `2D CON` / `13C`-detected channels only (e.g., fast amide exchange).
     ConRouteOnly,
+}
+
+/// Summary of one `X–Pro(–Y)` Proline bridge for CLI & GUI inspection.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ProlineBridgeSummary {
+    pub pro_seq_idx: usize,
+    pub prev_residue: String,
+    pub next_residue: Option<String>,
+    pub pro_node_idx: Option<usize>,
+    pub c_prev_ppm: Option<f64>,
+    pub n_pro_ppm: Option<f64>,
+    pub confidence: f64,
+    pub bridged: bool,
+}
+
+/// Summary of a C-terminal `COO-` (`~179 ppm` DSS) carbonyl anchor candidate for CLI & GUI inspection.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CTermAnchorSummary {
+    pub seq_idx: usize,
+    pub residue: String,
+    pub node_idx: usize,
+    pub c_curr_ppm: f64,
+    pub c_curr_dss_ppm: f64,
+    pub confidence: f64,
+    pub assigned_to_cterm: bool,
 }
 
 /// Directional `(H)N(CA)CON` sequential `N(i-1)` cross-peak anchored on a `CON(i)` root `(C'_{i-1}, N_i)`.
@@ -128,7 +227,7 @@ pub struct DirectionalNnPeak {
     pub c_prev_ppm: f64,
     /// Detected `15N(i)` coordinate in ppm.
     pub n_curr_ppm: f64,
-    /// Preceding-residue `15N(i-1)` partner coordinate in ppm (including `Pro` `132–143 ppm`!).
+    /// Preceding-residue `15N(i-1)` partner coordinate in ppm (including `Pro` `131.5–144.5 ppm`!).
     pub n_prev_ppm: f64,
     /// Signal-to-noise ratio (or relative peak intensity weight).
     pub snr: f64,
@@ -137,9 +236,9 @@ pub struct DirectionalNnPeak {
 /// Raw `BT_HNCACONH` / `HN(CA)CONH` `3D` `(1H_i, 15N_i, 15N_{i±1})` cross-peak before TROSY alignment.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct HncaconhPeak {
-    /// Detected amide `1H(i)` shift in ppm (may carry `±1/2 1J_HN` TROSY offset).
+    /// Detected amide `1H(i)` shift in ppm (may carry `46 Hz (1/2 1J_NH)` TROSY offset).
     pub h_ppm: f64,
-    /// Detected amide `15N(i)` shift in ppm (may carry `±1/2 1J_HN` TROSY offset).
+    /// Detected amide `15N(i)` shift in ppm (may carry `46 Hz (1/2 1J_NH)` TROSY offset).
     pub n_curr_ppm: f64,
     /// Sequential neighbor `15N(i±1)` partner shift in ppm.
     pub n_partner_ppm: f64,
@@ -147,22 +246,22 @@ pub struct HncaconhPeak {
     pub height: f64,
 }
 
-/// Result of field-scaled TROSY `±1/2 1J_HN` (`±46 Hz / MHz`) cross-spectrum `(dH, dN)` calibration.
+/// Result of field-scaled TROSY `46 Hz (1/2 1J_NH)` cross-spectrum `(dH, dN)` calibration.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct TrosyOffsetCalibration {
     /// Fitted `(H_trosy - H_decoupled)` shift in ppm (`0.0` if decoupled / already aligned).
     pub dh_ppm: f64,
     /// Fitted `(N_trosy - N_decoupled)` shift in ppm (`0.0` if decoupled / already aligned).
     pub dn_ppm: f64,
-    /// Expected physical magnitude `46.0 Hz / proton_mhz` in ppm.
+    /// Expected physical magnitude `46.0 Hz / nu_H` in ppm.
     pub expected_half_j_h_ppm: f64,
-    /// Expected physical magnitude `46.0 Hz / n15_obs_mhz(proton_mhz)` in ppm.
+    /// Expected physical magnitude `46.0 Hz / nu_N` in ppm.
     pub expected_half_j_n_ppm: f64,
-    /// True if a statistically significant `±1/2 1J_HN` TROSY component shift was detected.
+    /// True if a statistically significant `46 Hz (1/2 1J_NH)` TROSY component shift was detected.
     pub trosy_detected: bool,
     /// Number of distinct amide roots matched after alignment.
     pub matched_roots: usize,
-    /// Coincidence log-likelihood gain over `(0.0, 0.0)`.
+    /// Background-subtracted coincidence log-likelihood gain over `(0.0, 0.0)`.
     pub score_gain: f64,
 }
 
@@ -201,7 +300,9 @@ pub struct JointIdpNode {
     pub sidechain_c_prev: Vec<f64>,
     /// Directional `(H)N(CA)CON` sequential `N(i-1)` partner candidates `(n_prev_ppm, snr)`.
     pub nn_prev_cands: Vec<(f64, f64)>,
-    /// Reciprocal `BT_HNCACONH` neighbor node indices `(partner_node_idx, strength)`.
+    /// Reciprocal `BT_HNCACONH` neighbor node indices `(partner_node_idx, weight)`.
+    /// Note: reciprocal `BT_HNCACONH` edges are **symmetric** (`s <-> t`), disambiguated directionally
+    /// by `ΔC'`, `ΔCA`, `ΔCB`, and directional `(H)N(CA)CON`.
     pub recip_nn_partners: Vec<(usize, f64)>,
     /// Opposite-phase constant-time `2D CACO` Glycine indicator for `i - 1`.
     pub prev_gly_opposite_phase: bool,
@@ -255,7 +356,7 @@ impl JointIdpNode {
 /// Complete multi-experiment input bundle for the unified joint `HN + 13C` IDP solver.
 #[derive(Clone, Debug, Default)]
 pub struct JointIdpDataset {
-    /// `1H`-detected amide triple-resonance peaks (`HSQC`, `HNCO`, `HNCACO`, `HNCACB`, `CBCACONH`, `HNCA`, `HNCOCA`).
+    /// `1H`-detected amide triple-resonance peaks (`HSQC`, `HNCO`, `HNCACO`, `HNCACB`, `CBCACONH`/`HNCOCACB`, `HNCA`, `HNCOCA`).
     pub hn_peaks: Vec<Peak>,
     /// `13C`-detected peak bundle (`2D CON`, `2D CACO`, `3D CANCO`, `CBCACON`, `H(CC)CON`/`CCCON`, `NCACO`).
     pub c13_dataset: C13PickedDataset,
@@ -263,11 +364,11 @@ pub struct JointIdpDataset {
     pub cas_spectra: Vec<CasSpectrum>,
     /// Directional `(H)N(CA)CON` sequential `N(i-1)` partner peaks.
     pub hncacon_nn_edges: Vec<DirectionalNnPeak>,
-    /// Raw `BT_HNCACONH` / `HN(CA)CONH` peaks (auto-calibrated for TROSY `±46 Hz / MHz` `(dH, dN)`).
+    /// Raw `BT_HNCACONH` / `HN(CA)CONH` peaks (auto-calibrated for TROSY `46 Hz (1/2 1J_NH)`).
     pub hncaconh_peaks: Vec<HncaconhPeak>,
     /// Optional pre-extracted reciprocal `(N_a, N_b)` amide adjacency pairs in ppm.
     pub reciprocal_nn_pairs: Vec<(f64, f64)>,
-    /// Spectrometer `1H` Larmor frequency in `MHz` (`default = 600.0`; used for field-scaled TROSY `±46 Hz / MHz`).
+    /// Spectrometer `1H` Larmor frequency in `MHz` (fallback `800.0 MHz`; used for field-scaled TROSY `46 Hz`).
     pub proton_mhz: f64,
     /// Optional user-locked `(node_idx, seq_idx)` hard constraints.
     pub user_locks: Vec<(usize, usize)>,
@@ -280,7 +381,7 @@ pub struct JointIdpConfig {
     pub temperature_k: f64,
     /// Sample pH (`default = 6.5`).
     pub ph: f64,
-    /// Fallback spectrometer `1H` frequency in `MHz` when `dataset.proton_mhz <= 50.0` (`default = 600.0`).
+    /// Fallback spectrometer `1H` frequency in `MHz` when `dataset.proton_mhz <= 50.0` (`default = 800.0`).
     pub proton_mhz: f64,
     /// `HNCACB`/`CBCACONH` polarity mode (`default = HncacbPolarity::Auto`).
     pub hncacb_polarity: HncacbPolarity,
@@ -288,7 +389,7 @@ pub struct JointIdpConfig {
     pub auto_reference_offset: bool,
     /// Explicit offsets used when `auto_reference_offset == false`.
     pub manual_offsets: IdpShiftOffsets,
-    /// Enable field-scaled TROSY `±46 Hz / MHz` `(dH, dN)` auto-calibration on `BT_HNCACONH` (`default = true`).
+    /// Enable field-scaled TROSY `46 Hz (1/2 1J_NH)` `(dH, dN)` auto-calibration on `BT_HNCACONH` (`default = true`).
     pub auto_trosy_calibration: bool,
     /// Enable `F1(C')` NUS sidelobe pruning on `HN(CA)CO` / `HNCO` strips (`default = true`).
     pub enable_nus_sidelobe_pruning: bool,
@@ -319,9 +420,9 @@ pub struct JointIdpConfig {
     /// Elliptical `CAS` `(C', N)` match tolerances (ppm).
     pub cas_c_tol_ppm: f64,
     pub cas_n_tol_ppm: f64,
-    /// Maximum per-spectrum `CAS` LLR magnitude in nats (`default = 2.8`).
+    /// Maximum per-spectrum `CAS` LLR scale (nats, routed through `c13_detected::cas_llr_adjustment`, `default = 3.0`).
     pub cas_max_llr: f64,
-    /// Baseline breakthrough / false-positive rate for `CAS` calibration (`default = 0.06`).
+    /// Baseline breakthrough / false-positive rate floor (`default = 0.10`).
     pub cas_base_fp: f64,
     /// Number of SA trajectories per pass (`default = 32`).
     pub replicas: usize,
@@ -352,7 +453,7 @@ impl Default for JointIdpConfig {
         Self {
             temperature_k: 298.15,
             ph: 6.5,
-            proton_mhz: 600.0,
+            proton_mhz: CANONICAL_TROSY_FALLBACK_MHZ,
             hncacb_polarity: HncacbPolarity::Auto,
             auto_reference_offset: true,
             manual_offsets: IdpShiftOffsets::default(),
@@ -375,8 +476,8 @@ impl Default for JointIdpConfig {
             pair_floor: -3.8,
             cas_c_tol_ppm: CAS_MATCH_TOL_C_PRIME_PPM,
             cas_n_tol_ppm: CAS_MATCH_TOL_N15_PPM,
-            cas_max_llr: 2.8,
-            cas_base_fp: 0.06,
+            cas_max_llr: CAS_LOG_LIKELIHOOD_NATS,
+            cas_base_fp: 0.10,
             replicas: 32,
             islands: 4,
             generations: 3,
@@ -431,6 +532,9 @@ pub struct JointNodeBuildReport {
     pub trosy_calibration: TrosyOffsetCalibration,
     pub polarity_report: Option<PolarityReport>,
     pub hnco_to_con_drift_ppm: (f64, f64),
+    pub fusion_rms_c_ppm: f64,
+    pub fusion_rms_n_ppm: f64,
+    pub hn_unmatched_frac: f64,
     pub n_fused_hn_con: usize,
     pub n_hn_only: usize,
     pub n_proline_bridges: usize,
@@ -486,7 +590,7 @@ pub struct JointIdpAssignResult {
     pub fitted_offsets: IdpShiftOffsets,
     /// Plausibility & TMS-referencing audit report.
     pub auto_ref_report: IdpAutoRefSafetyReport,
-    /// Field-scaled TROSY `±1/2 1J_HN` calibration summary for `BT_HNCACONH`.
+    /// Field-scaled TROSY `46 Hz (1/2 1J_NH)` calibration summary for `BT_HNCACONH`.
     pub trosy_calibration: TrosyOffsetCalibration,
     /// Automatic `HNCACB`/`CBCACONH` polarity report (if `HN` peaks supplied).
     pub polarity_report: Option<PolarityReport>,
@@ -506,11 +610,20 @@ pub struct JointIdpAssignResult {
     pub n_sidelobes_pruned: usize,
     /// Total suspect `Gly CB` bleed-through candidates suppressed.
     pub n_gly_cb_guarded: usize,
+    /// Empirical sequential `CA` RMS (ppm) across assigned neighbors.
+    pub emp_rms_seq_ca: f64,
+    /// Empirical sequential `C'` RMS (ppm) across assigned neighbors.
+    pub emp_rms_seq_c: f64,
+    /// Empirical `HN ↔ CON` fusion RMS `(C', N)` in ppm.
+    pub fusion_rms_ppm: (f64, f64),
     /// Unlabelled dataset QC verdict.
     pub qc_verdict: DatasetQcVerdict,
     /// Human-readable QC diagnostics and warnings.
     pub qc_reasons: Vec<String>,
 }
+
+/// Canonical type alias exported for GUI & CLI consumers (`180.core:P1-4`).
+pub type JointIdpResult = JointIdpAssignResult;
 
 impl JointIdpAssignResult {
     /// Convert into `AssignResult` for interoperability with `evaluate` and `ProteinReliabilityCurve`.
@@ -522,10 +635,85 @@ impl JointIdpAssignResult {
             run_scores: self.run_scores.clone(),
         }
     }
+
+    /// Build structured Proline-bridge summaries across every assignable `PRO` residue (`k >= 1`).
+    pub fn proline_bridge_summaries(&self) -> Vec<ProlineBridgeSummary> {
+        let len = self.residue_assignments.len();
+        let mut out = Vec::new();
+        for k in 1..len {
+            let ra = &self.residue_assignments[k];
+            if !ra.is_proline {
+                continue;
+            }
+            let prev_res = self.residue_assignments[k - 1].residue.clone();
+            let next_res = (k + 1 < len).then(|| self.residue_assignments[k + 1].residue.clone());
+            let (c_prev, n_pro) = ra
+                .node_idx
+                .and_then(|nid| self.nodes.get(nid))
+                .map(|n| (n.c_prev, Some(n.n_curr)))
+                .unwrap_or((None, None));
+            out.push(ProlineBridgeSummary {
+                pro_seq_idx: k,
+                prev_residue: prev_res,
+                next_residue: next_res,
+                pro_node_idx: ra.node_idx,
+                c_prev_ppm: c_prev,
+                n_pro_ppm: n_pro,
+                confidence: ra.confidence,
+                bridged: ra.node_idx.is_some(),
+            });
+        }
+        out
+    }
+
+    /// Build structured C-terminal `COO-` (`~179 ppm` DSS) anchor summaries for GUI & CLI inspection.
+    pub fn cterm_anchor_summaries(&self) -> Vec<CTermAnchorSummary> {
+        let last_k = self.residue_assignments.len().saturating_sub(1);
+        let mut out = Vec::new();
+        for &nid in &self.c_term_coo_candidates {
+            let Some(node) = self.nodes.get(nid) else {
+                continue;
+            };
+            let c_obs = node
+                .c_curr
+                .iter()
+                .copied()
+                .find(|&c| {
+                    let cd = c - self.fitted_offsets.d_c;
+                    (CTERM_COO_DSS_MIN_PPM..=CTERM_COO_DSS_MAX_PPM).contains(&cd)
+                })
+                .or_else(|| node.c_curr.first().copied())
+                .unwrap_or(CTERM_COO_DSS_CENTER_PPM);
+            let c_dss = c_obs - self.fitted_offsets.d_c;
+            let pos_i = self.position.get(nid).copied().unwrap_or(-1);
+            let assigned_to_cterm = pos_i >= 0 && (pos_i as usize) == last_k;
+            let seq_idx = if pos_i >= 0 && (pos_i as usize) < self.residue_assignments.len() {
+                pos_i as usize
+            } else {
+                last_k
+            };
+            let residue = self
+                .residue_assignments
+                .get(seq_idx)
+                .map(|r| r.residue.clone())
+                .unwrap_or_else(|| "UNK".to_string());
+            let conf = self.confidence.get(nid).copied().unwrap_or(0.0);
+            out.push(CTermAnchorSummary {
+                seq_idx,
+                residue,
+                node_idx: nid,
+                c_curr_ppm: c_obs,
+                c_curr_dss_ppm: c_dss,
+                confidence: conf,
+                assigned_to_cterm,
+            });
+        }
+        out
+    }
 }
 
 // ============================================================================
-// Sequence Normalization & Enhanced `ncIDP` + Platzer C-Term COO- Predictions
+// Sequence Normalization & Enhanced `ncIDP` + Pre-Pro + Platzer C-Term COO-
 // ============================================================================
 
 fn normalize_seq_3(sequence: &[String]) -> Vec<String> {
@@ -542,25 +730,54 @@ fn normalize_seq_3(sequence: &[String]) -> Vec<String> {
         .collect()
 }
 
-/// Predict temperature-, pH-, neighbor-, pre-Proline-, and Platzer C-terminal `COO-`-corrected
-/// `ncIDP` backbone chemical shifts for `sequence[0..L]`.
-///
-/// Extends [`predict_ncidp_shifts`] with an explicit Platzer et al. (*J. Biomol. NMR* 2014)
-/// C-terminal `COO-` carbonyl titration model centered near `~179.0 ppm` DSS at neutral pH
-/// (protonating with `pKa = 3.55`).
+/// Longest contiguous homopolymer run length in `sequence` (for repeat QC gating).
+fn max_homopolymer_run(seq: &[String]) -> usize {
+    let mut best = 0usize;
+    let mut cur = 0usize;
+    let mut prev: Option<&str> = None;
+    for r in seq {
+        if prev == Some(r.as_str()) {
+            cur += 1;
+        } else {
+            cur = 1;
+            prev = Some(r.as_str());
+        }
+        if cur > best {
+            best = cur;
+        }
+    }
+    best
+}
+
+/// Predict temperature-, pH-, neighbor-, all-4-nucleus pre-Proline- (`C' -1.90`, `CA -1.80`,
+/// `N +1.65`, `CB -0.35 ppm`), and Platzer C-terminal `COO-`-corrected `ncIDP` backbone shifts.
 pub fn predict_joint_ncidp_shifts(
     sequence: &[String],
     cfg: &JointIdpConfig,
 ) -> Vec<NcIdpResiduePrediction> {
+    let seq = normalize_seq_3(sequence);
     let idp_cfg = cfg.as_idp_solver_config();
-    let mut preds = predict_ncidp_shifts(sequence, &idp_cfg);
+    let mut preds = predict_ncidp_shifts(&seq, &idp_cfg);
+
+    // Harmonize all 4 canonical pre-Proline shifts (`P2-14`: `C' -1.90`, `CA -1.80`, `N +1.65`,
+    // `CB -0.35 ppm`) explicitly against `predict_ncidp_shifts`'s baseline (`-1.95 C'`, `-1.95 CA`,
+    // `+1.65 N`, `-0.35 CB`) for non-Gly/non-Pro residues preceding `PRO`.
+    for k in 0..seq.len().saturating_sub(1) {
+        if seq[k + 1] == "PRO" && seq[k] != "GLY" && seq[k] != "PRO" {
+            let (dn_t, dc_t, dca_t, dcb_t) = pre_pro_shift_corrections(&seq[k]);
+            preds[k].n_ppm += dn_t - 1.65;
+            preds[k].c_ppm += dc_t - (-1.95);
+            preds[k].ca_ppm += dca_t - (-1.95);
+            if let Some(cb) = &mut preds[k].cb_ppm {
+                *cb += dcb_t - (-0.35);
+            }
+        }
+    }
+
     if cfg.enable_cterm_coo_prior && !preds.is_empty() {
         let last = preds.len() - 1;
         let ph_c = cfg.ph.clamp(1.0, 11.0);
         let f_deprot = 1.0 - 1.0 / (1.0 + 10.0_f64.powf(ph_c - 3.55));
-        // `predict_ncidp_shifts` already applied `+2.10 * f_deprot` on `C'`; refine toward
-        // Platzer et al. (2014) deprotonated C-terminal `COO-` (~179.0 ppm DSS, +0.90 ppm additional
-        // downfield for typical residues, clamped gently to realistic 178.4..180.5 ppm DSS).
         let target_coo = (preds[last].c_ppm + 0.85 * f_deprot).clamp(174.5, 180.8);
         if f_deprot > 0.5 && target_coo < 178.5 {
             preds[last].c_ppm = 0.5 * (target_coo + CTERM_COO_DSS_CENTER_PPM);
@@ -573,28 +790,25 @@ pub fn predict_joint_ncidp_shifts(
 }
 
 // ============================================================================
-// Field-Scaled TROSY `±1/2 1J_HN` (`±46 Hz / MHz`) Auto-Calibration
+// Crowded-HSQC-Robust Field-Scaled TROSY `46 Hz (1/2 1J_NH)` Calibration (P2-5)
 // ============================================================================
 
-/// Auto-calibrate a field-scaled TROSY `±1/2 1J_HN` (`±46 Hz / MHz`; Pervushin et al., *PNAS* 1997)
-/// cross-spectrum `(ΔH, ΔN)` offset between a TROSY 3D (`BT_HNCACONH`) and decoupled `HSQC`/`HNCO`
-/// amide roots.
+/// Auto-calibrate a field-scaled TROSY `46 Hz (1/2 1J_NH)` cross-spectrum `(ΔH, ΔN)` offset
+/// between a TROSY 3D (`BT_HNCACONH`) and decoupled `HSQC`/`HNCO` amide roots.
 ///
-/// Evaluates the decoupled null `(0, 0)` against all four physical `(±46 Hz / ν_H, ±46 Hz / ν_N)`
-/// multiplet-component quadrants using an unlabelled 2D Gaussian coincidence log-likelihood with
-/// Wilks + count gating (`>= 5` distinct matched roots) and bounded local median/IRLS polish.
+/// Evaluates the decoupled null `(0, 0)` against all four physical `46 Hz (1/2 1J_NH)` multiplet
+/// quadrants using 1-to-1 matched-pair coincidence scoring with crowded-HSQC background subtraction
+/// (averaging non-physical decoy shifts so dense `~0.22 ppm` IDP HSQCs do not inflate the null),
+/// requiring `>= 5` (`MIN_TROSY_MATCHED_ROOTS`) distinct matched roots and a Wilks excess margin
+/// over `(0, 0)`, followed by bounded local median refinement (`±0.028 ppm H`, `±0.28 ppm N`).
 pub fn calibrate_trosy_hn_offset(
     trosy_roots: &[(f64, f64)],
     decoupled_roots: &[(f64, f64)],
     proton_mhz: f64,
 ) -> TrosyOffsetCalibration {
-    let mhz = if proton_mhz.is_finite() && proton_mhz > 50.0 {
-        proton_mhz
-    } else {
-        600.0
-    };
-    let expected_h = TROSY_HALF_J_HN_HZ / mhz;
-    let expected_n = TROSY_HALF_J_HN_HZ / n15_obs_mhz(mhz);
+    let (exp_dh_signed, exp_dn_signed) = trosy_expected_shift_ppm(proton_mhz);
+    let expected_h = exp_dh_signed.abs();
+    let expected_n = exp_dn_signed.abs();
 
     let clean_t: Vec<(f64, f64)> = trosy_roots
         .iter()
@@ -607,7 +821,7 @@ pub fn calibrate_trosy_hn_offset(
         .filter(|&(h, n)| h.is_finite() && n.is_finite())
         .collect();
 
-    if clean_t.len() < 4 || clean_d.len() < 4 {
+    if clean_t.len() < MIN_TROSY_MATCHED_ROOTS || clean_d.len() < MIN_TROSY_MATCHED_ROOTS {
         return TrosyOffsetCalibration {
             dh_ppm: 0.0,
             dn_ppm: 0.0,
@@ -619,39 +833,67 @@ pub fn calibrate_trosy_hn_offset(
         };
     }
 
-    let bw_h = 0.025f64;
-    let bw_n = 0.25f64;
-    let bg = 0.03f64;
+    // Tight 1-to-1 coincidence bandwidth (`0.018 ppm 1H`, `0.18 ppm 15N`) so crowded IDP HSQCs
+    // with `~0.22 ppm` 1H dispersion separate cleanly from shifted TROSY peaks.
+    let bw_h = 0.018f64;
+    let bw_n = 0.18f64;
 
-    let eval_coinc = |dh: f64, dn: f64| -> (f64, usize) {
-        let mut ll = 0.0f64;
-        let mut matched = 0usize;
-        for &(th, tn) in &clean_t {
+    let eval_1to1_coinc = |dh: f64, dn: f64| -> (f64, usize) {
+        let mut edges: Vec<(f64, usize, usize)> = Vec::new();
+        for (ti, &(th, tn)) in clean_t.iter().enumerate() {
             let hc = th - dh;
             let nc = tn - dn;
-            let mut best_d2 = f64::INFINITY;
-            for &(dh_ref, dn_ref) in &clean_d {
-                let d2 = ((hc - dh_ref) / bw_h).powi(2) + ((nc - dn_ref) / bw_n).powi(2);
-                if d2 < best_d2 {
-                    best_d2 = d2;
+            for (di, &(rh, rn)) in clean_d.iter().enumerate() {
+                let d2 = ((hc - rh) / bw_h).powi(2) + ((nc - rn) / bw_n).powi(2);
+                if d2 <= 4.0 {
+                    edges.push((d2, ti, di));
                 }
             }
-            if best_d2 <= 2.25 {
-                matched += 1;
-            }
-            let ker = if best_d2 < 36.0 {
-                (-0.5 * best_d2).exp()
-            } else {
-                0.0
-            };
-            ll += (ker + bg).ln();
         }
-        (ll, matched)
+        edges.sort_by(|a, b| {
+            a.0.total_cmp(&b.0)
+                .then_with(|| a.1.cmp(&b.1))
+                .then_with(|| a.2.cmp(&b.2))
+        });
+        let mut used_t = vec![false; clean_t.len()];
+        let mut used_d = vec![false; clean_d.len()];
+        let mut score = 0.0f64;
+        let mut matched = 0usize;
+        for (d2, ti, di) in edges {
+            if used_t[ti] || used_d[di] {
+                continue;
+            }
+            used_t[ti] = true;
+            used_d[di] = true;
+            matched += 1;
+            score += 2.6 * (-0.5 * d2).exp();
+        }
+        (score, matched)
     };
 
-    let (null_ll, null_matched) = eval_coinc(0.0, 0.0);
+    // Estimate empirical crowded-HSQC random-coincidence baseline from 6 non-physical decoy shifts
+    let decoy_shifts = [
+        (0.32, 3.2),
+        (-0.32, -3.2),
+        (0.32, -3.2),
+        (-0.32, 3.2),
+        (0.26, 0.0),
+        (0.0, 3.8),
+    ];
+    let mut bg_score_sum = 0.0f64;
+    let mut bg_match_sum = 0.0f64;
+    for &(ddh, ddn) in &decoy_shifts {
+        let (sc, m) = eval_1to1_coinc(ddh, ddn);
+        bg_score_sum += sc;
+        bg_match_sum += m as f64;
+    }
+    let bg_score = bg_score_sum / (decoy_shifts.len() as f64);
+    let bg_matches = bg_match_sum / (decoy_shifts.len() as f64);
 
-    // Physical TROSY / anti-TROSY quadrants at `±1/2 1J_HN` (`(-H, +N)` is canonical TROSY)
+    let (null_raw, null_matched) = eval_1to1_coinc(0.0, 0.0);
+    let null_excess = (null_raw - bg_score).max(0.0);
+
+    // Physical `46 Hz (1/2 1J_NH)` quadrants (`(-H, +N)` is canonical TROSY)
     let candidates = [
         (-expected_h, expected_n),
         (expected_h, -expected_n),
@@ -660,18 +902,19 @@ pub fn calibrate_trosy_hn_offset(
     ];
 
     let mut best_cand = (0.0, 0.0);
-    let mut best_ll = null_ll;
+    let mut best_excess = null_excess;
     let mut best_matched = null_matched;
     for &(ch, cn) in &candidates {
-        let (ll, m) = eval_coinc(ch, cn);
-        if ll > best_ll {
-            best_ll = ll;
+        let (sc, m) = eval_1to1_coinc(ch, cn);
+        let ex = (sc - bg_score).max(0.0);
+        if ex > best_excess {
+            best_excess = ex;
             best_cand = (ch, cn);
             best_matched = m;
         }
     }
 
-    // Refine locally within `±0.028 ppm H, ±0.28 ppm N` around the winning physical quadrant
+    // Local bounded median refinement (`±0.028 ppm H`, `±0.28 ppm N`) around the winning quadrant
     if best_cand != (0.0, 0.0) {
         let mut dhs = Vec::new();
         let mut dns = Vec::new();
@@ -682,7 +925,7 @@ pub fn calibrate_trosy_hn_offset(
             for &(rh, rn) in &clean_d {
                 let eh = hc - rh;
                 let en = nc - rn;
-                if eh.abs() <= 0.035 && en.abs() <= 0.35 {
+                if eh.abs() <= 0.032 && en.abs() <= 0.32 {
                     let d2 = (eh / bw_h).powi(2) + (en / bw_n).powi(2);
                     if best.is_none_or(|b| d2 < b.0) {
                         best = Some((d2, th - rh, tn - rn));
@@ -694,26 +937,26 @@ pub fn calibrate_trosy_hn_offset(
                 dns.push(dni);
             }
         }
-        if dhs.len() >= 4 {
+        if dhs.len() >= MIN_TROSY_MATCHED_ROOTS {
             dhs.sort_by(|a, b| a.total_cmp(b));
             dns.sort_by(|a, b| a.total_cmp(b));
             let med_h = dhs[dhs.len() / 2].clamp(best_cand.0 - 0.028, best_cand.0 + 0.028);
             let med_n = dns[dns.len() / 2].clamp(best_cand.1 - 0.28, best_cand.1 + 0.28);
-            let (ref_ll, ref_m) = eval_coinc(med_h, med_n);
-            if ref_ll >= best_ll {
-                best_ll = ref_ll;
+            let (ref_sc, ref_m) = eval_1to1_coinc(med_h, med_n);
+            let ref_ex = (ref_sc - bg_score).max(0.0);
+            if ref_ex >= best_excess {
+                best_excess = ref_ex;
                 best_cand = (med_h, med_n);
                 best_matched = ref_m;
             }
         }
     }
 
-    let gain = (best_ll - null_ll).max(0.0);
-    let min_roots = 4usize.min(clean_t.len());
-    // Require clear statistical separation over `(0, 0)` (4 quadrants + Wilks chi2 + count gain)
+    let gain = (best_excess - null_excess).max(0.0);
     let detected = best_cand != (0.0, 0.0)
-        && best_matched >= min_roots
-        && best_matched >= null_matched + 2
+        && best_matched >= MIN_TROSY_MATCHED_ROOTS
+        && (best_matched as f64) >= bg_matches + 3.0
+        && best_matched >= null_matched + 3
         && gain > (4.0_f64.ln() + WILKS_HALF_CHI2_1_95);
 
     if detected {
@@ -744,11 +987,15 @@ pub fn calibrate_trosy_hn_offset(
 // ============================================================================
 
 /// Prune `F1(13C')` NUS reconstruction sidelobes from a single amide carbonyl strip
-/// (`HN(CA)CO` or `HNCO`), given `(c_prime_ppm, abs_height)` pairs.
+/// (`HN(CA)CO` or `HNCO`), given `(c_prime_ppm, abs_height)` pairs (`P2-13`).
 ///
-/// Rejects out-of-window noise (`< 163` or `> 186 ppm`), suppresses weak sidelobes
-/// (`height < 0.18 * parent_height` within `±2.2 ppm` of a stronger carbonyl peak, or
-/// `< 0.14 * strip_max`), deduplicates within `0.06 ppm`, and retains at most `max_keep` peaks.
+/// - Drops out-of-window (`< 163` or `> 186 ppm`) artifacts and deduplicates sub-peaks (`<= 0.06 ppm`).
+/// - **Preserves genuine 2-peak `(C'_i, C'_{i-1})` doublets** even when the weaker `C'_{i-1}`
+///   peak is `~0.10–0.18x` of `C'_i` (never prunes a 2-peak strip above the `0.04x` thermal floor).
+/// - When `>= 3` distinct in-window peaks are present, first removes symmetric flanking NUS
+///   sidelobe pairs `(c0 - Δ, c0 + Δ)` (`|Δ_L - Δ_R| <= 0.25 ppm`, both `< 0.28 * h0`), then
+///   drops excess weak sidelobes (`< 0.19 * kh` within `±2.2 ppm` or `< 0.14 * max_h`) while
+///   always preserving the top 2 resolved peaks (up to `max_keep`).
 pub fn prune_f1_c_prime_nus_sidelobes(
     peaks: &[(f64, f64)],
     max_keep: usize,
@@ -760,32 +1007,108 @@ pub fn prune_f1_c_prime_nus_sidelobes(
         .filter(|&(c, h)| c.is_finite() && h.is_finite() && (163.0..=186.0).contains(&c))
         .map(|(c, h)| (c, h.abs().max(1e-6)))
         .collect();
-    let dropped_oob = peaks.len().saturating_sub(sorted.len());
+    let mut pruned = peaks.len().saturating_sub(sorted.len());
     if sorted.is_empty() {
-        return (Vec::new(), dropped_oob);
+        return (Vec::new(), pruned);
     }
 
     sorted.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.total_cmp(&b.0)));
-    let max_h = sorted[0].1;
 
-    let mut kept: Vec<(f64, f64)> = Vec::with_capacity(cap);
-    let mut pruned = dropped_oob;
+    // Deduplicate sub-voxel split peaks (`<= 0.06 ppm`)
+    let mut dedup: Vec<(f64, f64)> = Vec::with_capacity(sorted.len());
     for (c, h) in sorted {
-        // Dedup very close sub-peaks
-        if kept.iter().any(|&(kc, _)| (kc - c).abs() <= 0.06) {
+        if dedup.iter().any(|&(kc, _)| (kc - c).abs() <= 0.06) {
+            pruned += 1;
+        } else {
+            dedup.push((c, h));
+        }
+    }
+    if dedup.is_empty() {
+        return (Vec::new(), pruned);
+    }
+
+    let max_h = dedup[0].1;
+
+    // Preserve genuine `<= 2`-peak `(C'_i, C'_{i-1})` doublets (including weak `0.10..0.18x` `C'_{i-1}`)
+    if dedup.len() <= 2 {
+        let mut kept = Vec::with_capacity(cap.min(dedup.len()));
+        for (idx, (c, h)) in dedup.into_iter().enumerate() {
+            if idx < cap && (idx == 0 || h >= 0.04 * max_h) {
+                kept.push((c, h));
+            } else {
+                pruned += 1;
+            }
+        }
+        return (kept, pruned);
+    }
+
+    // `>= 3` peaks: first identify & flag symmetric flanking NUS sidelobe pairs around `(c0, h0)`
+    let (c0, h0) = dedup[0];
+    let mut is_sym_sidelobe = vec![false; dedup.len()];
+    for i in 1..dedup.len() {
+        if is_sym_sidelobe[i] || dedup[i].1 >= 0.28 * h0 {
+            continue;
+        }
+        let di = dedup[i].0 - c0;
+        if di.abs() < 0.15 || di.abs() > 3.50 {
+            continue;
+        }
+        for j in (i + 1)..dedup.len() {
+            if is_sym_sidelobe[j] || dedup[j].1 >= 0.28 * h0 {
+                continue;
+            }
+            let dj = dedup[j].0 - c0;
+            // Opposite sides of `c0` with symmetric lag `| |di| - |dj| | <= 0.25 ppm`
+            if di * dj < 0.0 && (di.abs() - dj.abs()).abs() <= 0.25 {
+                is_sym_sidelobe[i] = true;
+                is_sym_sidelobe[j] = true;
+                break;
+            }
+        }
+    }
+
+    let mut remaining: Vec<(f64, f64)> = Vec::with_capacity(dedup.len());
+    for (idx, pk) in dedup.into_iter().enumerate() {
+        if is_sym_sidelobe[idx] {
+            pruned += 1;
+        } else {
+            remaining.push(pk);
+        }
+    }
+
+    // If pruning symmetric sidelobes already left `<= 2` peaks, keep the doublet intact!
+    if remaining.len() <= 2 {
+        let mut kept = Vec::with_capacity(cap.min(remaining.len()));
+        for (idx, (c, h)) in remaining.into_iter().enumerate() {
+            if idx < cap && (idx == 0 || h >= 0.04 * max_h) {
+                kept.push((c, h));
+            } else {
+                pruned += 1;
+            }
+        }
+        return (kept, pruned);
+    }
+
+    // Otherwise (`>= 3` remaining), keep top 2 peaks and reject weak asymmetric excess sidelobes
+    let mut kept: Vec<(f64, f64)> = Vec::with_capacity(cap);
+    for (idx, (c, h)) in remaining.into_iter().enumerate() {
+        if kept.len() >= cap {
             pruned += 1;
             continue;
         }
-        // Weak NUS sidelobe adjacent to a dominant carbonyl peak (`±2.2 ppm`)
+        if idx < 2 && (idx == 0 || h >= 0.04 * max_h) {
+            kept.push((c, h));
+            continue;
+        }
         let is_local_sidelobe = kept
             .iter()
             .any(|&(kc, kh)| (kc - c).abs() <= 2.20 && h < 0.19 * kh);
-        let is_global_floor = !kept.is_empty() && h < 0.14 * max_h;
-        if is_local_sidelobe || is_global_floor || kept.len() >= cap {
+        let is_global_floor = h < 0.14 * max_h;
+        if is_local_sidelobe || is_global_floor {
             pruned += 1;
-            continue;
+        } else {
+            kept.push((c, h));
         }
-        kept.push((c, h));
     }
 
     (kept, pruned)
@@ -795,8 +1118,7 @@ pub fn prune_f1_c_prime_nus_sidelobes(
 ///
 /// Whenever a node's primary `CA` candidate falls in the Glycine `CA` band `41.0..=46.5 ppm` DSS
 /// (after subtracting `offsets.d_ca`), removes suspect bleed-through / phase-ringing `CB` peaks
-/// sitting within `±0.95 ppm` of that `Gly CA` (or in `41.0..=46.5 ppm` DSS when no distinct
-/// non-ringing `CB` exists), marking `gly_cb_curr_suppressed` / `gly_cb_prev_suppressed`.
+/// sitting within `±1.25 ppm` of that `Gly CA` or inside `41.0..=46.5 ppm` DSS.
 pub fn apply_gly_cb_bleedthrough_guard(
     nodes: &mut [JointIdpNode],
     offsets: &IdpShiftOffsets,
@@ -808,7 +1130,6 @@ pub fn apply_gly_cb_bleedthrough_guard(
     };
 
     for node in nodes.iter_mut() {
-        // Guard intraresidue `(ca_curr, cb_curr)`
         if let Some(&ca0) = node.ca_curr.first() {
             if is_gly_ca_dss(ca0) && !node.cb_curr.is_empty() {
                 let ca0_dss = ca0 - offsets.d_ca;
@@ -827,7 +1148,6 @@ pub fn apply_gly_cb_bleedthrough_guard(
                 }
             }
         }
-        // Guard preceding `(ca_prev, cb_prev)`
         if let Some(&ca0) = node.ca_prev.first() {
             if is_gly_ca_dss(ca0) && !node.cb_prev.is_empty() {
                 let ca0_dss = ca0 - offsets.d_ca;
@@ -851,12 +1171,15 @@ pub fn apply_gly_cb_bleedthrough_guard(
 }
 
 // ============================================================================
-// Overlap & Breakthrough-Calibrated `CAS` Likelihood (Sahu et al. 2014)
+// Overlap & Breakthrough-Calibrated `CAS` Likelihood (Shared with `c13_detected`)
 // ============================================================================
 
-/// Precomputed overlap- and breakthrough-calibrated match table for one `CAS` subspectrum.
+/// Precomputed overlap- and breakthrough-calibrated match table for one `CAS` subspectrum,
+/// delegating core LLR calibration to [`cas_llr_adjustment`] (`P2-3`) scaled by per-root
+/// spectral-overlap fanout and peak-intensity confidence.
 #[derive(Clone, Debug)]
 pub struct CalibratedCasTable {
+    pub spectrum: CasSpectrum,
     pub mode: CasMode,
     pub residues: Vec<String>,
     /// Per-node overlap-damped hit strength in `[0.0, 1.0]` (`0.0` = no hit).
@@ -867,9 +1190,11 @@ pub struct CalibratedCasTable {
     pub p_fp_eff: f64,
     /// Number of nodes matched by at least one peak in this `CAS` spectrum.
     pub n_nodes_hit: usize,
+    /// Number of distinct CAS peaks that matched at least one node.
+    pub n_matched_peaks: usize,
     /// Count of matching residues in `sequence[1..L]` (or `0..L-1` for `Cacon`).
     pub seq_type_count: usize,
-    /// Maximum LLR magnitude (nats).
+    /// Maximum LLR scale (nats) forwarded to `cas_llr_adjustment`.
     pub max_llr: f64,
 }
 
@@ -879,26 +1204,27 @@ impl CalibratedCasTable {
     #[inline]
     pub fn llr_for(&self, node_idx: usize, target_res: &str) -> f64 {
         let w = self.hit_weight.get(node_idx).copied().unwrap_or(0.0);
-        let in_type = self
-            .residues
-            .iter()
-            .any(|r| r.eq_ignore_ascii_case(target_res));
+        // Delegate base breakthrough-calibrated LLR to `c13_detected::cas_llr_adjustment` (`P2-3`),
+        // passing `n_matched_peaks` so local spectral overlap (`w`) and global breakthrough
+        // (`n_matched_peaks > seq_type_count`) are cleanly decoupled without double-penalizing!
         if w > 0.0 {
-            let raw_llr = (self.p_tp_eff / self.p_fp_eff.max(1e-3))
-                .ln()
-                .clamp(0.45, self.max_llr);
-            if in_type {
-                w * raw_llr
-            } else {
-                // Slightly softer mismatch penalty prevents isolated breakthrough spikes from
-                // overpowering corroborated sequential walks.
-                -0.85 * w * raw_llr
-            }
-        } else if in_type && self.seq_type_count > 0 && self.n_nodes_hit > 0 {
-            let miss_ratio = (1.0 - 0.70 * self.p_tp_eff) / (1.0 - self.p_fp_eff).max(0.25);
-            miss_ratio.max(0.15).ln().clamp(-1.15, 0.0)
+            w * cas_llr_adjustment(
+                &self.spectrum,
+                true,
+                target_res,
+                self.max_llr,
+                self.seq_type_count,
+                self.n_matched_peaks,
+            )
         } else {
-            0.0
+            cas_llr_adjustment(
+                &self.spectrum,
+                false,
+                target_res,
+                self.max_llr,
+                self.seq_type_count,
+                self.n_matched_peaks,
+            )
         }
     }
 }
@@ -938,19 +1264,20 @@ pub fn build_calibrated_cas_tables(
 
         if clean_peaks.is_empty() {
             tables.push(CalibratedCasTable {
+                spectrum: cas.clone(),
                 mode: cas.mode,
                 residues: cas.residues.clone(),
                 hit_weight: vec![0.0; s_len],
                 p_tp_eff: 0.0,
-                p_fp_eff: cfg.cas_base_fp.clamp(0.02, 0.45),
+                p_fp_eff: cfg.cas_base_fp.clamp(0.10, 0.52),
                 n_nodes_hit: 0,
+                n_matched_peaks: 0,
                 seq_type_count,
                 max_llr: cfg.cas_max_llr.max(0.5),
             });
             continue;
         }
 
-        // Bounded median drift alignment between CAS and node `(c_prev, n_curr)` roots
         let eval_matches = |dc: f64, dn: f64| -> (Vec<f64>, usize) {
             let mut weights = vec![0.0f64; s_len];
             let mut matched_pks = 0usize;
@@ -973,12 +1300,8 @@ pub fn build_calibrated_cas_tables(
                 }
                 if !hits_for_pk.is_empty() {
                     matched_pks += 1;
-                    // Overlap damping: if one CAS peak falls inside `m` crowded roots, damp
-                    // per-root certainty smoothly via `1 / (1 + 0.45 * (m - 1))`.
                     let fanout = hits_for_pk.len() as f64;
                     let w_overlap = 1.0 / (1.0 + 0.45 * (fanout - 1.0));
-                    // Mild intensity confidence weight: very weak `< 25%`-median peaks get
-                    // damped (`0.55..1.0`) to protect against incomplete-suppression breakthrough.
                     let rel_h = (h / med_h).clamp(0.05, 3.0);
                     let w_int = (0.55 + 0.45 * (rel_h / 0.60).clamp(0.0, 1.0)).clamp(0.55, 1.0);
                     for (s_idx, d2) in hits_for_pk {
@@ -1033,26 +1356,23 @@ pub fn build_calibrated_cas_tables(
         }
 
         let n_nodes_hit = hit_weight.iter().filter(|&&w| w > 0.0).count();
-        let non_type_pool = s_len.saturating_sub(seq_type_count).max(1) as f64;
-        // Breakthrough calibration uses matched *peaks* (not overlap-inflated node count) so
-        // crowded-root overlap is damped locally by `w_overlap` while excess breakthrough peaks
-        // inflate global `p_fp_eff`.
-        let excess_peaks = matched_pks.saturating_sub(seq_type_count) as f64;
-        let p_fp_eff = (cfg.cas_base_fp + excess_peaks / non_type_pool).clamp(0.03, 0.45);
-        let p_tp_eff = if seq_type_count > 0 {
-            let cov = (matched_pks.min(seq_type_count) as f64) / (seq_type_count as f64);
-            (0.18 + 0.74 * cov).clamp(0.20, 0.92)
+        let excess_fp = if seq_type_count > 0 && matched_pks > seq_type_count {
+            (((matched_pks - seq_type_count) as f64) / (matched_pks as f64)) * 0.45
         } else {
-            0.20
+            0.0
         };
+        let p_fp_eff = (0.12 + excess_fp).clamp(0.10, 0.52);
+        let p_tp_eff = 0.82f64;
 
         tables.push(CalibratedCasTable {
+            spectrum: cas.clone(),
             mode: cas.mode,
             residues: cas.residues.clone(),
             hit_weight,
             p_tp_eff,
             p_fp_eff,
             n_nodes_hit,
+            n_matched_peaks: matched_pks,
             seq_type_count,
             max_llr: cfg.cas_max_llr.max(0.5),
         });
@@ -1062,138 +1382,12 @@ pub fn build_calibrated_cas_tables(
 }
 
 // ============================================================================
-// Unlabelled Permutation-Invariant Reference Offset Estimation (TMS-Safe)
+// Unlabelled Reference Offset Estimation (Delegated to `idp_solver`, P2-3)
 // ============================================================================
 
-fn fit_1d_marginal_offset_tms_safe(
-    obs_sorted: &[f64],
-    model_sorted: &[(f64, f64)],
-    range_ppm: f64,
-    max_abs_offset: f64,
-    grid_step: f64,
-) -> f64 {
-    if obs_sorted.len() < 5 || model_sorted.is_empty() {
-        return 0.0;
-    }
-    let inv_m = 1.0 / (model_sorted.len() as f64);
-    let bg = 0.06 / range_ppm.max(4.0);
-    let fg = 0.94;
-
-    let inv_s_sum: f64 = model_sorted
-        .iter()
-        .map(|&(_, sd)| 1.0 / (sd * 1.15).max(0.30))
-        .sum();
-    let s_harm = (model_sorted.len() as f64) / inv_s_sum.max(1e-12);
-    let corr_step = (std::f64::consts::SQRT_2 * s_harm).max(0.25);
-    let n_grid_eff = ((2.0 * max_abs_offset) / corr_step).ceil().max(6.0);
-
-    let eval_one = |v: f64, d: f64| -> f64 {
-        let mut density = 0.0f64;
-        for &(mu, sd) in model_sorted {
-            let s_eff = (sd * 1.15).max(0.30);
-            let z = (v - (mu + d)) / s_eff;
-            if z.abs() < 8.0 {
-                density += inv_m * (-0.5 * z * z).exp() / (s_eff * TAU.sqrt());
-            }
-        }
-        (fg * density + bg).max(1e-30).ln()
-    };
-
-    let h_eps = 0.025f64;
-    let inv_h2 = 1.0 / (h_eps * h_eps);
-    let mut h_sum = 0.0f64;
-    for &v in obs_sorted {
-        let lp = eval_one(v, h_eps);
-        let l0 = eval_one(v, 0.0);
-        let lm = eval_one(v, -h_eps);
-        h_sum += (-(lp - 2.0 * l0 + lm) * inv_h2).max(0.0);
-    }
-    let bar_h = h_sum / (obs_sorted.len() as f64);
-    let lambda_godambe = (s_harm * s_harm * bar_h).clamp(0.12, 1.0);
-    let ll_crit = lambda_godambe * (n_grid_eff.ln() + WILKS_HALF_CHI2_1_95);
-
-    let eval_ll = |d: f64| -> f64 {
-        let mut ll = -0.025 * d * d;
-        for &v in obs_sorted {
-            ll += eval_one(v, d);
-        }
-        ll
-    };
-
-    let n_steps = ((2.0 * max_abs_offset) / grid_step).round() as usize;
-    let mut scores = Vec::with_capacity(n_steps + 1);
-    let mut best_idx = 0usize;
-    let mut best_ll = f64::NEG_INFINITY;
-    for i in 0..=n_steps {
-        let d = -max_abs_offset + (i as f64) * grid_step;
-        let sc = eval_ll(d);
-        if sc > best_ll {
-            best_ll = sc;
-            best_idx = i;
-        }
-        scores.push(sc);
-    }
-
-    let base_ll = eval_ll(0.0);
-    let mut d_est = -max_abs_offset + (best_idx as f64) * grid_step;
-    if best_idx > 0 && best_idx < n_steps {
-        let ym1 = scores[best_idx - 1];
-        let y0 = scores[best_idx];
-        let yp1 = scores[best_idx + 1];
-        let den = ym1 - 2.0 * y0 + yp1;
-        if den < -1e-12 {
-            let frac = (0.5 * (ym1 - yp1) / den).clamp(-0.5, 0.5);
-            d_est += frac * grid_step;
-        }
-    }
-
-    // 4-step posterior-responsibility Huber IRLS polish
-    let huber_k = 1.345f64;
-    for _ in 0..4 {
-        let mut num = 0.0f64;
-        let mut den = 1e-9f64;
-        for &v in obs_sorted {
-            let mut post_num = 0.0f64;
-            let mut post_den = bg;
-            let mut f_w = 0.0f64;
-            for &(mu, sd) in model_sorted {
-                let s_eff = (sd * 1.10).max(0.30);
-                let r = v - (mu + d_est);
-                let z = r / s_eff;
-                if z.abs() < 7.0 {
-                    let comp = fg * inv_m * (-0.5 * z * z).exp() / (s_eff * TAU.sqrt());
-                    let hw = if z.abs() <= huber_k {
-                        1.0
-                    } else {
-                        huber_k / z.abs()
-                    };
-                    let w = comp * hw / (s_eff * s_eff);
-                    post_num += w * r;
-                    f_w += w;
-                    post_den += comp;
-                }
-            }
-            if post_den > 1e-24 {
-                num += post_num / post_den;
-                den += f_w / post_den;
-            }
-        }
-        let step = (num / den).clamp(-0.15, 0.15);
-        let cand = (d_est + step).clamp(-max_abs_offset, max_abs_offset);
-        if eval_ll(cand) >= eval_ll(d_est) - 1e-6 {
-            d_est = cand;
-        }
-    }
-
-    if eval_ll(d_est) > base_ll + ll_crit && d_est.abs() >= 0.015 {
-        d_est
-    } else {
-        0.0
-    }
-}
-
 /// Strictly unlabelled, permutation-invariant global `(dN, dC', dCA, dCB)` offset estimator over
-/// unified `JointIdpNode`s with wide TMS-safe shift windows (recovering `-2.7 ppm` TMS `13C` offsets).
+/// unified `JointIdpNode`s using shared [`fit_1d_unlabelled_marginal_offset`] and
+/// [`evaluate_idp_auto_reference_safety`] from `idp_solver` (`P2-3`, TMS-safe windows).
 pub fn estimate_joint_reference_offsets(
     nodes: &[JointIdpNode],
     sequence: &[String],
@@ -1249,7 +1443,6 @@ pub fn estimate_joint_reference_offsets(
     obs_ca.sort_by(|a, b| a.total_cmp(b));
     obs_cb.sort_by(|a, b| a.total_cmp(b));
 
-    // When only non-Proline HN roots exist (no CON Prolines), exclude Proline `15N` from `mod_n`
     let has_con_pro = nodes.iter().any(|n| n.con_matched && n.n_curr >= 131.0);
     let mut mod_n: Vec<(f64, f64)> = preds[1..]
         .iter()
@@ -1274,13 +1467,12 @@ pub fn estimate_joint_reference_offsets(
     mod_cb.sort_by(|a, b| a.0.total_cmp(&b.0));
 
     let raw = IdpShiftOffsets {
-        d_n: fit_1d_marginal_offset_tms_safe(&obs_n, &mod_n, 38.0, 4.0, 0.02),
-        d_c: fit_1d_marginal_offset_tms_safe(&obs_c, &mod_c, 16.0, 4.0, 0.01),
-        d_ca: fit_1d_marginal_offset_tms_safe(&obs_ca, &mod_ca, 30.0, 4.0, 0.01),
-        d_cb: fit_1d_marginal_offset_tms_safe(&obs_cb, &mod_cb, 60.0, 4.0, 0.015),
+        d_n: fit_1d_unlabelled_marginal_offset(&obs_n, &mod_n, 38.0, 4.0, 0.02),
+        d_c: fit_1d_unlabelled_marginal_offset(&obs_c, &mod_c, 16.0, 4.0, 0.01),
+        d_ca: fit_1d_unlabelled_marginal_offset(&obs_ca, &mod_ca, 30.0, 4.0, 0.01),
+        d_cb: fit_1d_unlabelled_marginal_offset(&obs_cb, &mod_cb, 60.0, 4.0, 0.015),
     };
 
-    // Reuse `evaluate_idp_auto_reference_safety` for `±3.5 ppm 13C` / `±1.5 ppm 15N` plausibility caps
     let proxy_systems: Vec<ConDipeptideSystem> = nodes
         .iter()
         .map(|n| {
@@ -1299,8 +1491,248 @@ pub fn estimate_joint_reference_offsets(
 }
 
 // ============================================================================
+// Connected-Component Kuhn–Munkres (Hungarian) 1-to-1 `HN ↔ CON` Fusion (P2-1)
+// ============================================================================
+
+/// Exact Kuhn–Munkres (Hungarian) minimum-cost maximum-cardinality bipartite matching on an
+/// `n_rows x n_cols` cost matrix where `f64::INFINITY` denotes forbidden edges (`P2-1`).
+///
+/// Returns matched `(row, col)` pairs sorted by `row`. Uses a clean-room Jonker–Volgenant /
+/// Kuhn–Munkres shortest-augmenting-path formulation with finite dummy cost `BIG_COST` for
+/// unassigned vertices so every real edge `< BIG_COST` strictly increases matching cardinality.
+fn hungarian_min_cost_max_card(cost: &[Vec<f64>]) -> Vec<(usize, usize)> {
+    let n_rows = cost.len();
+    if n_rows == 0 {
+        return Vec::new();
+    }
+    let n_cols = cost[0].len();
+    if n_cols == 0 {
+        return Vec::new();
+    }
+
+    // Pad to square `n x n` (`n = n_rows + n_cols` dummy slots so every real vertex can either
+    // match a valid partner with cost `c_ij << UNMATCHED_COST` or stay unmatched cleanly).
+    const UNMATCHED_COST: f64 = 1.0e5;
+    const FORBID_EDGE: f64 = 1.0e9;
+
+    // Transpose if `n_rows > n_cols` so `m <= n` isn't needed with square padding of size `n_rows + n_cols`
+    // Actually for small connected components (typically `<= 16`), a `dim = n_rows + n_cols` matrix
+    // handles rectangular maximum-cardinality minimum-cost matching in one exact pass!
+    let dim = n_rows + n_cols;
+    let mut a = vec![vec![FORBID_EDGE; dim + 1]; dim + 1];
+    for r in 0..n_rows {
+        for c in 0..n_cols {
+            let v = cost[r][c];
+            if v.is_finite() && v < UNMATCHED_COST * 0.5 {
+                a[r + 1][c + 1] = v;
+            }
+        }
+        // Dummy unmatched column for row `r`
+        a[r + 1][n_cols + r + 1] = UNMATCHED_COST;
+    }
+    for c in 0..n_cols {
+        // Dummy unmatched row for col `c`
+        a[n_rows + c + 1][c + 1] = UNMATCHED_COST;
+        for r in 0..n_rows {
+            a[n_rows + c + 1][n_cols + r + 1] = 0.0;
+        }
+    }
+
+    let mut u = vec![0.0f64; dim + 1];
+    let mut v = vec![0.0f64; dim + 1];
+    let mut p = vec![0usize; dim + 1];
+    let mut way = vec![0usize; dim + 1];
+
+    for i in 1..=dim {
+        p[0] = i;
+        let mut j0 = 0usize;
+        let mut minv = vec![f64::INFINITY; dim + 1];
+        let mut used = vec![false; dim + 1];
+        loop {
+            used[j0] = true;
+            let i0 = p[j0];
+            let mut delta = f64::INFINITY;
+            let mut j1 = 0usize;
+            for j in 1..=dim {
+                if !used[j] {
+                    let cur = a[i0][j] - u[i0] - v[j];
+                    if cur < minv[j] {
+                        minv[j] = cur;
+                        way[j] = j0;
+                    }
+                    if minv[j] < delta {
+                        delta = minv[j];
+                        j1 = j;
+                    }
+                }
+            }
+            for j in 0..=dim {
+                if used[j] {
+                    u[p[j]] += delta;
+                    v[j] -= delta;
+                } else {
+                    minv[j] -= delta;
+                }
+            }
+            j0 = j1;
+            if p[j0] == 0 {
+                break;
+            }
+        }
+        loop {
+            let j1 = way[j0];
+            p[j0] = p[j1];
+            j0 = j1;
+            if j0 == 0 {
+                break;
+            }
+        }
+    }
+
+    let mut matched = Vec::new();
+    for j in 1..=n_cols {
+        let i = p[j];
+        if i >= 1 && i <= n_rows {
+            let c_ij = cost[i - 1][j - 1];
+            if c_ij.is_finite() && c_ij < UNMATCHED_COST * 0.5 {
+                matched.push((i - 1, j - 1));
+            }
+        }
+    }
+    matched.sort_by_key(|&(r, _)| r);
+    matched
+}
+
+/// Partition bipartite candidate edges `(hn_idx, con_idx, cost)` into connected components and solve
+/// each component via exact Hungarian 1-to-1 optimal matching (`P2-1`).
+fn match_hn_con_bipartite_hungarian(
+    n_hn: usize,
+    n_con: usize,
+    edges: &[(usize, usize, f64)],
+) -> Vec<(usize, usize, f64)> {
+    if n_hn == 0 || n_con == 0 || edges.is_empty() {
+        return Vec::new();
+    }
+    let mut adj_h: Vec<Vec<(usize, f64)>> = vec![Vec::new(); n_hn];
+    let mut adj_c: Vec<Vec<(usize, f64)>> = vec![Vec::new(); n_con];
+    for &(h, c, w) in edges {
+        adj_h[h].push((c, w));
+        adj_c[c].push((h, w));
+    }
+
+    let mut vis_h = vec![false; n_hn];
+    let mut vis_c = vec![false; n_con];
+    let mut result = Vec::new();
+
+    for start_h in 0..n_hn {
+        if vis_h[start_h] || adj_h[start_h].is_empty() {
+            continue;
+        }
+        let mut comp_h = Vec::new();
+        let mut comp_c = Vec::new();
+        let mut q: VecDeque<(bool, usize)> = VecDeque::new();
+        vis_h[start_h] = true;
+        q.push_back((true, start_h));
+
+        while let Some((is_h, u)) = q.pop_front() {
+            if is_h {
+                comp_h.push(u);
+                for &(c, _) in &adj_h[u] {
+                    if !vis_c[c] {
+                        vis_c[c] = true;
+                        q.push_back((false, c));
+                    }
+                }
+            } else {
+                comp_c.push(u);
+                for &(h, _) in &adj_c[u] {
+                    if !vis_h[h] {
+                        vis_h[h] = true;
+                        q.push_back((true, h));
+                    }
+                }
+            }
+        }
+        comp_h.sort_unstable();
+        comp_c.sort_unstable();
+
+        // Fast path for isolated 1-to-1 component
+        if comp_h.len() == 1 && comp_c.len() == 1 {
+            let h = comp_h[0];
+            let c = comp_c[0];
+            if let Some(&(_, w)) = adj_h[h].iter().find(|&&(cc, _)| cc == c) {
+                result.push((h, c, w));
+            }
+            continue;
+        }
+
+        // Guard against pathological giant connected component (> 64 vertices): fallback to sorted greedy
+        if comp_h.len() + comp_c.len() > 64 {
+            let mut local_edges: Vec<(f64, usize, usize)> = Vec::new();
+            for &h in &comp_h {
+                for &(c, w) in &adj_h[h] {
+                    local_edges.push((w, h, c));
+                }
+            }
+            local_edges.sort_by(|a, b| a.0.total_cmp(&b.0));
+            let mut used_h = BTreeSet::new();
+            let mut used_c = BTreeSet::new();
+            for (w, h, c) in local_edges {
+                if used_h.insert(h) && used_c.insert(c) {
+                    result.push((h, c, w));
+                }
+            }
+            continue;
+        }
+
+        let mut c_map: BTreeMap<usize, usize> = BTreeMap::new();
+        for (idx, &c) in comp_c.iter().enumerate() {
+            c_map.insert(c, idx);
+        }
+        let mut cost = vec![vec![f64::INFINITY; comp_c.len()]; comp_h.len()];
+        for (ri, &h) in comp_h.iter().enumerate() {
+            for &(c, w) in &adj_h[h] {
+                if let Some(&ci) = c_map.get(&c) {
+                    if w < cost[ri][ci] {
+                        cost[ri][ci] = w;
+                    }
+                }
+            }
+        }
+        for (ri, ci) in hungarian_min_cost_max_card(&cost) {
+            result.push((comp_h[ri], comp_c[ci], cost[ri][ci]));
+        }
+    }
+
+    result.sort_by_key(|&(h, c, _)| (h, c));
+    result
+}
+
+// ============================================================================
 // Unified Node Fusion Builder (`HN + 2D CON + Proline-Bridge + N–N`)
 // ============================================================================
+
+/// Canonicalize `1H`-detected experiment labels, accepting all `CBCACONH` / `HNCOCACB` /
+/// `CBCA(CO)NH` / `HN(CO)CACB` aliases (`P2-4`).
+fn canonical_hn_exp(raw: &str) -> &'static str {
+    let norm: String = raw
+        .trim()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .map(|c| c.to_ascii_uppercase())
+        .collect();
+    match norm.as_str() {
+        "HSQC" | "15NHSQC" | "N15HSQC" | "BESTHSQC" | "TROSY" | "TROSYHSQC" | "SOFAST"
+        | "SOFASTHMQC" | "NH" => "HSQC",
+        "HNCO" | "BESTHNCO" => "HNCO",
+        "HNCACO" | "BESTHNCACO" => "HNCACO",
+        "HNCACB" | "BESTHNCACB" | "CBCA" => "HNCACB",
+        "CBCACONH" | "HNCOCACB" | "BESTCBCACONH" | "BESTHNCOCACB" => "CBCACONH",
+        "HNCA" | "BESTHNCA" => "HNCA",
+        "HNCOCA" | "BESTHNCOCA" => "HNCOCA",
+        _ => "",
+    }
+}
 
 #[inline]
 fn dedup_push_f64(dst: &mut Vec<f64>, val: f64, tol: f64, max_len: usize) {
@@ -1322,7 +1754,6 @@ fn pool_corroborated_channels(
     max_len: usize,
 ) -> Vec<f64> {
     let mut out = Vec::with_capacity(max_len);
-    // 1. Corroborated peaks seen in BOTH routes first (average the two measurements)
     for &p in primary {
         if let Some(&q) = secondary
             .iter()
@@ -1333,11 +1764,9 @@ fn pool_corroborated_channels(
             }
         }
     }
-    // 2. Remaining primary candidates
     for &p in primary {
         dedup_push_f64(&mut out, p, dedup_tol, max_len);
     }
-    // 3. Remaining secondary candidates
     for &q in secondary {
         dedup_push_f64(&mut out, q, dedup_tol, max_len);
     }
@@ -1388,6 +1817,7 @@ fn sanitize_c13_dataset(raw: &C13PickedDataset) -> C13PickedDataset {
         .collect();
 
     // Auto-anchor unanchored `CANCO`/`CBCACON`/`CCCON` 3D peaks onto nearest `CON` root
+    // using noise-tolerant `(0.14 C', 0.50 N)` windows so noisy strips still attach without leaking truth!
     let mut strip_peaks = Vec::with_capacity(raw.strip_peaks.len());
     for p in &raw.strip_peaks {
         if !(p.c_prime_ppm.is_finite()
@@ -1410,8 +1840,8 @@ fn sanitize_c13_dataset(raw: &C13PickedDataset) -> C13PickedDataset {
         {
             let mut best: Option<(usize, f64)> = None;
             for (r_idx, r) in con_roots.iter().enumerate() {
-                let d2 = ((q.c_prime_ppm - r.c_prev_ppm) / 0.09).powi(2)
-                    + ((q.n_ppm - r.n_curr_ppm) / 0.35).powi(2);
+                let d2 = ((q.c_prime_ppm - r.c_prev_ppm) / 0.14).powi(2)
+                    + ((q.n_ppm - r.n_curr_ppm) / 0.50).powi(2);
                 if d2 <= 1.0 && best.is_none_or(|b| d2 < b.1) {
                     best = Some((r_idx, d2));
                 }
@@ -1446,7 +1876,7 @@ fn estimate_hnco_to_con_drift(
             .iter()
             .filter(|&&(hc, hn)| {
                 con_systems.iter().any(|cs| {
-                    ((hc - dc - cs.c_prev) / 0.08).powi(2) + ((hn - dn - cs.n_curr) / 0.32).powi(2)
+                    ((hc - dc - cs.c_prev) / 0.12).powi(2) + ((hn - dn - cs.n_curr) / 0.42).powi(2)
                         <= 1.0
                 })
             })
@@ -1454,14 +1884,12 @@ fn estimate_hnco_to_con_drift(
     };
 
     let direct = count_matches(0.0, 0.0);
-    // Check small bounded carrier drift first, plus wide TMS-vs-DSS (`±3.5 ppm C'`) only if direct is low
     let (max_dc, max_dn) = if direct * 2 >= hn_cn.len() {
-        (0.18, 0.45)
+        (0.22, 0.55)
     } else {
         (3.50, 1.50)
     };
 
-    // Histogram peak search on `(hc - cs.c_prev, hn - cs.n_curr)` for robust unlabelled registration
     let mut best_dc = 0.0f64;
     let mut best_dn = 0.0f64;
     let mut best_votes = direct;
@@ -1480,7 +1908,6 @@ fn estimate_hnco_to_con_drift(
         return (0.0, 0.0);
     }
 
-    // Coarse 2D bin vote (`0.08 ppm C' x 0.30 ppm N`)
     let mut bins: BTreeMap<(i32, i32), Vec<(f64, f64)>> = BTreeMap::new();
     for &(dc, dn) in &cand_pairs {
         let bc = (dc / 0.08).round() as i32;
@@ -1527,10 +1954,11 @@ fn estimate_hnco_to_con_drift(
     }
 }
 
-/// Build unified `JointIdpNode`s by fusing `HNCO`-supported amide roots with `2D CON`,
-/// preserving Proline `CON` bridges and exchange-broadened `CON`-only amides, pooling all
-/// multi-experiment channels, calibrating TROSY `±46 Hz / MHz` `(dH, dN)` and global TMS/DSS
-/// reference offsets, and applying `F1(C')` NUS sidelobe pruning and `Gly CB` bleed-through guards.
+/// Build unified `JointIdpNode`s by fusing `HNCO`-supported amide roots with `2D CON` via exact
+/// connected-component Hungarian 1-to-1 matching (`P2-1`), preserving Proline `CON` bridges and
+/// exchange-broadened `CON`-only amides, pooling all multi-experiment channels, calibrating TROSY
+/// `46 Hz (1/2 1J_NH)` `(dH, dN)` (`P2-5`) and global TMS/DSS reference offsets (`P2-3`), and
+/// applying `F1(C')` NUS sidelobe pruning (`P2-13`) and `Gly CB` bleed-through guards.
 pub fn build_joint_idp_nodes(
     dataset: &JointIdpDataset,
     sequence: &[String],
@@ -1542,23 +1970,32 @@ pub fn build_joint_idp_nodes(
     } else if cfg.proton_mhz.is_finite() && cfg.proton_mhz > 50.0 {
         cfg.proton_mhz
     } else {
-        600.0
+        CANONICAL_TROSY_FALLBACK_MHZ
     };
 
-    // 1. Sanitize `HN` peaks & normalize `HNCACB`/`CBCACONH` polarity (`RD-1`)
+    // 1. Sanitize `HN` peaks, normalize experiment aliases (`P2-4`), and normalize polarity (`RD-1`)
     let clean_hn_raw: Vec<Peak> = dataset
         .hn_peaks
         .iter()
-        .filter(|p| {
-            p.h.is_finite()
+        .filter_map(|p| {
+            if !(p.h.is_finite()
                 && p.n.is_finite()
                 && p.c.is_none_or(f64::is_finite)
                 && p.height.is_none_or(f64::is_finite)
                 && p.volume.is_none_or(f64::is_finite)
                 && (4.5..=12.5).contains(&p.h)
-                && (95.0..=148.0).contains(&p.n)
+                && (95.0..=148.0).contains(&p.n))
+            {
+                return None;
+            }
+            let canon = canonical_hn_exp(&p.exp);
+            if canon.is_empty() {
+                return None;
+            }
+            let mut q = p.clone();
+            q.exp = canon.to_string();
+            Some(q)
         })
-        .cloned()
         .collect();
 
     let (clean_hn, polarity_report) = if clean_hn_raw.is_empty() {
@@ -1569,7 +2006,6 @@ pub fn build_joint_idp_nodes(
         (norm, Some(rep))
     };
 
-    // Partition `HN` peaks by experiment
     let mut hsqc_pks: Vec<&Peak> = Vec::new();
     let mut hnco_pks: Vec<&Peak> = Vec::new();
     let mut hncaco_pks: Vec<&Peak> = Vec::new();
@@ -1596,8 +2032,7 @@ pub fn build_joint_idp_nodes(
     let cbcaconh_has_both_signs =
         cbcaconh_pks.iter().any(|p| p.sign > 0) && cbcaconh_pks.iter().any(|p| p.sign < 0);
 
-    // 2. Construct `HN` amide roots (preferring `HNCO` `(H_i, N_i, C'_{i-1})`, plus optional
-    //    `HSQC`-without-`HNCO` roots when corroborated by 3D `HNCACB`/`HNCA` strips).
+    // 2. Construct `HN` amide roots (`HNCO`-preferred + optional `HSQC` fallback with 3D support)
     let mut hn_drafts: Vec<HnRootDraft> = Vec::new();
     let mut sorted_hnco = hnco_pks.clone();
     sorted_hnco.sort_by(|a, b| {
@@ -1614,7 +2049,6 @@ pub fn build_joint_idp_nodes(
         if !(162.0..=186.0).contains(&c_val) {
             continue;
         }
-        // Dedup near-identical `HNCO` peaks
         let dup = hn_drafts.iter().any(|r| {
             (r.h - hp.h).abs() <= 0.022
                 && (r.n - hp.n).abs() <= 0.22
@@ -1643,16 +2077,15 @@ pub fn build_joint_idp_nodes(
         for sp in &hsqc_pks {
             let covered_by_hnco = hn_drafts
                 .iter()
-                .any(|r| ((r.h - sp.h) / 0.032).hypot((r.n - sp.n) / 0.32) <= 1.0);
+                .any(|r| ((r.h - sp.h) / 0.045).hypot((r.n - sp.n) / 0.45) <= 1.0);
             if covered_by_hnco {
                 continue;
             }
-            // Only keep `HSQC`-only roots if they carry at least one 3D strip peak (or if no 3Ds exist)
             let has_3d = hncacb_pks
                 .iter()
                 .chain(hnca_pks.iter())
                 .chain(cbcaconh_pks.iter())
-                .any(|p| ((p.h - sp.h) / 0.035).hypot((p.n - sp.n) / 0.35) <= 1.0);
+                .any(|p| ((p.h - sp.h) / 0.055).hypot((p.n - sp.n) / 0.50) <= 1.0);
             if has_3d || (hnco_pks.is_empty() && hncacb_pks.is_empty() && hnca_pks.is_empty()) {
                 hn_drafts.push(HnRootDraft {
                     h: sp.h,
@@ -1672,10 +2105,10 @@ pub fn build_joint_idp_nodes(
         }
     }
 
-    // 3. Populate 3D `HN` channels per amide root (`HNCACO`, `CBCACONH`, `HNCOCA`, `HNCACB`, `HNCA`)
+    // 3. Populate 3D `HN` channels per amide root with noise-adaptive `(tol_h, tol_n)`
     let mut total_sidelobes_pruned = 0usize;
-    let tol_h = 0.036f64;
-    let tol_n = 0.36f64;
+    let tol_h = 0.055f64;
+    let tol_n = 0.48f64;
 
     for draft in &mut hn_drafts {
         let strip_collect = |pks: &[&Peak]| -> Vec<(f64, i32, f64)> {
@@ -1685,7 +2118,7 @@ pub fn build_joint_idp_nodes(
                 if d <= 1.0 {
                     if let Some(c) = p.c {
                         let w = p.height.map(f64::abs).unwrap_or(1.0e4).max(1.0)
-                            * (-0.35 * d * d).exp();
+                            * (-0.45 * d * d).exp();
                         hits.push((c, p.sign, w));
                     }
                 }
@@ -1694,7 +2127,7 @@ pub fn build_joint_idp_nodes(
             hits
         };
 
-        // (a) `HN(CA)CO` with `F1(C')` NUS sidelobe pruning
+        // (a) `HN(CA)CO` with doublet-preserving `F1(C')` NUS sidelobe pruning (`P2-13`)
         let raw_hncaco: Vec<(f64, f64)> = strip_collect(&hncaco_pks)
             .into_iter()
             .map(|(c, _, w)| (c, w))
@@ -1707,11 +2140,10 @@ pub fn build_joint_idp_nodes(
         } else {
             raw_hncaco
         };
-        // Separate `c_curr` (`C'_i`) from `c_prev` (`C'_{i-1}`)
         let mut distinct_c_curr = Vec::new();
         let mut fallback_c_curr = Vec::new();
         for (c_val, _) in hncaco_clean {
-            if draft.c_prev.is_some_and(|cp| (cp - c_val).abs() <= 0.10) {
+            if draft.c_prev.is_some_and(|cp| (cp - c_val).abs() <= 0.12) {
                 dedup_push_f64(&mut fallback_c_curr, c_val, 0.06, 2);
             } else {
                 dedup_push_f64(&mut distinct_c_curr, c_val, 0.06, MAX_JOINT_CANDS);
@@ -1723,7 +2155,8 @@ pub fn build_joint_idp_nodes(
             draft.c_curr = fallback_c_curr;
         }
 
-        // (b) `HNCACB`, `CBCACONH`, `HNCOCA`, `HNCA`
+        // (b) `HNCACB`, `CBCACONH` (`HNCOCACB` alias), `HNCOCA`, `HNCA`
+        //     Uses shared `idp_solver::select_hncacb_intra_and_backfill_prev` (`P2-3`).
         let hncacb_strip = strip_collect(&hncacb_pks);
         let cbcaconh_strip = strip_collect(&cbcaconh_pks);
         let hncoca_strip = strip_collect(&hncoca_pks);
@@ -1740,15 +2173,15 @@ pub fn build_joint_idp_nodes(
             .map(|&(c, _, w)| (c, w))
             .collect();
 
-        // Preceding `CA(i-1)` from `HNCOCA`
         for &(c, _, _) in &hncoca_strip {
             if (36.0..=72.0).contains(&c) {
                 dedup_push_f64(&mut draft.ca_prev, c, 0.12, MAX_JOINT_CANDS);
             }
         }
 
-        // Preceding `CA(i-1)` and `CB(i-1)` from `CBCACONH` (disambiguated by sign or `HNCACB` sign!)
+        let mut hncocacb_all_c: Vec<f64> = Vec::with_capacity(cbcaconh_strip.len());
         for &(c, sgn, _) in &cbcaconh_strip {
+            hncocacb_all_c.push(c);
             if cbcaconh_has_both_signs {
                 if sgn >= 0 && (36.0..=72.0).contains(&c) {
                     dedup_push_f64(&mut draft.ca_prev, c, 0.12, MAX_JOINT_CANDS);
@@ -1756,9 +2189,8 @@ pub fn build_joint_idp_nodes(
                     dedup_push_f64(&mut draft.cb_prev, c, 0.14, MAX_JOINT_CB_CANDS);
                 }
             } else {
-                // Unipolar `CBCACONH`: match against signed `HNCACB` peaks first
-                let matches_pos = hncacb_pos.iter().any(|&(v, _)| (v - c).abs() <= 0.25);
-                let matches_neg = hncacb_neg.iter().any(|&(v, _)| (v - c).abs() <= 0.28);
+                let matches_pos = hncacb_pos.iter().any(|&(v, _)| (v - c).abs() <= 0.28);
+                let matches_neg = hncacb_neg.iter().any(|&(v, _)| (v - c).abs() <= 0.30);
                 match (matches_pos, matches_neg) {
                     (true, false) => dedup_push_f64(&mut draft.ca_prev, c, 0.12, MAX_JOINT_CANDS),
                     (false, true) => {
@@ -1773,8 +2205,6 @@ pub fn build_joint_idp_nodes(
                         }
                     }
                     (false, false) => {
-                        // Without `HNCACB` disambiguation, separate clear aliphatic `CB` (< 40 or > 65.5)
-                        // from `CA` (`40..65.5`) while allowing Ser/Thr dual overlap
                         if (39.0..=65.5).contains(&c) && draft.ca_prev.is_empty() {
                             dedup_push_f64(&mut draft.ca_prev, c, 0.12, MAX_JOINT_CANDS);
                         } else if (9.0..=76.0).contains(&c) {
@@ -1785,7 +2215,6 @@ pub fn build_joint_idp_nodes(
             }
         }
 
-        // Intraresidue `CA(i)` by subtracting corroborated `ca_prev` from `HNCACB(+)` & `HNCA`
         let mut all_ca_obs: Vec<(f64, f64)> = hncacb_pos.clone();
         for &(c, _, w) in &hnca_strip {
             if (36.0..=72.0).contains(&c) {
@@ -1794,45 +2223,24 @@ pub fn build_joint_idp_nodes(
         }
         all_ca_obs.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.total_cmp(&b.0)));
 
-        let mut ca_curr_distinct = Vec::new();
-        for &(c, _) in &all_ca_obs {
-            if !draft.ca_prev.iter().any(|&p| (p - c).abs() <= 0.18) {
-                dedup_push_f64(&mut ca_curr_distinct, c, 0.10, MAX_JOINT_CANDS);
-            }
-        }
-        if !ca_curr_distinct.is_empty() {
-            draft.ca_curr = ca_curr_distinct;
-        } else {
-            // Degenerate `CA_i == CA_{i-1}` fallback
-            for &(c, _) in all_ca_obs.iter().take(2) {
-                dedup_push_f64(&mut draft.ca_curr, c, 0.10, MAX_JOINT_CANDS);
-            }
-        }
-        // If no dedicated `(i-1)` experiment existed, also allow `HNCACB(+)`/`HNCA` weaker peak as `ca_prev`
-        if draft.ca_prev.is_empty() && all_ca_obs.len() >= 2 {
-            for &(c, _) in all_ca_obs.iter().skip(1).take(2) {
-                dedup_push_f64(&mut draft.ca_prev, c, 0.12, MAX_JOINT_CANDS);
-            }
+        let ca_intra = select_hncacb_intra_and_backfill_prev(
+            &all_ca_obs,
+            &mut draft.ca_prev,
+            &hncocacb_all_c,
+            0.20,
+        );
+        for v in ca_intra {
+            dedup_push_f64(&mut draft.ca_curr, v, 0.10, MAX_JOINT_CANDS);
         }
 
-        // Intraresidue `CB(i)` by subtracting corroborated `cb_prev` from `HNCACB(-)`
-        let mut cb_curr_distinct = Vec::new();
-        for &(c, _) in &hncacb_neg {
-            if !draft.cb_prev.iter().any(|&p| (p - c).abs() <= 0.22) {
-                dedup_push_f64(&mut cb_curr_distinct, c, 0.12, MAX_JOINT_CB_CANDS);
-            }
-        }
-        if !cb_curr_distinct.is_empty() {
-            draft.cb_curr = cb_curr_distinct;
-        } else if !hncacb_neg.is_empty() {
-            for &(c, _) in hncacb_neg.iter().take(2) {
-                dedup_push_f64(&mut draft.cb_curr, c, 0.12, MAX_JOINT_CB_CANDS);
-            }
-        }
-        if draft.cb_prev.is_empty() && hncacb_neg.len() >= 2 {
-            for &(c, _) in hncacb_neg.iter().skip(1).take(2) {
-                dedup_push_f64(&mut draft.cb_prev, c, 0.14, MAX_JOINT_CB_CANDS);
-            }
+        let cb_intra = select_hncacb_intra_and_backfill_prev(
+            &hncacb_neg,
+            &mut draft.cb_prev,
+            &hncocacb_all_c,
+            0.24,
+        );
+        for v in cb_intra {
+            dedup_push_f64(&mut draft.cb_curr, v, 0.12, MAX_JOINT_CB_CANDS);
         }
     }
 
@@ -1840,8 +2248,6 @@ pub fn build_joint_idp_nodes(
     let clean_c13 = sanitize_c13_dataset(&dataset.c13_dataset);
     let mut con_systems = register_and_build_con_dipeptide_systems(&clean_c13);
 
-    // Supplement TMS-shifted `H(CC)CON`/`CBCACON` aliphatic peaks that might sit slightly below
-    // DSS 13.0 ppm (e.g. `Ile CG2 ~ 10.3 ppm` under `-2.7 ppm` TMS offset)
     for p in &clean_c13.strip_peaks {
         if let Some(r_idx) = p.anchor_root_idx {
             if r_idx < con_systems.len() {
@@ -1882,13 +2288,12 @@ pub fn build_joint_idp_nodes(
         }
     }
 
-    // Also keep raw `2D CACO` peaks available for intraresidue `c_curr` bridging on Prolines
     let has_c13_prev_cb = clean_c13
         .strip_peaks
         .iter()
         .any(|p| matches!(p.exp, C13DetectedExp::Cbcaco3D | C13DetectedExp::Cccon3D));
 
-    // 5. Register `(dC', dN)` carrier drift between `HNCO` and `2D CON`, then 1-to-1 optimal fusion
+    // 5. Noise-scaled Connected-Component Hungarian 1-to-1 `HN ↔ CON` Fusion (`P2-1`)
     let (sh_c, sh_n) = estimate_hnco_to_con_drift(&hn_drafts, &con_systems);
     if sh_c.abs() > 0.02 || sh_n.abs() > 0.08 {
         warnings.push(format!(
@@ -1896,8 +2301,48 @@ pub fn build_joint_idp_nodes(
         ));
     }
 
-    // Build all valid candidate `(hn_idx, con_idx, dist2)` pairs sorted by ascending distance
-    let mut pair_edges: Vec<(usize, usize, f64)> = Vec::new();
+    // Estimate empirical cross-spectrum `(C', N)` noise scatter via MAD of nearest-neighbor
+    // residuals so noisy spectra scale the Hungarian matching gate instead of fragmenting nodes!
+    let mut nn_res_c = Vec::new();
+    let mut nn_res_n = Vec::new();
+    for hd in &hn_drafts {
+        let Some(hc_raw) = hd.c_prev else {
+            continue;
+        };
+        let hc = hc_raw - sh_c;
+        let hn = hd.n - sh_n;
+        let mut best: Option<(f64, f64, f64)> = None;
+        for cs in &con_systems {
+            let dc = (hc - cs.c_prev).abs();
+            let dn = (hn - cs.n_curr).abs();
+            if dc <= 0.28 && dn <= 0.85 {
+                let d2 = (dc / 0.08).powi(2) + (dn / 0.28).powi(2);
+                if best.is_none_or(|b| d2 < b.0) {
+                    best = Some((d2, dc, dn));
+                }
+            }
+        }
+        if let Some((_, dc, dn)) = best {
+            nn_res_c.push(dc);
+            nn_res_n.push(dn);
+        }
+    }
+    let (sig_c_est, sig_n_est) = if nn_res_c.len() >= 8 {
+        nn_res_c.sort_by(|a, b| a.total_cmp(b));
+        nn_res_n.sort_by(|a, b| a.total_cmp(b));
+        let mad_c = nn_res_c[nn_res_c.len() / 2];
+        let mad_n = nn_res_n[nn_res_n.len() / 2];
+        (
+            (1.4826 * mad_c).clamp(0.025, 0.12),
+            (1.4826 * mad_n).clamp(0.08, 0.35),
+        )
+    } else {
+        (0.035, 0.12)
+    };
+    let gate_c = (3.4 * sig_c_est).clamp(0.10, 0.28);
+    let gate_n = (3.4 * sig_n_est).clamp(0.36, 0.85);
+
+    let mut bipartite_edges: Vec<(usize, usize, f64)> = Vec::new();
     for (hi, hd) in hn_drafts.iter().enumerate() {
         let Some(hc_raw) = hd.c_prev else {
             continue;
@@ -1907,36 +2352,39 @@ pub fn build_joint_idp_nodes(
         for (ci, cs) in con_systems.iter().enumerate() {
             let dc = (hc - cs.c_prev).abs();
             let dn = (hn - cs.n_curr).abs();
-            if dc <= 0.10 && dn <= 0.38 {
-                let d2 = (dc / 0.06).powi(2) + (dn / 0.24).powi(2);
-                if d2 <= 2.25 {
-                    pair_edges.push((hi, ci, d2));
-                }
+            let d2_gate = (dc / gate_c).powi(2) + (dn / gate_n).powi(2);
+            if d2_gate <= 1.0 {
+                // Cost scaled by empirical `(sig_c_est, sig_n_est)` for optimal 1-to-1 assignment
+                let cost = (dc / sig_c_est).powi(2) + (dn / sig_n_est).powi(2);
+                bipartite_edges.push((hi, ci, cost));
             }
         }
     }
-    pair_edges.sort_by(|a, b| {
-        a.2.total_cmp(&b.2)
-            .then_with(|| a.0.cmp(&b.0))
-            .then_with(|| a.1.cmp(&b.1))
-    });
+
+    let matched_pairs =
+        match_hn_con_bipartite_hungarian(hn_drafts.len(), con_systems.len(), &bipartite_edges);
 
     let mut hn_used = vec![false; hn_drafts.len()];
     let mut con_used = vec![false; con_systems.len()];
     let mut nodes: Vec<JointIdpNode> = Vec::with_capacity(hn_drafts.len() + con_systems.len());
     let mut con_idx_to_node: Vec<Option<usize>> = vec![None; con_systems.len()];
+    let mut sq_fus_c = 0.0f64;
+    let mut sq_fus_n = 0.0f64;
 
-    // (a) Fused `HN + CON` amide nodes
-    for (hi, ci, _) in pair_edges {
-        if hn_used[hi] || con_used[ci] {
-            continue;
-        }
+    // (a) Fused `HN + CON` amide nodes (exact 1-to-1 Hungarian matches)
+    for &(hi, ci, _) in &matched_pairs {
         hn_used[hi] = true;
         con_used[ci] = true;
         let hd = &hn_drafts[hi];
         let cs = &con_systems[ci];
 
-        // Shift `HN` carbons into `CON`'s `13C` frame if `sh_c` detected a TMS-vs-DSS offset
+        if let Some(hc_raw) = hd.c_prev {
+            let dc = (hc_raw - sh_c) - cs.c_prev;
+            let dn = (hd.n - sh_n) - cs.n_curr;
+            sq_fus_c += dc * dc;
+            sq_fus_n += dn * dn;
+        }
+
         let c_shift = if sh_c.abs() > 0.50 { sh_c } else { 0.0 };
         let hn_ca_curr: Vec<f64> = hd.ca_curr.iter().map(|&v| v - c_shift).collect();
         let hn_cb_curr: Vec<f64> = hd.cb_curr.iter().map(|&v| v - c_shift).collect();
@@ -1944,20 +2392,17 @@ pub fn build_joint_idp_nodes(
         let hn_cb_prev: Vec<f64> = hd.cb_prev.iter().map(|&v| v - c_shift).collect();
         let hn_c_curr: Vec<f64> = hd.c_curr.iter().map(|&v| v - sh_c).collect();
 
-        // Pool `HN` + `13C` channels, prioritizing cross-validated candidates!
         let ca_prev =
-            pool_corroborated_channels(&hn_ca_prev, &cs.ca_prev, 0.22, 0.10, MAX_JOINT_CANDS);
+            pool_corroborated_channels(&hn_ca_prev, &cs.ca_prev, 0.24, 0.10, MAX_JOINT_CANDS);
         let cb_prev =
-            pool_corroborated_channels(&hn_cb_prev, &cs.cb_prev, 0.28, 0.12, MAX_JOINT_CB_CANDS);
+            pool_corroborated_channels(&hn_cb_prev, &cs.cb_prev, 0.30, 0.12, MAX_JOINT_CB_CANDS);
         let mut ca_curr =
-            pool_corroborated_channels(&hn_ca_curr, &cs.ca_curr, 0.22, 0.10, MAX_JOINT_CANDS);
+            pool_corroborated_channels(&hn_ca_curr, &cs.ca_curr, 0.24, 0.10, MAX_JOINT_CANDS);
         let mut cb_curr =
-            pool_corroborated_channels(&hn_cb_curr, &cs.cb_curr, 0.28, 0.12, MAX_JOINT_CB_CANDS);
+            pool_corroborated_channels(&hn_cb_curr, &cs.cb_curr, 0.30, 0.12, MAX_JOINT_CB_CANDS);
         let c_curr =
-            pool_corroborated_channels(&hn_c_curr, &cs.c_curr, 0.12, 0.06, MAX_JOINT_CANDS);
+            pool_corroborated_channels(&hn_c_curr, &cs.c_curr, 0.14, 0.06, MAX_JOINT_CANDS);
 
-        // If `13C` `CBCACON`/`H(CC)CON` revealed `ca_prev`/`cb_prev` that wasn't in `HN`, re-prune
-        // `i-1` bleed-through from `ca_curr`/`cb_curr` when a distinct intraresidue peak exists
         if !cs.ca_prev.is_empty() && ca_curr.len() > 1 {
             let filt: Vec<f64> = ca_curr
                 .iter()
@@ -2009,6 +2454,24 @@ pub fn build_joint_idp_nodes(
         });
     }
 
+    let n_matched_fus = matched_pairs.len();
+    let fusion_rms_c_ppm = if n_matched_fus > 0 {
+        (sq_fus_c / (n_matched_fus as f64)).sqrt()
+    } else {
+        0.0
+    };
+    let fusion_rms_n_ppm = if n_matched_fus > 0 {
+        (sq_fus_n / (n_matched_fus as f64)).sqrt()
+    } else {
+        0.0
+    };
+    let n_hn_with_cprev = hn_drafts.iter().filter(|d| d.c_prev.is_some()).count();
+    let hn_unmatched_frac = if n_hn_with_cprev > 0 && !con_systems.is_empty() {
+        (n_hn_with_cprev.saturating_sub(n_matched_fus) as f64) / (n_hn_with_cprev as f64)
+    } else {
+        0.0
+    };
+
     // (b) Unmatched `HN` amide roots (`HN`-only or `CON`-dropped)
     let c_shift_unmatched = if sh_c.abs() > 0.50 { sh_c } else { 0.0 };
     for (hi, hd) in hn_drafts.iter().enumerate() {
@@ -2045,14 +2508,13 @@ pub fn build_joint_idp_nodes(
     }
 
     // (c) Unmatched `2D CON` roots -> provisionally `ProlineConBridge` vs `ConOnlyAmide`
-    //     (re-classified cleanly in DSS frame immediately after unlabelled `d_n` estimation!)
     for (ci, cs) in con_systems.iter().enumerate() {
         if con_used[ci] {
             continue;
         }
         let node_id = nodes.len();
         con_idx_to_node[ci] = Some(node_id);
-        let provisional_kind = if cs.n_curr >= PROLINE_N_DSS_MIN_PPM {
+        let provisional_kind = if cs.n_curr >= PROLINE_N15_MIN_PPM {
             JointNodeKind::ProlineConBridge
         } else {
             JointNodeKind::ConOnlyAmide
@@ -2100,8 +2562,8 @@ pub fn build_joint_idp_nodes(
             let Some(cp) = node.c_prev else {
                 continue;
             };
-            let d2 = ((edge.c_prev_ppm - cp) / 0.09).powi(2)
-                + ((edge.n_curr_ppm - node.n_curr) / 0.35).powi(2);
+            let d2 = ((edge.c_prev_ppm - cp) / 0.14).powi(2)
+                + ((edge.n_curr_ppm - node.n_curr) / 0.48).powi(2);
             if d2 <= 1.0 && best_node.is_none_or(|b| d2 < b.1) {
                 best_node = Some((s_idx, d2));
             }
@@ -2124,7 +2586,8 @@ pub fn build_joint_idp_nodes(
         node.nn_prev_cands.truncate(4);
     }
 
-    // 7. Field-scaled TROSY `±46 Hz / MHz` calibration & reciprocal `BT_HNCACONH` `N–N` edges
+    // 7. Field-scaled TROSY `46 Hz (1/2 1J_NH)` calibration & reciprocal `BT_HNCACONH` `N–N` edges
+    //    Retains partner-checked near-diagonal `0.0..=0.35 ppm` links with smooth down-weight (`P2-2`)!
     let amide_hn_roots: Vec<(usize, f64, f64)> = nodes
         .iter()
         .filter_map(|n| Some((n.id, n.h_curr?, n.hn_n_curr.unwrap_or(n.n_curr))))
@@ -2142,7 +2605,6 @@ pub fn build_joint_idp_nodes(
         })
         .collect();
 
-    // Deduplicate `(h, n_curr)` roots in `BT_HNCACONH` before TROSY calibration
     let mut trosy_unique_roots: Vec<(f64, f64)> = Vec::new();
     for p in &clean_hncaconh {
         if !trosy_unique_roots
@@ -2156,15 +2618,14 @@ pub fn build_joint_idp_nodes(
     let trosy_calibration = if cfg.auto_trosy_calibration && !trosy_unique_roots.is_empty() {
         calibrate_trosy_hn_offset(&trosy_unique_roots, &decoupled_pairs, proton_mhz)
     } else {
+        let (eh, en) = trosy_expected_shift_ppm(proton_mhz);
         TrosyOffsetCalibration {
-            expected_half_j_h_ppm: TROSY_HALF_J_HN_HZ / proton_mhz,
-            expected_half_j_n_ppm: TROSY_HALF_J_HN_HZ / n15_obs_mhz(proton_mhz),
+            expected_half_j_h_ppm: eh.abs(),
+            expected_half_j_n_ppm: en.abs(),
             ..TrosyOffsetCalibration::default()
         }
     };
 
-    // Detect whether `n_partner_ppm` in `BT_HNCACONH` also carries `dn_ppm` (TROSY indirect N)
-    // or is already decoupled (`0.0`).
     let partner_dn = if trosy_calibration.trosy_detected {
         let count_partner_hits = |shift_n: f64| -> usize {
             clean_hncaconh
@@ -2172,7 +2633,7 @@ pub fn build_joint_idp_nodes(
                 .filter(|p| {
                     amide_hn_roots
                         .iter()
-                        .any(|&(_, _, rn)| ((p.n_partner_ppm - shift_n) - rn).abs() <= 0.28)
+                        .any(|&(_, _, rn)| ((p.n_partner_ppm - shift_n) - rn).abs() <= 0.30)
                 })
                 .count()
         };
@@ -2187,52 +2648,69 @@ pub fn build_joint_idp_nodes(
         0.0
     };
 
-    // Extract directed `(node_s -> partner_n)` observations from aligned `BT_HNCACONH`, then keep
-    // reciprocal pairs `(s <-> t)`!
+    // Extract directed `(node_s, partner_n, diag_weight)` observations without hard-excluding
+    // near-diagonal Ser-Ser / Gln-Gln `0.0..=0.35 ppm` links (`P2-2`)!
     let mut directed_hncaconh: Vec<(usize, f64, f64)> = Vec::new();
     for p in &clean_hncaconh {
         let h_corr = p.h_ppm - trosy_calibration.dh_ppm;
         let n_corr = p.n_curr_ppm - trosy_calibration.dn_ppm;
         let n_part = p.n_partner_ppm - partner_dn;
-        if (n_part - n_corr).abs() <= 0.30 {
-            continue; // diagonal self-peak
-        }
+
         let mut best_root: Option<(usize, f64)> = None;
         for &(nid, rh, rn) in &amide_hn_roots {
-            let d2 = ((h_corr - rh) / 0.036).powi(2) + ((n_corr - rn) / 0.36).powi(2);
+            let d2 = ((h_corr - rh) / 0.05).powi(2) + ((n_corr - rn) / 0.45).powi(2);
             if d2 <= 1.0 && best_root.is_none_or(|b| d2 < b.1) {
                 best_root = Some((nid, d2));
             }
         }
-        if let Some((nid, _)) = best_root {
-            directed_hncaconh.push((nid, n_part, p.height.abs().max(1.0)));
-        }
+        let Some((nid, _)) = best_root else {
+            continue;
+        };
+
+        let dn_diag = (n_part - n_corr).abs();
+        // Smooth diagonal down-weighting for near-diagonal `0.0..=0.35 ppm` links (`P2-2`),
+        // gated strictly on matching a DISTINCT amide root `t != nid` below!
+        let w_diag = if dn_diag < 0.35 {
+            0.45 + 0.55 * (dn_diag / 0.35).clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
+        directed_hncaconh.push((nid, n_part, w_diag));
     }
 
-    let mut recip_edge_set: BTreeSet<(usize, usize)> = BTreeSet::new();
-    for &(s_idx, n_part_s, _) in &directed_hncaconh {
+    let mut recip_edge_weights: BTreeMap<(usize, usize), f64> = BTreeMap::new();
+    for &(s_idx, n_part_s, ws) in &directed_hncaconh {
         let ns_hn = nodes[s_idx].hn_n_curr.unwrap_or(nodes[s_idx].n_curr);
-        for &(t_idx, n_part_t, _) in &directed_hncaconh {
+        for &(t_idx, n_part_t, wt) in &directed_hncaconh {
             if s_idx == t_idx {
                 continue;
             }
             let nt_hn = nodes[t_idx].hn_n_curr.unwrap_or(nodes[t_idx].n_curr);
-            if (n_part_s - nt_hn).abs() <= 0.30 && (n_part_t - ns_hn).abs() <= 0.30 {
+            if (n_part_s - nt_hn).abs() <= 0.32 && (n_part_t - ns_hn).abs() <= 0.32 {
                 let (a, b) = if s_idx < t_idx {
                     (s_idx, t_idx)
                 } else {
                     (t_idx, s_idx)
                 };
-                recip_edge_set.insert((a, b));
+                let w = ws.min(wt);
+                let entry = recip_edge_weights.entry((a, b)).or_insert(0.0);
+                if w > *entry {
+                    *entry = w;
+                }
             }
         }
     }
 
-    // Also integrate any pre-extracted reciprocal `(N_a, N_b)` pairs supplied in `dataset`
     for &(na, nb) in &dataset.reciprocal_nn_pairs {
-        if !(na.is_finite() && nb.is_finite()) || (na - nb).abs() <= 0.25 {
+        if !(na.is_finite() && nb.is_finite()) {
             continue;
         }
+        let dn_diag = (na - nb).abs();
+        let w_diag = if dn_diag < 0.35 {
+            0.45 + 0.55 * (dn_diag / 0.35).clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
         let matching_a: Vec<usize> = nodes
             .iter()
             .filter(|n| (n.n_curr - na).abs() <= 0.25)
@@ -2248,20 +2726,23 @@ pub fn build_joint_idp_nodes(
                 for &sb in &matching_b {
                     if sa != sb {
                         let (a, b) = if sa < sb { (sa, sb) } else { (sb, sa) };
-                        recip_edge_set.insert((a, b));
+                        let entry = recip_edge_weights.entry((a, b)).or_insert(0.0);
+                        if w_diag > *entry {
+                            *entry = w_diag;
+                        }
                     }
                 }
             }
         }
     }
 
-    for &(a, b) in &recip_edge_set {
-        nodes[a].recip_nn_partners.push((b, 1.0));
-        nodes[b].recip_nn_partners.push((a, 1.0));
+    for (&(a, b), &w) in &recip_edge_weights {
+        nodes[a].recip_nn_partners.push((b, w));
+        nodes[b].recip_nn_partners.push((a, w));
     }
-    let n_reciprocal_nn_edges = recip_edge_set.len();
+    let n_reciprocal_nn_edges = recip_edge_weights.len();
 
-    // 8. Unlabelled global reference offset estimation (DSS/TMS)
+    // 8. Unlabelled global reference offset estimation (DSS/TMS, shared with `idp_solver`)
     let (fitted_offsets, auto_ref_report) = if cfg.auto_reference_offset {
         estimate_joint_reference_offsets(&nodes, sequence, cfg)
     } else {
@@ -2272,11 +2753,11 @@ pub fn build_joint_idp_nodes(
         warnings.push(tms.clone());
     }
 
-    // 9. Finalize `ProlineConBridge` vs `ConOnlyAmide` classification in DSS frame (`n_curr - d_n`)
+    // 9. Finalize `ProlineConBridge` vs `ConOnlyAmide` classification in DSS frame (`131.5..=144.5 ppm`)
     for node in &mut nodes {
         if !node.hn_matched && node.con_matched {
             let n_dss = node.n_curr - fitted_offsets.d_n;
-            node.kind = if (PROLINE_N_DSS_MIN_PPM..=PROLINE_N_DSS_MAX_PPM).contains(&n_dss) {
+            node.kind = if (PROLINE_N15_MIN_PPM..=PROLINE_N15_MAX_PPM).contains(&n_dss) {
                 JointNodeKind::ProlineConBridge
             } else {
                 JointNodeKind::ConOnlyAmide
@@ -2329,6 +2810,9 @@ pub fn build_joint_idp_nodes(
         trosy_calibration,
         polarity_report,
         hnco_to_con_drift_ppm: (sh_c, sh_n),
+        fusion_rms_c_ppm,
+        fusion_rms_n_ppm,
+        hn_unmatched_frac,
         n_fused_hn_con,
         n_hn_only,
         n_proline_bridges,
@@ -2411,16 +2895,6 @@ pub fn try_joint_idp_unary_matrix(
 }
 
 /// Compute unified joint IDP unary scoring matrix `U` `(S x L)`.
-///
-/// Key physical rules:
-/// - `k == 0` is `FORBID` (no preceding peptide bond `C'_{-1}`).
-/// - `AmideFused` nodes carry `1H^N`, so `seq[k] == "PRO"` is `FORBID`.
-/// - `ProlineConBridge` nodes lack `1H^N` and reside in the `Pro` imino `15N` window (`131.5–144.5 ppm` DSS),
-///   actively occupying `PRO` slots (`seq[k] == "PRO"`) and forbidden on non-`PRO` slots when `n_dss >= 132.5`.
-/// - `ConOnlyAmide` nodes recover exchange-broadened non-`PRO` residues (`seq[k] != "PRO"`).
-/// - Incorporates Platzer C-terminal `COO-` (`~179 ppm` DSS) scoring at `k == L - 1`, pre-Proline
-///   `C' -1.9 / CA -1.8` shifts via `predict_joint_ncidp_shifts`, `Gly CB` bleed-through softness,
-///   and overlap/breakthrough-calibrated `CAS` (`cacon`/`canco`) LLRs.
 pub fn joint_idp_unary_matrix(
     nodes: &[JointIdpNode],
     sequence: &[String],
@@ -2460,26 +2934,21 @@ pub fn joint_idp_unary_matrix(
         let n_dss = node.n_curr - dn;
         let has_3d = node.has_3d_support();
 
-        // Base assignment log-odds prior:
-        // - Cross-validated `HN + CON` or 3D-corroborated nodes get strong positive prior.
-        // - `ProlineConBridge` is a genuine `2D CON` tertiary imino peak (cannot have `1H` 3Ds!)
-        //   so even a 2D-only `ProlineConBridge` receives a positive assignment prior!
-        // - Isolated 2D-only non-Proline noise roots in multi-3D datasets receive a negative prior.
         let sys_assign_bonus = match node.kind {
             JointNodeKind::ProlineConBridge => {
                 if has_3d {
                     2.85
                 } else {
-                    1.95
+                    1.45
                 }
             }
             JointNodeKind::AmideFused => {
                 if node.con_matched && has_3d {
                     3.05
                 } else if has_3d || node.con_matched {
-                    2.55
+                    2.45
                 } else if multi_3d_dataset {
-                    -5.8
+                    -6.0
                 } else {
                     0.5
                 }
@@ -2488,7 +2957,7 @@ pub fn joint_idp_unary_matrix(
                 if has_3d {
                     2.65
                 } else if multi_3d_dataset {
-                    -5.8
+                    -6.2
                 } else {
                     0.5
                 }
@@ -2505,21 +2974,20 @@ pub fn joint_idp_unary_matrix(
             let cur_aa = seq[k].as_str();
             let is_pro = cur_aa == "PRO";
 
-            // Physical amide/imino Proline exclusivity gates
             match node.kind {
                 JointNodeKind::AmideFused => {
                     if is_pro {
-                        continue; // `FORBID` — Proline has no amide `1H^N`!
+                        continue;
                     }
                 }
                 JointNodeKind::ProlineConBridge => {
                     if !is_pro && n_dss >= 132.5 {
-                        continue; // `FORBID` — tertiary imino `>= 132.5 ppm` cannot be non-Proline
+                        continue;
                     }
                 }
                 JointNodeKind::ConOnlyAmide => {
                     if is_pro && n_dss < 131.0 {
-                        continue; // `FORBID` — `< 131.0 ppm` cannot be Proline imino
+                        continue;
                     }
                 }
             }
@@ -2565,7 +3033,7 @@ pub fn joint_idp_unary_matrix(
                 llr_floor,
             );
 
-            // 3. `CB(k-1)` and `Gly(k-1)` signatures (with `Gly CB` guard awareness)
+            // 3. `CB(k-1)` and `Gly(k-1)` signatures
             if let Some(mu_cb_prev) = prv_p.cb_ppm {
                 if !node.cb_prev.is_empty() {
                     total += best_cand_llr(
@@ -2583,7 +3051,6 @@ pub fn joint_idp_unary_matrix(
                     total -= 4.50;
                 }
             } else {
-                // `seq[k - 1] == GLY`
                 if !node.cb_prev.is_empty() {
                     let ca_in_gly_band = node.ca_prev.first().is_some_and(|&ca| {
                         let ca_dss = ca - dca;
@@ -2598,7 +3065,7 @@ pub fn joint_idp_unary_matrix(
                 }
             }
 
-            // 4. `CB(k)` and `Gly(k)` signatures (with `Gly CB` guard awareness)
+            // 4. `CB(k)` and `Gly(k)` signatures
             if let Some(mu_cb_cur) = cur_p.cb_ppm {
                 if !node.cb_curr.is_empty() {
                     total += best_cand_llr(
@@ -2612,17 +3079,14 @@ pub fn joint_idp_unary_matrix(
                 } else if node.has_curr_cb_exp && !node.gly_cb_curr_suppressed {
                     total -= 1.35;
                 }
-            } else {
-                // `seq[k] == GLY`
-                if !node.cb_curr.is_empty() {
-                    let ca_in_gly_band = node.ca_curr.first().is_some_and(|&ca| {
-                        let ca_dss = ca - dca;
-                        (GLY_CA_DSS_MIN_PPM..=GLY_CA_DSS_MAX_PPM).contains(&ca_dss)
-                    });
-                    total -= if ca_in_gly_band { 1.60 } else { 4.20 };
-                } else if node.has_curr_cb_exp && !node.ca_curr.is_empty() {
-                    total += 2.15;
-                }
+            } else if !node.cb_curr.is_empty() {
+                let ca_in_gly_band = node.ca_curr.first().is_some_and(|&ca| {
+                    let ca_dss = ca - dca;
+                    (GLY_CA_DSS_MIN_PPM..=GLY_CA_DSS_MAX_PPM).contains(&ca_dss)
+                });
+                total -= if ca_in_gly_band { 1.60 } else { 4.20 };
+            } else if node.has_curr_cb_exp && !node.ca_curr.is_empty() {
+                total += 2.15;
             }
 
             // 5. Intraresidue `C'(k)` (`HN(CA)CO` / `NCACO` / `CACO`) + Platzer C-term `COO-` prior
@@ -2639,7 +3103,6 @@ pub fn joint_idp_unary_matrix(
                 if cfg.enable_cterm_coo_prior {
                     let is_c_term = k + 1 == k_len;
                     if is_c_term && has_cterm_coo_peak {
-                        // Strong positive Platzer C-terminal `COO-` (~179 ppm DSS) anchor bonus
                         let best_coo_z = node
                             .c_curr
                             .iter()
@@ -2649,7 +3112,6 @@ pub fn joint_idp_unary_matrix(
                             total += 2.40 * (-0.25 * best_coo_z * best_coo_z).exp();
                         }
                     } else if !is_c_term && has_cterm_coo_peak {
-                        // Penalize placing a `>= 178.4 ppm` DSS `COO-` carbonyl at an internal site
                         let extreme_coo = node.c_curr.iter().all(|&c| (c - dc) >= 178.4);
                         if extreme_coo {
                             total -= 2.20;
@@ -2694,7 +3156,6 @@ pub fn joint_idp_unary_matrix(
         }
     }
 
-    // Apply optional user hard locks (`user_locks`) if valid and physically allowed
     for &(s_lock, k_lock) in user_locks {
         if s_lock < s_len && k_lock >= 1 && k_lock < k_len && u.get(s_lock, k_lock) > FORBID * 0.5 {
             for k in 0..k_len {
@@ -2761,12 +3222,12 @@ pub fn try_joint_idp_pair_matrix(
 }
 
 /// Compute unified pairwise sequential transition matrix `P(s -> t)` `(S x S)` combining:
-/// 1. **`ΔC'` across ALL residues including Prolines** (`s.c_curr` from `HN(CA)CO`/`NCACO`/`CACO`
-///    matching `t.c_prev` root from `2D CON`/`HNCO`),
+/// 1. **`ΔC'` across ALL residues including Prolines** (`s.c_curr` matching `t.c_prev`),
 /// 2. **`ΔCA` and `ΔCB`** (`s.ca_curr <-> t.ca_prev`, `s.cb_curr <-> t.cb_prev`),
-/// 3. **Directional `(H)N(CA)CON` `N–N` edges** (`t.nn_prev_cands` matching `s.n_curr`, active
-///    both into and out of Prolines!),
-/// 4. **Reciprocal `BT_HNCACONH` `N–N` edges** (after field-scaled TROSY `±46 Hz / MHz` calibration),
+/// 3. **Directional `(H)N(CA)CON` `N–N` edges** (`t.nn_prev_cands` matching `s.n_curr`, including
+///    near-diagonal `0.0..=0.35 ppm` links with smooth down-weight),
+/// 4. **Symmetric reciprocal `BT_HNCACONH` `N–N` edges** (post-TROSY calibration, `s <-> t`
+///    symmetric bonus disambiguated directionally by `ΔC'`, `ΔCA`, `ΔCB`, and `(H)N(CA)CON`),
 /// 5. **Smooth bidirectional candidate-multiplicity ambiguity damping** (`w_mult`).
 pub fn joint_idp_pair_matrix(nodes: &[JointIdpNode], cfg: &JointIdpConfig) -> Matrix2D {
     let s_len = nodes.len();
@@ -2793,24 +3254,29 @@ pub fn joint_idp_pair_matrix(nodes: &[JointIdpNode], cfg: &JointIdpConfig) -> Ma
             }
             let nt = &nodes[t];
 
-            // 1. `ΔCA` and `ΔCB` sequential channels
             let sc_ca = channel_pair_llr(&ns.ca_curr, &nt.ca_prev, sig_ca, 28.0, p_floor);
             let sc_cb = channel_pair_llr(&ns.cb_curr, &nt.cb_prev, sig_cb, 56.0, p_floor);
-
-            // 2. `ΔC'` sequential channel (bridges directly across Prolines!)
             let sc_c = if let Some(c_prev_t) = nt.c_prev {
                 channel_pair_llr(&ns.c_curr, &[c_prev_t], sig_c, 13.0, p_floor)
             } else {
                 0.0
             };
 
-            // 3. Directional `(H)N(CA)CON` sequential `N(i-1)` channel (works across Prolines too!)
+            // Directional `(H)N(CA)CON` sequential `N(i-1)` channel (including smooth near-diagonal
+            // `0.0..=0.35 ppm` down-weighting consistent with `idp_solver.rs` v0.17.3 R2).
             let sc_nn_dir = if !nt.nn_prev_cands.is_empty() {
                 let mut best_nn: Option<f64> = None;
                 for &(cand_n, snr) in &nt.nn_prev_cands {
                     let dn = (cand_n - ns.n_curr).abs();
-                    if dn < 0.28 {
-                        let bonus = 2.1 + (snr.clamp(3.0, 12.0) / 4.0) * (1.0 - dn / 0.36);
+                    if dn < 0.30 {
+                        let sep_diag = (cand_n - nt.n_curr).abs();
+                        let diag_w = if sep_diag < 0.35 {
+                            0.45 + 0.55 * (sep_diag / 0.35).clamp(0.0, 1.0)
+                        } else {
+                            1.0
+                        };
+                        let bonus =
+                            diag_w * (2.1 + (snr.clamp(3.0, 12.0) / 4.0) * (1.0 - dn / 0.38));
                         if best_nn.is_none_or(|b| bonus > b) {
                             best_nn = Some(bonus);
                         }
@@ -2821,12 +3287,12 @@ pub fn joint_idp_pair_matrix(nodes: &[JointIdpNode], cfg: &JointIdpConfig) -> Ma
                 0.0
             };
 
-            // 4. Reciprocal `BT_HNCACONH` `N–N` adjacency edge (post-TROSY calibration)
+            // Symmetric reciprocal `BT_HNCACONH` `N–N` adjacency bonus (`P(s,t)` and `P(t,s)`)
             let sc_nn_recip = ns
                 .recip_nn_partners
                 .iter()
                 .find(|&&(partner, _)| partner == t)
-                .map(|&(_, w)| 2.10 * w.clamp(0.5, 1.5))
+                .map(|&(_, w)| 2.10 * w.clamp(0.35, 1.5))
                 .unwrap_or(0.0);
 
             let total = sc_ca + sc_cb + sc_c + sc_nn_dir + sc_nn_recip;
@@ -2959,7 +3425,6 @@ fn delta_single_move(
     }
     let t_i = at[k_new];
     if t_i >= 0 && k_old_i >= 0 {
-        // Swap `s` at `k_old` and `t` at `k_new`
         let k_old = k_old_i as usize;
         let t = t_i as usize;
         if u_mat.get(t, k_old) <= FORBID * 0.5 || u_mat.get(s, k_new) <= FORBID * 0.5 {
@@ -3007,7 +3472,6 @@ fn delta_single_move(
         }
         du + (new_p - old_p)
     } else if t_i < 0 && k_old_i >= 0 {
-        // Move `s` from `k_old` to empty `k_new`
         let k_old = k_old_i as usize;
         if u_mat.get(s, k_new) <= FORBID * 0.5 {
             return FORBID;
@@ -3029,7 +3493,6 @@ fn delta_single_move(
         }
         du + (new_p - old_p)
     } else if t_i >= 0 && k_old_i < 0 {
-        // Replace `t` at `k_new` with unassigned `s` (`t` becomes unassigned)
         let t = t_i as usize;
         if u_mat.get(s, k_new) <= FORBID * 0.5 {
             return FORBID;
@@ -3047,7 +3510,6 @@ fn delta_single_move(
         }
         du + (new_p - old_p)
     } else {
-        // Insert unassigned `s` into empty `k_new`
         if u_mat.get(s, k_new) <= FORBID * 0.5 {
             return FORBID;
         }
@@ -3091,7 +3553,52 @@ fn delta_unassign(s: usize, at: &[i32], pos: &[i32], u_mat: &Matrix2D, p_mat: &M
     -loss
 }
 
-/// Deterministic greedy single-move + 2-swap + block-shift local polish respecting locked anchors.
+/// Evaluate exact local objective contribution of two disjoint blocks `[k1..k1+blen]` and
+/// `[k2..k2+blen]` (including flanking sequential links).
+fn eval_two_blocks_local(
+    at: &[i32],
+    u_mat: &Matrix2D,
+    p_mat: &Matrix2D,
+    k1: usize,
+    k2: usize,
+    blen: usize,
+) -> f64 {
+    let k_len = at.len();
+    let (lo, hi) = if k1 < k2 { (k1, k2) } else { (k2, k1) };
+    let mut sc = 0.0;
+    if lo > 0 {
+        sc += pair_score_opt(at[lo - 1], at[lo], p_mat);
+    }
+    for o in 0..blen {
+        let s = at[lo + o];
+        if s >= 0 {
+            sc += u_mat.get(s as usize, lo + o);
+        }
+        if o + 1 < blen {
+            sc += pair_score_opt(at[lo + o], at[lo + o + 1], p_mat);
+        }
+    }
+    if lo + blen == hi {
+        sc += pair_score_opt(at[lo + blen - 1], at[hi], p_mat);
+    } else {
+        sc += pair_score_opt(at[lo + blen - 1], at[lo + blen], p_mat);
+        sc += pair_score_opt(at[hi - 1], at[hi], p_mat);
+    }
+    for o in 0..blen {
+        let s = at[hi + o];
+        if s >= 0 {
+            sc += u_mat.get(s as usize, hi + o);
+        }
+        if o + 1 < blen {
+            sc += pair_score_opt(at[hi + o], at[hi + o + 1], p_mat);
+        }
+    }
+    if hi + blen < k_len {
+        sc += pair_score_opt(at[hi + blen - 1], at[hi + blen], p_mat);
+    }
+    sc
+}
+
 fn polish_joint_state(
     state: &mut JointReplicaState,
     u_mat: &Matrix2D,
@@ -3138,7 +3645,6 @@ fn polish_joint_state(
                 }
             }
         }
-        // Try contiguous 2..=4 residue block swaps between non-overlapping unlocked blocks
         for blen in 2..=4 {
             if k_len <= blen + 1 {
                 continue;
@@ -3157,7 +3663,6 @@ fn polish_joint_state(
                     if (k2..k2 + blen).any(|k| locked_slot[k]) {
                         continue;
                     }
-                    // Check unary feasibility for both directions
                     let ok = (0..blen).all(|o| {
                         let a = state.at[k1 + o];
                         let b = state.at[k2 + o];
@@ -3167,12 +3672,15 @@ fn polish_joint_state(
                     if !ok {
                         continue;
                     }
-                    let mut tmp_at = state.at.clone();
+                    let before = eval_two_blocks_local(&state.at, u_mat, p_mat, k1, k2, blen);
                     for o in 0..blen {
-                        tmp_at.swap(k1 + o, k2 + o);
+                        state.at.swap(k1 + o, k2 + o);
                     }
-                    let sc = evaluate_joint_score(&tmp_at, u_mat, p_mat);
-                    let gain = sc - state.score;
+                    let after = eval_two_blocks_local(&state.at, u_mat, p_mat, k1, k2, blen);
+                    for o in 0..blen {
+                        state.at.swap(k1 + o, k2 + o);
+                    }
+                    let gain = after - before;
                     if gain > best_gain {
                         best_gain = gain;
                         best_k2 = Some(k2);
@@ -3267,7 +3775,6 @@ fn crossover_joint_states(
         }
     }
 
-    // Preserve consensus placements first
     for (k, slot) in at.iter_mut().enumerate().take(k_len).skip(1) {
         if *slot < 0 && parent_a.at[k] >= 0 && parent_a.at[k] == parent_b.at[k] {
             let s = parent_a.at[k] as usize;
@@ -3278,7 +3785,6 @@ fn crossover_joint_states(
         }
     }
 
-    // Randomly inherit contiguous segments from A or B
     let cut = if k_len > 3 {
         rng.range_usize(1, k_len - 1)
     } else {
@@ -3348,7 +3854,6 @@ fn run_sa_replica(
         let phase = rng.usize(16);
 
         if phase < 9 {
-            // Single-node move / swap / insert
             let s = unlocked_nodes[rng.usize(unlocked_nodes.len())];
             let slots = &valid_slots[s];
             let k_new = slots[rng.usize(slots.len())];
@@ -3362,7 +3867,6 @@ fn run_sa_replica(
                 state.score += d;
             }
         } else if phase == 9 {
-            // Occasional unassign move to evict spurious noise peaks
             let s = unlocked_nodes[rng.usize(unlocked_nodes.len())];
             if state.pos[s] >= 0 {
                 let d = delta_unassign(s, &state.at, &state.pos, u_mat, p_mat);
@@ -3374,7 +3878,6 @@ fn run_sa_replica(
                 }
             }
         } else if phase < 14 {
-            // Sequential bridge-guided neighbor extension (`s -> t` or `t -> s`, including across Prolines!)
             let s = unlocked_nodes[rng.usize(unlocked_nodes.len())];
             let ks_i = state.pos[s];
             if ks_i < 0 {
@@ -3406,7 +3909,6 @@ fn run_sa_replica(
                 }
             }
         } else if k_len >= 6 {
-            // Contiguous `2..=5`-residue block swap (translates solved stretches intact!)
             let blen = rng.range_usize(2, 6.min(k_len / 2 + 1));
             if k_len <= 2 * blen + 1 {
                 continue;
@@ -3428,33 +3930,11 @@ fn run_sa_replica(
             if !feasible {
                 continue;
             }
-            // Local exact delta around the two disjoint blocks
-            let eval_block_env = |at_cur: &[i32]| -> f64 {
-                let mut sc = 0.0;
-                for &kb in &[k1, k2] {
-                    if kb > 0 {
-                        sc += pair_score_opt(at_cur[kb - 1], at_cur[kb], p_mat);
-                    }
-                    for o in 0..blen {
-                        let s = at_cur[kb + o];
-                        if s >= 0 {
-                            sc += u_mat.get(s as usize, kb + o);
-                        }
-                        if o + 1 < blen {
-                            sc += pair_score_opt(at_cur[kb + o], at_cur[kb + o + 1], p_mat);
-                        }
-                    }
-                    if kb + blen < k_len {
-                        sc += pair_score_opt(at_cur[kb + blen - 1], at_cur[kb + blen], p_mat);
-                    }
-                }
-                sc
-            };
-            let before = eval_block_env(&state.at);
+            let before = eval_two_blocks_local(&state.at, u_mat, p_mat, k1, k2, blen);
             for o in 0..blen {
                 state.at.swap(k1 + o, k2 + o);
             }
-            let after = eval_block_env(&state.at);
+            let after = eval_two_blocks_local(&state.at, u_mat, p_mat, k1, k2, blen);
             let d = after - before;
             if d >= 0.0 || rng.f64() < (d / temp).exp() {
                 for o in 0..blen {
@@ -3518,7 +3998,6 @@ fn run_island_ensemble(
     let scale_n = s_len.max(k_len).max(1);
     let steps_per_gen = (cfg.steps_per_system.max(200) * scale_n) / n_gens;
 
-    // Initial seeded replicas
     let mut replicas: Vec<JointReplicaState> = (0..n_replicas)
         .map(|r| {
             let mut rng = Rng::new(
@@ -3625,7 +4104,6 @@ fn run_island_ensemble(
         replicas = next_replicas;
         elite_pool.extend(replicas.iter().cloned());
 
-        // Island evolutionary crossover for next generation
         if gen + 1 < n_gens {
             let island_size = n_replicas.div_ceil(n_islands);
             let mut evolved = Vec::with_capacity(n_replicas);
@@ -3676,26 +4154,148 @@ fn run_island_ensemble(
     (best, replicas)
 }
 
-/// Compute per-node ensemble consensus frequency `p_ens` and local Boltzmann specificity `p_local`
-/// around the best solution.
-fn compute_posteriors(
+// ============================================================================
+// Honest Adaptive-Temperature Posterior & Unlabelled QC Calibration (`P1-1`, `P1-2`)
+// ============================================================================
+
+#[derive(Clone, Debug, Default)]
+struct PosteriorDiagnostics {
+    p_ens: Vec<f64>,
+    p_local: Vec<f64>,
+    raw_post: Vec<f64>,
+    emp_rms_seq_ca: f64,
+    emp_rms_seq_c: f64,
+    mean_cands_per_ch: f64,
+    ambig_placement_frac: f64,
+    mean_ens_agreement: f64,
+    connectivity_frac: f64,
+    support_3d_frac: f64,
+    node_ratio: f64,
+}
+
+/// Compute honest per-node ensemble consensus `p_ens`, full local-swap + multi-way cycle +
+/// `2..=4`-residue motif-swap Boltzmann specificity `p_local` with adaptive `tau_local`, and
+/// unlabelled data-quality diagnostics (`180.core:P1-1`).
+///
+/// Strictly NO Pass-2 lock floor: locked and unlocked placements are evaluated identically
+/// against the full competitor landscape.
+#[allow(clippy::too_many_arguments)]
+fn compute_posteriors_honest(
     best: &JointReplicaState,
     replicas: &[JointReplicaState],
+    nodes: &[JointIdpNode],
+    seq: &[String],
     u_mat: &Matrix2D,
     p_mat: &Matrix2D,
-    locked_slot: &[bool],
-) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
+    fusion_rms_c_ppm: f64,
+    fusion_rms_n_ppm: f64,
+    hn_unmatched_frac: f64,
+) -> PosteriorDiagnostics {
     let s_len = u_mat.rows;
     let k_len = u_mat.cols;
-    let mut p_ens = vec![0.0f64; s_len];
-    let mut p_local = vec![0.0f64; s_len];
-    let mut raw_post = vec![0.0f64; s_len];
-
+    let mut diag = PosteriorDiagnostics {
+        p_ens: vec![0.0; s_len],
+        p_local: vec![0.0; s_len],
+        raw_post: vec![0.0; s_len],
+        ..PosteriorDiagnostics::default()
+    };
     if s_len == 0 || k_len < 2 || replicas.is_empty() {
-        return (p_ens, p_local, raw_post);
+        return diag;
     }
 
-    // Boltzmann-weighted replica consensus (`tau_ens = 6.5`)
+    let n_assignable = k_len.saturating_sub(1).max(1);
+    diag.node_ratio = (s_len as f64) / (n_assignable as f64);
+
+    // 1. Empirical unlabelled matching-noise & multiplicity diagnostics
+    let mut ch_cand_sum = 0usize;
+    let mut ch_nonempty = 0usize;
+    let mut n_with_3d = 0usize;
+    for nd in nodes {
+        if nd.has_3d_support() {
+            n_with_3d += 1;
+        }
+        for ch in [
+            &nd.ca_curr,
+            &nd.ca_prev,
+            &nd.cb_prev,
+            &nd.cb_curr,
+            &nd.c_curr,
+        ] {
+            if !ch.is_empty() {
+                ch_nonempty += 1;
+                ch_cand_sum += ch.len().min(MAX_JOINT_CANDS);
+            }
+        }
+    }
+    diag.support_3d_frac = (n_with_3d as f64) / (s_len as f64);
+    diag.mean_cands_per_ch = if ch_nonempty > 0 {
+        (ch_cand_sum as f64) / (ch_nonempty as f64)
+    } else {
+        1.0
+    };
+
+    let mut sq_ca_diffs = Vec::new();
+    let mut sq_c_diffs = Vec::new();
+    let mut n_assigned = 0usize;
+    let mut n_connected = 0usize;
+    for k in 1..k_len {
+        let sa_i = best.at[k];
+        if sa_i < 0 {
+            continue;
+        }
+        n_assigned += 1;
+        let sa = sa_i as usize;
+        let prev_ok = k > 1 && best.at[k - 1] >= 0 && p_mat.get(best.at[k - 1] as usize, sa) >= 1.0;
+        let next_ok =
+            k + 1 < k_len && best.at[k + 1] >= 0 && p_mat.get(sa, best.at[k + 1] as usize) >= 1.0;
+        if prev_ok || next_ok {
+            n_connected += 1;
+        }
+        if k + 1 < k_len && best.at[k + 1] >= 0 {
+            let sb = best.at[k + 1] as usize;
+            let na = &nodes[sa];
+            let nb = &nodes[sb];
+            if !na.ca_curr.is_empty() && !nb.ca_prev.is_empty() {
+                let mut best_df = f64::INFINITY;
+                for &va in na.ca_curr.iter().take(MAX_JOINT_CANDS) {
+                    for &vb in nb.ca_prev.iter().take(MAX_JOINT_CANDS) {
+                        best_df = best_df.min((va - vb).abs());
+                    }
+                }
+                if best_df <= 0.40 {
+                    sq_ca_diffs.push(best_df * best_df);
+                }
+            }
+            if let Some(cp_b) = nb.c_prev {
+                if !na.c_curr.is_empty() {
+                    let mut best_dc = f64::INFINITY;
+                    for &va in na.c_curr.iter().take(MAX_JOINT_CANDS) {
+                        best_dc = best_dc.min((va - cp_b).abs());
+                    }
+                    if best_dc <= 0.30 {
+                        sq_c_diffs.push(best_dc * best_dc);
+                    }
+                }
+            }
+        }
+    }
+    diag.connectivity_frac = if n_assigned > 0 {
+        (n_connected as f64) / (n_assigned as f64)
+    } else {
+        0.0
+    };
+    diag.emp_rms_seq_ca = if sq_ca_diffs.len() >= 5 {
+        (sq_ca_diffs.iter().sum::<f64>() / (sq_ca_diffs.len() as f64)).sqrt()
+    } else {
+        0.0
+    };
+    diag.emp_rms_seq_c = if sq_c_diffs.len() >= 5 {
+        (sq_c_diffs.iter().sum::<f64>() / (sq_c_diffs.len() as f64)).sqrt()
+    } else {
+        0.0
+    };
+
+    // 2. Boltzmann-weighted replica consensus `p_ens`
     let max_sc = replicas
         .iter()
         .map(|r| r.score)
@@ -3707,62 +4307,230 @@ fn compute_posteriors(
         .collect();
     let sum_w: f64 = rep_w.iter().sum::<f64>().max(1e-12);
 
-    let tau_local = 2.05f64;
-
+    let mut ens_sum = 0.0f64;
     for s in 0..s_len {
         let k_best = best.pos[s];
         if k_best < 0 {
             continue;
         }
-        let kb = k_best as usize;
         let mut agree = 0.0f64;
         for (r, &w) in replicas.iter().zip(rep_w.iter()) {
             if r.pos[s] == k_best {
                 agree += w;
             }
         }
-        p_ens[s] = (agree / sum_w).clamp(0.0, 1.0);
+        let pe = (agree / sum_w).clamp(0.0, 1.0);
+        diag.p_ens[s] = pe;
+        ens_sum += pe;
+    }
+    diag.mean_ens_agreement = if n_assigned > 0 {
+        ens_sum / (n_assigned as f64)
+    } else {
+        0.0
+    };
 
-        // Local competitor Boltzmann specificity across top single-slot relocations / swaps
-        let mut alt_deltas: Vec<f64> = Vec::new();
+    // 3. Evaluate single/2-swap, multi-way cycle, and `2..=4`-residue motif-swap competitors
+    let mut work_at = best.at.clone();
+    let mut top_single: Vec<Vec<f64>> = vec![Vec::new(); s_len];
+    let mut top_cycle: Vec<Vec<f64>> = vec![Vec::new(); s_len];
+    let mut best_motif: Vec<f64> = vec![f64::NEG_INFINITY; s_len];
+    let mut d_unassign_vec: Vec<f64> = vec![f64::NEG_INFINITY; s_len];
+    let mut n_ambig = 0usize;
+
+    for s in 0..s_len {
+        let k_i = best.pos[s];
+        if k_i < 0 {
+            continue;
+        }
+        let k_star = k_i as usize;
+        let u_star = u_mat.get(s, k_star);
+        let pair_prev = if k_star > 1 && best.at[k_star - 1] >= 0 {
+            p_mat.get(best.at[k_star - 1] as usize, s).max(0.0)
+        } else {
+            0.0
+        };
+        let pair_next = if k_star + 1 < k_len && best.at[k_star + 1] >= 0 {
+            p_mat.get(s, best.at[k_star + 1] as usize).max(0.0)
+        } else {
+            0.0
+        };
+        let walk_anchor = 0.72 * (pair_prev + pair_next) + 1.65;
+
+        let mut s_deltas = Vec::with_capacity(k_len);
+        let mut c_deltas = Vec::with_capacity(k_len);
         for k_alt in 1..k_len {
-            if k_alt == kb || u_mat.get(s, k_alt) <= FORBID * 0.5 {
+            if k_alt == k_star || u_mat.get(s, k_alt) <= FORBID * 0.5 {
                 continue;
             }
+            c_deltas.push((u_mat.get(s, k_alt) - u_star) - walk_anchor);
             let d = delta_single_move(s, k_alt, &best.at, &best.pos, u_mat, p_mat);
             if d > FORBID * 0.5 {
-                alt_deltas.push(d);
+                s_deltas.push(d);
             }
         }
-        // Also evaluate unassigning `s`
-        let d_un = delta_unassign(s, &best.at, &best.pos, u_mat, p_mat);
-        alt_deltas.push(d_un);
-
-        alt_deltas.sort_by(|a, b| b.total_cmp(a));
-        let mut z_denom = 1.0f64;
-        for &d in alt_deltas.iter().take(8) {
-            let term = (d / tau_local).clamp(-35.0, 4.0).exp();
-            z_denom += term;
+        // Also consider replacing `s` at `k_star` with any currently unassigned node `u` (decoy competition!)
+        for u_cand in 0..s_len {
+            if u_cand == s || best.pos[u_cand] >= 0 || u_mat.get(u_cand, k_star) <= FORBID * 0.5 {
+                continue;
+            }
+            let d_rep = delta_single_move(u_cand, k_star, &best.at, &best.pos, u_mat, p_mat);
+            if d_rep > FORBID * 0.5 {
+                s_deltas.push(d_rep);
+            }
         }
-        let loc = (1.0 / z_denom).clamp(0.0, 1.0);
-        p_local[s] = if locked_slot[kb] { loc.max(0.85) } else { loc };
 
-        // Combine ensemble consensus & local specificity conservatively
-        let comb = (0.50 * p_ens[s] + 0.50 * p_local[s]).min(p_ens[s].max(p_local[s]));
-        raw_post[s] = comb.clamp(0.0, 1.0);
+        s_deltas.sort_by(|a, b| b.total_cmp(a));
+        c_deltas.sort_by(|a, b| b.total_cmp(a));
+        top_single[s].extend(s_deltas.into_iter().take(8));
+        top_cycle[s].extend(c_deltas.into_iter().take(3));
+        d_unassign_vec[s] = delta_unassign(s, &best.at, &best.pos, u_mat, p_mat);
+
+        // Short motif-swap competitors (`blen = 2..=4`) covering `k_star`
+        let mut best_blk = f64::NEG_INFINITY;
+        for blen in 2..=4usize.min(k_len.saturating_sub(1)) {
+            let win_lo = k_star.saturating_sub(blen - 1).max(1);
+            let win_hi = k_star.min(k_len - blen);
+            if win_lo > win_hi {
+                continue;
+            }
+            for k_win in win_lo..=win_hi {
+                for k_alt in 1..=(k_len - blen) {
+                    if k_alt.abs_diff(k_win) < blen {
+                        continue;
+                    }
+                    let feasible = (0..blen).all(|o| {
+                        let a = work_at[k_win + o];
+                        let b = work_at[k_alt + o];
+                        (a < 0 || u_mat.get(a as usize, k_alt + o) > FORBID * 0.5)
+                            && (b < 0 || u_mat.get(b as usize, k_win + o) > FORBID * 0.5)
+                    });
+                    if !feasible {
+                        continue;
+                    }
+                    let before = eval_two_blocks_local(&work_at, u_mat, p_mat, k_win, k_alt, blen);
+                    for o in 0..blen {
+                        work_at.swap(k_win + o, k_alt + o);
+                    }
+                    let after = eval_two_blocks_local(&work_at, u_mat, p_mat, k_win, k_alt, blen);
+                    for o in 0..blen {
+                        work_at.swap(k_win + o, k_alt + o);
+                    }
+                    let delta = after - before;
+                    if delta > best_blk {
+                        best_blk = delta;
+                    }
+                }
+            }
+        }
+        best_motif[s] = best_blk;
+
+        let strongest_alt = top_single[s]
+            .first()
+            .copied()
+            .unwrap_or(f64::NEG_INFINITY)
+            .max(best_blk)
+            .max(d_unassign_vec[s]);
+        if strongest_alt >= -2.0 {
+            n_ambig += 1;
+        }
+    }
+    diag.ambig_placement_frac = if n_assigned > 0 {
+        (n_ambig as f64) / (n_assigned as f64)
+    } else {
+        1.0
+    };
+
+    // 4. Adaptive temperature `tau_local_eff` scaled by empirical RMS, node inflation,
+    //    missing channels, fusion scatter, ambiguity, and sequence repeat factor!
+    let (h_bits, max_aa, max_dipep, top3_dipep) = sequence_complexity_metrics(seq);
+    let max_homo = max_homopolymer_run(seq);
+    let seq_extreme_repeat =
+        k_len >= 16 && (h_bits < 1.65 || max_aa >= 0.55 || max_dipep >= 0.35 || max_homo >= 6);
+    let seq_warn_repeat =
+        k_len >= 16 && (h_bits < 2.60 || max_aa >= 0.35 || top3_dipep >= 0.35 || max_homo >= 4);
+
+    let rms_ca_scale = if diag.emp_rms_seq_ca > 0.042 {
+        (diag.emp_rms_seq_ca / 0.040).clamp(1.0, 2.6)
+    } else {
+        1.0
+    };
+    let rms_c_scale = if diag.emp_rms_seq_c > 0.028 {
+        (diag.emp_rms_seq_c / 0.026).clamp(1.0, 2.4)
+    } else {
+        1.0
+    };
+    let rms_scale = rms_ca_scale.max(rms_c_scale);
+
+    // Decoy/node inflation factor: `n_nodes / n_assignable > 1.15` widens uncertainty!
+    let inflation_scale = if diag.node_ratio > 1.15 {
+        (1.0 + 1.35 * (diag.node_ratio - 1.15)).clamp(1.0, 2.8)
+    } else {
+        1.0
+    };
+
+    // Missing channels / sparse connectivity / fusion scatter
+    let conn_deficit = (0.88 - diag.connectivity_frac).max(0.0);
+    let sup_deficit = (0.85 - diag.support_3d_frac).max(0.0);
+    let channel_scale = (1.0 + 2.8 * conn_deficit + 1.5 * sup_deficit).clamp(1.0, 2.2);
+
+    let fus_n_excess = (fusion_rms_n_ppm - 0.08).max(0.0);
+    let fus_c_excess = (fusion_rms_c_ppm - 0.028).max(0.0);
+    let unm_excess = (hn_unmatched_frac - 0.16).max(0.0);
+    let fusion_scale =
+        (1.0 + 5.5 * fus_n_excess + 14.0 * fus_c_excess + 1.6 * unm_excess).clamp(1.0, 2.4);
+
+    let repeat_scale = if seq_extreme_repeat {
+        2.60
+    } else if seq_warn_repeat {
+        1.95
+    } else {
+        1.0
+    };
+    let ambig_scale = (1.0 + 1.45 * (diag.ambig_placement_frac - 0.15).max(0.0)).clamp(1.0, 2.0);
+
+    let tau_local_eff = (2.05
+        * rms_scale
+        * inflation_scale
+        * channel_scale
+        * fusion_scale
+        * repeat_scale
+        * ambig_scale)
+        .clamp(2.05, 16.0);
+
+    for s in 0..s_len {
+        if best.pos[s] < 0 {
+            continue;
+        }
+        let mut alt_sum = (d_unassign_vec[s] / tau_local_eff).clamp(-35.0, 18.0).exp();
+        for &d in &top_single[s] {
+            alt_sum += (d / tau_local_eff).clamp(-35.0, 18.0).exp();
+        }
+        for &cd in &top_cycle[s] {
+            alt_sum += (cd / (1.15 * tau_local_eff)).clamp(-35.0, 18.0).exp();
+        }
+        if best_motif[s] > -5.0 {
+            alt_sum += (best_motif[s] / (1.15 * tau_local_eff))
+                .clamp(-35.0, 18.0)
+                .exp();
+        }
+        let p_loc = (1.0 / (1.0 + alt_sum)).clamp(0.0, 1.0);
+        diag.p_local[s] = p_loc;
+        // Honest combination: `p_ens` alone can never inflate a low-specificity placement!
+        let combined = 0.72 * p_loc + 0.28 * (p_loc * diag.p_ens[s]).sqrt();
+        diag.raw_post[s] = combined.clamp(0.0, 1.0);
     }
 
-    (p_ens, p_local, raw_post)
+    diag
 }
 
-/// Map pre-calibration raw posterior through monotone calibration knots (`IDP_CALIBRATION_KNOTS`).
+/// Map pre-calibration raw posterior through dedicated monotone [`JOINT_IDP_CALIBRATION_KNOTS`].
 #[inline]
-fn calibrate_posterior_monotone(raw: f64) -> f64 {
+pub fn calibrate_joint_posterior(raw: f64) -> f64 {
     if !raw.is_finite() {
         return 0.0;
     }
     let x = raw.clamp(0.0, 1.0);
-    let knots = IDP_CALIBRATION_KNOTS;
+    let knots = JOINT_IDP_CALIBRATION_KNOTS;
     if knots.is_empty() {
         return x;
     }
@@ -3898,8 +4666,93 @@ fn select_conservative_pass1_anchors(
 }
 
 // ============================================================================
-// Top-Level Unified Joint IDP Backbone Assignment Entrypoint
+// NMR-STAR / Reference Conversion & Top-Level Entrypoints
 // ============================================================================
+
+/// Convert a [`JointIdpAssignResult`] into a standard [`Reference`] chemical-shift table and
+/// per-residue calibrated confidence map for NMR-STAR, TSV, NEF, and HTML quality reporting.
+pub fn joint_idp_to_reference(
+    result: &JointIdpAssignResult,
+    sequence: &[String],
+    seq_ids: &[i32],
+) -> (Reference, BTreeMap<usize, f64>) {
+    let seq = normalize_seq_3(sequence);
+    let ids: Vec<i32> = if seq_ids.len() == seq.len() {
+        seq_ids.to_vec()
+    } else {
+        (1..=seq.len() as i32).collect()
+    };
+    let mut shifts: BTreeMap<(usize, String), f64> = BTreeMap::new();
+    let mut conf: BTreeMap<usize, f64> = BTreeMap::new();
+
+    let mut record_conf = |k: usize, c: f64| {
+        let e = conf.entry(k).or_insert(0.0);
+        if c > *e {
+            *e = c;
+        }
+    };
+
+    for (s_idx, &pos_i) in result.position.iter().enumerate() {
+        if pos_i < 1 || (pos_i as usize) >= seq.len() {
+            continue;
+        }
+        let k = pos_i as usize;
+        let node = &result.nodes[s_idx];
+        let c_val = result.confidence.get(s_idx).copied().unwrap_or(0.0);
+
+        if let Some(h) = node.h_curr {
+            if seq[k] != "PRO" {
+                shifts.insert((k, "H".to_string()), h);
+            }
+        }
+        shifts.insert((k, "N".to_string()), node.n_curr);
+        if let Some(&ca) = node.ca_curr.first() {
+            shifts.insert((k, "CA".to_string()), ca);
+        }
+        if let Some(&cb) = node.cb_curr.first() {
+            if seq[k] != "GLY" {
+                shifts.insert((k, "CB".to_string()), cb);
+            }
+        }
+        if let Some(&c_cur) = node.c_curr.first() {
+            shifts.insert((k, "C".to_string()), c_cur);
+        }
+        record_conf(k, c_val);
+
+        // Preceding residue `k - 1` shifts observed on this peptide-bond node
+        if let Some(c_prev) = node.c_prev {
+            shifts.entry((k - 1, "C".to_string())).or_insert(c_prev);
+        }
+        if let Some(&ca_p) = node.ca_prev.first() {
+            shifts.entry((k - 1, "CA".to_string())).or_insert(ca_p);
+        }
+        if let Some(&cb_p) = node.cb_prev.first() {
+            if seq[k - 1] != "GLY" {
+                shifts.entry((k - 1, "CB".to_string())).or_insert(cb_p);
+            }
+        }
+        record_conf(k - 1, (c_val * 0.95).clamp(0.0, 1.0));
+    }
+
+    (
+        Reference {
+            sequence: seq,
+            seq_ids: ids,
+            shifts,
+            ambiguity_codes: BTreeMap::new(),
+        },
+        conf,
+    )
+}
+
+/// CPU entrypoint alias (`assign_joint_idp_cpu`) matching `assign_idp_13c_cpu` naming convention.
+pub fn assign_joint_idp_cpu(
+    dataset: &JointIdpDataset,
+    sequence: &[String],
+    cfg: &JointIdpConfig,
+) -> Result<JointIdpAssignResult, String> {
+    assign_joint_idp(dataset, sequence, cfg)
+}
 
 /// Run the unified joint `HN + 2D CON + Proline-Bridge + N–N + CAS` IDP backbone solver.
 ///
@@ -3917,7 +4770,6 @@ pub fn assign_joint_idp(
     let nodes = build.nodes;
     let s_len = nodes.len();
 
-    // Enforce bounded matrix allocation
     check_idp_matrix_bounds(s_len, k_len)?;
 
     let total_pro_k_ge_1 = if k_len >= 2 {
@@ -3926,7 +4778,6 @@ pub fn assign_joint_idp(
         0
     };
 
-    // Degenerate / empty sequence or peak list: return clean abstention with zero panics
     if s_len == 0 || k_len < 2 {
         let mut qc_reasons = build.warnings;
         if k_len < 2 {
@@ -3977,12 +4828,14 @@ pub fn assign_joint_idp(
             proline_bridge_recovery: (0, total_pro_k_ge_1),
             n_sidelobes_pruned: build.n_sidelobes_pruned,
             n_gly_cb_guarded: build.n_gly_cb_guarded,
+            emp_rms_seq_ca: 0.0,
+            emp_rms_seq_c: 0.0,
+            fusion_rms_ppm: (build.fusion_rms_c_ppm, build.fusion_rms_n_ppm),
             qc_verdict: DatasetQcVerdict::Abstain,
             qc_reasons,
         });
     }
 
-    // Build overlap/breakthrough-calibrated CAS tables, joint `U`, and joint `P`
     let cas_tables = build_calibrated_cas_tables(&dataset.cas_spectra, &nodes, &seq, cfg);
     let u_mat = try_joint_idp_unary_matrix(
         &nodes,
@@ -3994,7 +4847,6 @@ pub fn assign_joint_idp(
     )?;
     let p_mat = try_joint_idp_pair_matrix(&nodes, cfg)?;
 
-    // Sanitize user locks
     let valid_user_locks: Vec<(usize, usize)> = dataset
         .user_locks
         .iter()
@@ -4007,24 +4859,24 @@ pub fn assign_joint_idp(
         run_island_ensemble(&u_mat, &p_mat, &valid_user_locks, cfg, 0);
     let pass1_score = pass1_best.score;
 
-    let mut locked_slot_p1 = vec![false; k_len];
-    for &(_, k) in &valid_user_locks {
-        locked_slot_p1[k] = true;
-    }
-    let (p1_ens, p1_loc, p1_raw) = compute_posteriors(
+    let p1_diag = compute_posteriors_honest(
         &pass1_best,
         &pass1_replicas,
+        &nodes,
+        &seq,
         &u_mat,
         &p_mat,
-        &locked_slot_p1,
+        build.fusion_rms_c_ppm,
+        build.fusion_rms_n_ppm,
+        build.hn_unmatched_frac,
     );
 
     // Conservative Pass-1 -> Pass-2 anchor-lock propagation
     let mut pass1_locked_anchors = if cfg.enable_two_pass_anchor_lock {
         select_conservative_pass1_anchors(
             &pass1_best,
-            &p1_ens,
-            &p1_loc,
+            &p1_diag.p_ens,
+            &p1_diag.p_local,
             &nodes,
             &seq,
             &u_mat,
@@ -4036,7 +4888,6 @@ pub fn assign_joint_idp(
         Vec::new()
     };
 
-    // Merge user locks into Pass-2 lock set without duplicates
     let mut combined_locks = valid_user_locks.clone();
     for &(s, k) in &pass1_locked_anchors {
         if !combined_locks.iter().any(|&(us, uk)| us == s || uk == k) {
@@ -4049,90 +4900,186 @@ pub fn assign_joint_idp(
         && !pass1_locked_anchors.is_empty()
         && combined_locks.len() < s_len.min(n_assignable_slots);
 
-    let (final_best, final_replicas, raw_posterior, pass2_score_gain) = if run_pass2 {
+    let (final_best, final_replicas, final_diag, pass2_score_gain) = if run_pass2 {
         let (p2_best, p2_replicas) =
             run_island_ensemble(&u_mat, &p_mat, &combined_locks, cfg, 0xA5A5_5A5A_1234_5678);
         if p2_best.score >= pass1_best.score - 1e-6 {
-            let mut locked_slot_p2 = vec![false; k_len];
-            for &(_, k) in &combined_locks {
-                locked_slot_p2[k] = true;
-            }
-            let (_e2, _l2, raw2) =
-                compute_posteriors(&p2_best, &p2_replicas, &u_mat, &p_mat, &locked_slot_p2);
+            // Evaluate honest posteriors WITHOUT any circular Pass-2 lock floor (`180.core:P1-1`)
+            let p2_diag = compute_posteriors_honest(
+                &p2_best,
+                &p2_replicas,
+                &nodes,
+                &seq,
+                &u_mat,
+                &p_mat,
+                build.fusion_rms_c_ppm,
+                build.fusion_rms_n_ppm,
+                build.hn_unmatched_frac,
+            );
             let gain = (p2_best.score - pass1_score).max(0.0);
-            (p2_best, p2_replicas, raw2, gain)
+            (p2_best, p2_replicas, p2_diag, gain)
         } else {
-            // Retain Pass 1 if Pass 2 did not match Pass 1 objective
             pass1_locked_anchors.clear();
-            (pass1_best, pass1_replicas, p1_raw, 0.0)
+            (pass1_best, pass1_replicas, p1_diag, 0.0)
         }
     } else {
-        (pass1_best, pass1_replicas, p1_raw, 0.0)
+        (pass1_best, pass1_replicas, p1_diag, 0.0)
     };
 
-    // Compute calibrated confidences & unlabelled QC metrics
-    let support_3d_frac =
-        (nodes.iter().filter(|n| n.has_3d_support()).count() as f64) / (s_len.max(1) as f64);
-
-    let mut assigned_links = 0usize;
-    let mut connected_links = 0usize;
-    for k in 1..(k_len - 1) {
-        let a = final_best.at[k];
-        let b = final_best.at[k + 1];
-        if a >= 0 && b >= 0 {
-            assigned_links += 1;
-            if p_mat.get(a as usize, b as usize) >= 0.8 {
-                connected_links += 1;
-            }
-        }
-    }
-    let connectivity_frac = if assigned_links > 0 {
-        (connected_links as f64) / (assigned_links as f64)
-    } else {
-        0.0
-    };
+    // Comprehensive unlabelled Dataset QC Verdict (`180.core:P1-2`):
+    // Ports Spec 14 §2.4 low-complexity/repeat guards + decoy/node inflation + fusion RMS +
+    // empirical sequential matching RMS + ensemble agreement/ambiguity gates!
+    let (h_aa_bits, max_aa_frac, max_dipep_frac, top3_dipep_frac) =
+        sequence_complexity_metrics(&seq);
+    let max_homo_run = max_homopolymer_run(&seq);
 
     let mut qc_reasons = build.warnings;
-    let mut qc_verdict = DatasetQcVerdict::Pass;
-    let root_cov = (s_len as f64) / (n_assignable_slots.max(1) as f64);
-    if support_3d_frac < 0.25 || root_cov < 0.30 {
-        qc_verdict = DatasetQcVerdict::Abstain;
+    let mut severe_abstain = false;
+    let mut severe_degeneracy_warn = false;
+    let mut compound_noise_warn = false;
+    let mut mild_warn = false;
+
+    // (a) 3D support & sequential connectivity gates
+    if final_diag.support_3d_frac < 0.25 {
         qc_reasons.push(format!(
-            "Insufficient 3D/root coverage (3D={:.1}%, roots={}/{})",
-            100.0 * support_3d_frac,
-            s_len,
-            n_assignable_slots
+            "Catastrophic 3D strip support loss ({:.1}% < 25.0% of roots supported)",
+            final_diag.support_3d_frac * 100.0
         ));
-    } else if support_3d_frac < 0.55
-        || connectivity_frac < 0.35
-        || !build.auto_ref_report.refused_nuclei.is_empty()
+        severe_abstain = true;
+    } else if s_len >= 6 && final_diag.connectivity_frac < 0.15 {
+        qc_reasons.push(format!(
+            "Sequential connectivity collapsed ({:.1}% < 15.0% linked)",
+            final_diag.connectivity_frac * 100.0
+        ));
+        severe_abstain = true;
+    } else if final_diag.support_3d_frac < 0.55
+        || (s_len >= 6 && final_diag.connectivity_frac < 0.45)
     {
-        qc_verdict = DatasetQcVerdict::Warn;
-        if support_3d_frac < 0.55 {
-            qc_reasons.push(format!(
-                "Sparse 3D support ({:.1}%)",
-                100.0 * support_3d_frac
-            ));
-        }
-        if connectivity_frac < 0.35 {
-            qc_reasons.push(format!(
-                "Low sequential connectivity ({:.1}%)",
-                100.0 * connectivity_frac
-            ));
+        qc_reasons.push(format!(
+            "Partial 3D support ({:.1}%) or sparse sequential connectivity ({:.1}%)",
+            final_diag.support_3d_frac * 100.0,
+            final_diag.connectivity_frac * 100.0
+        ));
+        mild_warn = true;
+    }
+
+    // (b) Root collapse & decoy/duplicate inflation gates
+    let root_ratio = final_diag.node_ratio;
+    if k_len >= 20 && root_ratio < 0.35 {
+        qc_reasons.push(format!(
+            "Severe root collapse ({s_len}/{n_assignable_slots} = {:.1}% < 35.0% expected peptide bonds)",
+            root_ratio * 100.0
+        ));
+        severe_abstain = true;
+    } else if k_len >= 20 && root_ratio < 0.70 {
+        qc_reasons.push(format!(
+            "Root deficit ({s_len}/{n_assignable_slots} = {:.1}% < 70.0% expected peptide bonds)",
+            root_ratio * 100.0
+        ));
+        severe_degeneracy_warn = true;
+    } else if k_len >= 20 && root_ratio >= 1.35 {
+        qc_reasons.push(format!(
+            "Decoy or duplicate root inflation ({s_len}/{n_assignable_slots} = {:.2}x expected peptide bonds >= 1.35x)",
+            root_ratio
+        ));
+        severe_degeneracy_warn = true;
+    }
+
+    // (c) Primary-sequence low-complexity & repeat gate (Spec 14 §2.4 via shared `idp_solver`)
+    if k_len >= 16
+        && (h_aa_bits < 1.65 || max_aa_frac >= 0.55 || max_dipep_frac >= 0.35 || max_homo_run >= 6)
+    {
+        qc_reasons.push(format!(
+            "Extreme low-complexity / homopolymeric repeat sequence (H={h_aa_bits:.2} bits, max_AA={:.1}%, max_dipep={:.1}%, max_run={max_homo_run})",
+            max_aa_frac * 100.0,
+            max_dipep_frac * 100.0
+        ));
+        severe_abstain = true;
+    } else if k_len >= 16
+        && (h_aa_bits < 2.60 || max_aa_frac >= 0.35 || top3_dipep_frac >= 0.35 || max_homo_run >= 4)
+    {
+        qc_reasons.push(format!(
+            "Low-complexity / repetitive IDP sequence (H={h_aa_bits:.2} bits, max_AA={:.1}%, top3_dipep={:.1}%, max_run={max_homo_run})",
+            max_aa_frac * 100.0,
+            top3_dipep_frac * 100.0
+        ));
+        severe_degeneracy_warn = true;
+    }
+
+    // (d) Matching noise, HN<->CON fusion scatter, ensemble disagreement & placement ambiguity gates
+    let noise_high = final_diag.emp_rms_seq_ca >= 0.068
+        || final_diag.emp_rms_seq_c >= 0.042
+        || build.fusion_rms_n_ppm >= 0.14
+        || build.fusion_rms_c_ppm >= 0.045;
+    let ambig_high = final_diag.ambig_placement_frac >= 0.22
+        || final_diag.mean_ens_agreement < 0.78
+        || final_diag.mean_cands_per_ch >= 1.65;
+
+    if s_len >= 8 && (noise_high || ambig_high) {
+        qc_reasons.push(format!(
+            "Elevated matching noise or assignment ambiguity (seq_CA_RMS={:.3}, seq_C_RMS={:.3}, fus_N_RMS={:.3}, fus_C_RMS={:.3} ppm, ambig={:.1}%, ens_agree={:.1}%)",
+            final_diag.emp_rms_seq_ca,
+            final_diag.emp_rms_seq_c,
+            build.fusion_rms_n_ppm,
+            build.fusion_rms_c_ppm,
+            final_diag.ambig_placement_frac * 100.0,
+            final_diag.mean_ens_agreement * 100.0
+        ));
+        if noise_high && (ambig_high || root_ratio >= 1.35) {
+            compound_noise_warn = true;
+        } else {
+            mild_warn = true;
         }
     }
 
-    let confidence: Vec<f64> = raw_posterior
+    // Severe compound degradation -> Abstain
+    if s_len >= 12
+        && ((final_diag.ambig_placement_frac >= 0.55 && final_diag.mean_ens_agreement < 0.65)
+            || (root_ratio >= 2.00 && (noise_high || final_diag.ambig_placement_frac >= 0.30))
+            || (final_diag.emp_rms_seq_ca >= 0.105 && final_diag.ambig_placement_frac >= 0.35))
+    {
+        qc_reasons.push(
+            "Compound degradation (severe noise, decoy inflation, and low ensemble margin); abstaining from high-confidence calls"
+                .to_string(),
+        );
+        severe_abstain = true;
+    }
+
+    if !build.auto_ref_report.refused_nuclei.is_empty() {
+        mild_warn = true;
+    }
+
+    let qc_verdict = if severe_abstain {
+        DatasetQcVerdict::Abstain
+    } else if severe_degeneracy_warn || compound_noise_warn || mild_warn {
+        DatasetQcVerdict::Warn
+    } else {
+        DatasetQcVerdict::Pass
+    };
+
+    // Map honest raw posteriors through dedicated `JOINT_IDP_CALIBRATION_KNOTS` + QC scale/cap
+    let confidence: Vec<f64> = final_diag
+        .raw_post
         .iter()
         .enumerate()
         .map(|(s, &raw)| {
             if final_best.pos[s] < 0 {
                 0.0
             } else {
-                let mut cal = calibrate_posterior_monotone(raw);
+                let mut cal = calibrate_joint_posterior(raw);
                 match qc_verdict {
-                    DatasetQcVerdict::Abstain => cal = cal.min(0.45),
-                    DatasetQcVerdict::Warn => cal = cal.min(0.88),
+                    DatasetQcVerdict::Abstain => {
+                        cal = (cal * 0.45).min((cfg.hc_threshold - 0.35).clamp(0.10, 0.45));
+                    }
+                    DatasetQcVerdict::Warn => {
+                        if compound_noise_warn {
+                            cal = (cal * 0.78).min(0.79);
+                        } else if severe_degeneracy_warn {
+                            cal = (cal * 0.84).min(0.86);
+                        } else {
+                            cal = (cal * 0.93).min(0.95);
+                        }
+                    }
                     DatasetQcVerdict::Pass => {}
                 }
                 cal.clamp(0.0, 1.0)
@@ -4172,7 +5119,7 @@ pub fn assign_joint_idp(
         let (conf, raw_p, r_sup, is_coo) = if let Some(s) = node_opt {
             (
                 confidence[s],
-                raw_posterior[s],
+                final_diag.raw_post[s],
                 route_support[s],
                 k + 1 == k_len && build.c_term_coo_candidates.contains(&s),
             )
@@ -4206,7 +5153,7 @@ pub fn assign_joint_idp(
         nodes,
         position: final_best.pos,
         confidence,
-        raw_posterior,
+        raw_posterior: final_diag.raw_post,
         route_support,
         residue_assignments,
         score: final_score,
@@ -4234,6 +5181,9 @@ pub fn assign_joint_idp(
         proline_bridge_recovery: (assigned_prolines, total_pro_k_ge_1),
         n_sidelobes_pruned: build.n_sidelobes_pruned,
         n_gly_cb_guarded: build.n_gly_cb_guarded,
+        emp_rms_seq_ca: final_diag.emp_rms_seq_ca,
+        emp_rms_seq_c: final_diag.emp_rms_seq_c,
+        fusion_rms_ppm: (build.fusion_rms_c_ppm, build.fusion_rms_n_ppm),
         qc_verdict,
         qc_reasons,
     })
