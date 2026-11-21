@@ -398,6 +398,70 @@ pub fn parse_workbench_action(name: &str) -> Option<WorkbenchAction> {
         .find(|&act| normalize_action_token(&format!("{act:?}")) == target)
 }
 
+/// Return `true` when dispatching `action` via MCP replaces or wipes workspace state without
+/// an MCP undo entry and must therefore carry `destructive: true` metadata and be gated behind
+/// GUI `allow_destructive_actions` plus explicit `confirm: true` (or remain blocked via MCP for
+/// interactive file dialogs such as [`WorkbenchAction::LoadPathOrSpectrum`]).
+pub const fn workbench_action_is_destructive(action: WorkbenchAction) -> bool {
+    matches!(
+        action,
+        WorkbenchAction::ResetWorkspace
+            | WorkbenchAction::LoadUbiquitinDemo
+            | WorkbenchAction::LoadSessionNef
+            | WorkbenchAction::LoadPathOrSpectrum
+            | WorkbenchAction::ReSimulateSyntheticNoise
+    )
+}
+
+/// Destructive-action classification for parameterized `run_workbench_workflow` actions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorkflowDestructiveMode {
+    /// Action does not replace or wipe existing workspace/assignment state.
+    Never,
+    /// Action always replaces workspace state without an MCP undo entry.
+    Always,
+    /// Action replaces or clears existing sequence/assignment state when non-empty.
+    WhenReplacingState,
+}
+
+impl WorkflowDestructiveMode {
+    /// Wire-stable string representation for `inspect_workbench_data(section="actions")`.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Never => "never",
+            Self::Always => "always",
+            Self::WhenReplacingState => "when_replacing_state",
+        }
+    }
+
+    /// Return `true` when this workflow action can destructively replace workspace state.
+    pub const fn is_destructive(self) -> bool {
+        !matches!(self, Self::Never)
+    }
+}
+
+/// Canonical list of all `run_workbench_workflow` action names.
+const ALL_WORKFLOW_ACTIONS: &[&str] = &[
+    "load_study_folder",
+    "set_sequence",
+    "pick_peaks",
+    "run_assignment",
+    "select_workbook_page",
+    "set_contour_level",
+    "set_viewport_bounds",
+    "export_results",
+    "set_lock_residue",
+];
+
+/// Return the [`WorkflowDestructiveMode`] for a `run_workbench_workflow` action name.
+pub fn workflow_action_destructive_mode(action: &str) -> WorkflowDestructiveMode {
+    match action.trim() {
+        "load_study_folder" => WorkflowDestructiveMode::Always,
+        "set_sequence" => WorkflowDestructiveMode::WhenReplacingState,
+        _ => WorkflowDestructiveMode::Never,
+    }
+}
+
 /// Undo-tagged UI navigation and resonance curation commands executable via the MCP bridge.
 #[derive(Clone, Debug, PartialEq)]
 pub enum McpUiCommand {
@@ -425,11 +489,13 @@ pub enum McpUiCommand {
     LoadStudyFolder {
         path: String,
         run_full_pipeline: bool,
+        confirm: bool,
     },
     /// Queue setting the target protein amino-acid sequence in the workbench (inline or via path).
     SetSequence {
         sequence: String,
         sequence_path: Option<String>,
+        confirm: bool,
     },
     /// Queue peak picking across loaded spectra with optional manual/auto SNR and picker backend.
     PickAllSpectra {
@@ -515,16 +581,25 @@ impl McpUiCommand {
             Self::LoadStudyFolder {
                 path,
                 run_full_pipeline,
+                confirm,
             } => {
-                format!("LoadStudyFolder(path={path}, run_full_pipeline={run_full_pipeline})")
+                format!(
+                    "LoadStudyFolder(path={path}, run_full_pipeline={run_full_pipeline}, confirm={confirm})"
+                )
             }
             Self::SetSequence {
                 sequence,
                 sequence_path,
+                confirm,
             } => match sequence_path {
-                Some(p) if sequence.is_empty() => format!("SetSequence(path={p})"),
-                Some(p) => format!("SetSequence(len={}, path={p})", sequence.len()),
-                None => format!("SetSequence(len={})", sequence.len()),
+                Some(p) if sequence.is_empty() => {
+                    format!("SetSequence(path={p}, confirm={confirm})")
+                }
+                Some(p) => format!(
+                    "SetSequence(len={}, path={p}, confirm={confirm})",
+                    sequence.len()
+                ),
+                None => format!("SetSequence(len={}, confirm={confirm})", sequence.len()),
             },
             Self::PickAllSpectra {
                 snr_threshold,
@@ -738,6 +813,13 @@ impl McpUndoLog {
         !self.redo_stack.is_empty()
     }
 
+    /// Return `true` when a `SetSequence` command is already pending in the GUI command queue.
+    fn has_pending_set_sequence(&self) -> bool {
+        self.pending_ui_commands
+            .iter()
+            .any(|cmd| matches!(cmd, McpUiCommand::SetSequence { .. }))
+    }
+
     /// Immutable view of recent AI audit records (oldest to newest, bounded to `256` entries).
     pub fn audit_records(&self) -> &VecDeque<McpAuditRecord> {
         &self.audit_log
@@ -903,6 +985,7 @@ impl McpUndoLog {
             McpUiCommand::LoadStudyFolder {
                 path,
                 run_full_pipeline,
+                ..
             } => {
                 let delta = Self::capture_workflow_undo(snapshot);
                 snapshot.status_msg =
@@ -912,6 +995,7 @@ impl McpUndoLog {
             McpUiCommand::SetSequence {
                 sequence,
                 sequence_path,
+                ..
             } => {
                 let delta = Self::capture_workflow_undo(snapshot);
                 snapshot.status_msg = match sequence_path {
@@ -1838,6 +1922,46 @@ fn validate_raw_prefix(raw_prefix: &str) -> Result<PathBuf, McpSecurityError> {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+fn detected_home_dirs() -> Vec<PathBuf> {
+    let mut homes = Vec::new();
+    let mut push_candidate = |raw: PathBuf| {
+        if raw.as_os_str().is_empty() {
+            return;
+        }
+        if let Ok(canon) = std::fs::canonicalize(&raw) {
+            if !homes.contains(&canon) {
+                homes.push(canon);
+            }
+        } else if !homes.contains(&raw) {
+            homes.push(raw);
+        }
+    };
+    for key in ["HOME", "USERPROFILE"] {
+        if let Some(val) = std::env::var_os(key) {
+            push_candidate(PathBuf::from(val));
+        }
+    }
+    if let (Some(drive), Some(path)) = (std::env::var_os("HOMEDRIVE"), std::env::var_os("HOMEPATH"))
+    {
+        let mut combined = drive;
+        combined.push(path);
+        push_candidate(PathBuf::from(combined));
+    }
+    homes
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn is_home_or_ancestor_of(canon: &Path, homes: &[PathBuf]) -> bool {
+    homes.iter().any(|home| home.starts_with(canon))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn is_home_or_ancestor_of_home(canon: &Path) -> bool {
+    let homes = detected_home_dirs();
+    is_home_or_ancestor_of(canon, &homes)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 fn canonicalize_approved_root(raw: &Path) -> Result<PathBuf, String> {
     let canon = std::fs::canonicalize(raw).map_err(|e| {
         format!(
@@ -1860,14 +1984,136 @@ fn canonicalize_approved_root(raw: &Path) -> Result<PathBuf, String> {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+fn canonicalize_automatic_root_with_homes(
+    raw: &Path,
+    homes: &[PathBuf],
+) -> Result<PathBuf, String> {
+    let canon = canonicalize_approved_root(raw)?;
+    if is_home_or_ancestor_of(&canon, homes) {
+        return Err(format!(
+            "refusing home directory or ancestor ('{}') as an automatic MCP sandbox root; add an explicit root in GUI MCP Bridge settings if intended",
+            canon.display()
+        ));
+    }
+    Ok(canon)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn canonicalize_automatic_root(raw: &Path) -> Result<PathBuf, String> {
+    let homes = detected_home_dirs();
+    canonicalize_automatic_root_with_homes(raw, &homes)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 fn default_cwd_roots() -> Vec<PathBuf> {
     let Ok(cwd) = std::env::current_dir() else {
         return Vec::new();
     };
-    match canonicalize_approved_root(&cwd) {
+    match canonicalize_automatic_root(&cwd) {
         Ok(canon) => vec![canon],
         Err(_) => Vec::new(),
     }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+const MAX_STUDY_TREE_SCAN_DEPTH: usize = 24;
+#[cfg(not(target_arch = "wasm32"))]
+const MAX_STUDY_TREE_SCAN_ENTRIES: usize = 50_000;
+
+/// Recursively inspect every child entry inside `canon_study_root` without following directory
+/// symlinks into cycles, refusing any symlink that is dangling or resolves outside
+/// `canon_study_root` / `approved_roots`, and blocking forbidden credential segments.
+#[cfg(not(target_arch = "wasm32"))]
+fn validate_study_folder_tree_containment(
+    canon_study_root: &Path,
+    approved_roots: &[PathBuf],
+) -> Result<(), McpSecurityError> {
+    let mut stack: Vec<(PathBuf, usize)> = vec![(canon_study_root.to_path_buf(), 0)];
+    let mut visited = 0usize;
+
+    while let Some((dir, depth)) = stack.pop() {
+        if depth > MAX_STUDY_TREE_SCAN_DEPTH {
+            return Err(McpSecurityError::new(
+                McpSecurityErrorKind::NullByteOrInvalidPath,
+                format!(
+                    "study folder exceeds maximum directory nesting depth ({MAX_STUDY_TREE_SCAN_DEPTH})"
+                ),
+            ));
+        }
+        let entries = std::fs::read_dir(&dir).map_err(|e| {
+            McpSecurityError::new(
+                McpSecurityErrorKind::IoError,
+                format!("failed to scan study folder contents: {e}"),
+            )
+        })?;
+        for entry_res in entries {
+            visited = visited.saturating_add(1);
+            if visited > MAX_STUDY_TREE_SCAN_ENTRIES {
+                return Err(McpSecurityError::new(
+                    McpSecurityErrorKind::NullByteOrInvalidPath,
+                    format!(
+                        "study folder exceeds maximum scanned entry limit ({MAX_STUDY_TREE_SCAN_ENTRIES})"
+                    ),
+                ));
+            }
+            let entry = entry_res.map_err(|e| {
+                McpSecurityError::new(
+                    McpSecurityErrorKind::IoError,
+                    format!("failed to read study folder entry: {e}"),
+                )
+            })?;
+            let entry_path = entry.path();
+            if let Some(name) = entry.file_name().to_str() {
+                if is_forbidden_credential_seg(name) {
+                    return Err(McpSecurityError::new(
+                        McpSecurityErrorKind::CredentialPathBlocked,
+                        format!(
+                            "study folder contains forbidden sensitive credential segment '{name}'"
+                        ),
+                    ));
+                }
+            }
+            let meta = std::fs::symlink_metadata(&entry_path).map_err(|e| {
+                McpSecurityError::new(
+                    McpSecurityErrorKind::IoError,
+                    format!("failed to inspect study folder entry metadata: {e}"),
+                )
+            })?;
+            if meta.file_type().is_symlink() {
+                let canon_target = std::fs::canonicalize(&entry_path).map_err(|_| {
+                    McpSecurityError::new(
+                        McpSecurityErrorKind::SymlinkEscape,
+                        "dangling or unresolvable nested symlink inside study folder is forbidden",
+                    )
+                })?;
+                if !canon_target.starts_with(canon_study_root)
+                    || !approved_roots.iter().any(|r| canon_target.starts_with(r))
+                {
+                    return Err(McpSecurityError::new(
+                        McpSecurityErrorKind::SymlinkEscape,
+                        "nested symlink inside study folder escapes the study root",
+                    ));
+                }
+                for comp in canon_target.components() {
+                    if let Component::Normal(os) = comp {
+                        if let Some(seg) = os.to_str() {
+                            if is_forbidden_credential_seg(seg) {
+                                return Err(McpSecurityError::new(
+                                    McpSecurityErrorKind::CredentialPathBlocked,
+                                    format!(
+                                        "nested symlink targets forbidden credential segment '{seg}'"
+                                    ),
+                                ));
+                            }
+                        }
+                    }
+                }
+            } else if meta.is_dir() {
+                stack.push((entry_path, depth + 1));
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -1892,6 +2138,8 @@ struct SharedBridgeInner {
     viewport: ViewportFrameBuffer,
     permission: McpBridgePermission,
     allow_destructive_actions: bool,
+    #[cfg(not(target_arch = "wasm32"))]
+    allow_cwd_fallback: bool,
     #[cfg(not(target_arch = "wasm32"))]
     active_study_root: Option<PathBuf>,
     #[cfg(not(target_arch = "wasm32"))]
@@ -1929,6 +2177,8 @@ impl SharedBridgeInner {
             permission: McpBridgePermission::ReadOnly,
             allow_destructive_actions: false,
             #[cfg(not(target_arch = "wasm32"))]
+            allow_cwd_fallback: false,
+            #[cfg(not(target_arch = "wasm32"))]
             active_study_root: None,
             #[cfg(not(target_arch = "wasm32"))]
             approved_roots: Vec::new(),
@@ -1953,14 +2203,29 @@ impl SharedBridgeInner {
         }
     }
 
+    /// Return `true` when setting a sequence would replace or clear existing sequence or
+    /// assignment state (including a prior `SetSequence` already queued in this batch/frame).
+    fn has_existing_sequence_or_assignments(&self) -> bool {
+        self.snapshot.sequence_len > 0
+            || self.snapshot.assigned_count > 0
+            || !self.snapshot.assigned_residues.is_empty()
+            || self.undo_log.has_pending_set_sequence()
+    }
+
     #[cfg(not(target_arch = "wasm32"))]
     fn effective_roots(&self) -> Vec<PathBuf> {
         if self.roots_customized {
             self.approved_roots.clone()
         } else if let Some(ref study) = self.active_study_root {
-            vec![study.clone()]
-        } else {
+            if is_home_or_ancestor_of_home(study) {
+                Vec::new()
+            } else {
+                vec![study.clone()]
+            }
+        } else if self.allow_cwd_fallback {
             default_cwd_roots()
+        } else {
+            Vec::new()
         }
     }
 
@@ -2017,6 +2282,16 @@ impl SharedBridgeInner {
                     ),
                 ));
             }
+        }
+        Ok(resolved)
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn resolve_sandboxed_study_path(&self, raw_path: &str) -> Result<PathBuf, McpSecurityError> {
+        let resolved = self.resolve_sandboxed_read_path(raw_path, true)?;
+        if resolved.is_dir() {
+            let roots = self.effective_roots();
+            validate_study_folder_tree_containment(&resolved, &roots)?;
         }
         Ok(resolved)
     }
@@ -2198,7 +2473,11 @@ fn mcp_tool_schemas_json() -> Value {
         },
         {
             "name": "run_workbench_workflow",
-            "description": "Queue parameterized workbench workflows (`load_study_folder`, `set_sequence`, `pick_peaks`, `run_assignment`, `select_workbook_page`, `set_contour_level`, `set_viewport_bounds`, `export_results`, `set_lock_residue`). Requires ReadWrite permission; filesystem paths are strictly sandboxed to user-approved roots and existing files are not overwritten unless `overwrite: true` is passed.",
+            "description": "Queue parameterized workbench workflows (`load_study_folder`, `set_sequence`, `pick_peaks`, `run_assignment`, `select_workbook_page`, `set_contour_level`, `set_viewport_bounds`, `export_results`, `set_lock_residue`). Requires ReadWrite permission; filesystem paths are strictly sandboxed to user-approved roots (fail-closed when none are configured), existing files are not overwritten unless `overwrite: true` is passed, and destructive workflows (`load_study_folder`, plus `set_sequence` when replacing existing sequence/assignment state) require enabling destructive actions in GUI MCP settings and passing `confirm: true`.",
+            "annotations": {
+                "readOnlyHint": false,
+                "destructiveHint": true
+            },
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -2252,6 +2531,10 @@ fn mcp_tool_schemas_json() -> Value {
                         "type": "boolean",
                         "description": "Explicitly allow overwriting an existing output file during export_results (default: false)."
                     },
+                    "confirm": {
+                        "type": "boolean",
+                        "description": "Explicit confirmation flag required for destructive workflows (`load_study_folder`, and `set_sequence` when replacing existing sequence/assignment state) alongside enabling destructive actions in GUI MCP settings (default: false)."
+                    },
                     "seq_id": { "type": "integer" },
                     "locked": { "type": "boolean" }
                 },
@@ -2260,7 +2543,11 @@ fn mcp_tool_schemas_json() -> Value {
         },
         {
             "name": "dispatch_workbench_action",
-            "description": "Dispatch any registered WorkbenchAction (menu, workflow, view, picker, assignment, structure, dynamics, or mode switch) by PascalCase or snake_case name. Requires ReadWrite permission; file-backed actions obey approved-root sandboxing & overwrite refusal, and destructive actions (`ResetWorkspace`) are denied unless explicitly enabled in MCP settings and confirmed (`confirm: true`).",
+            "description": "Dispatch any registered WorkbenchAction (menu, workflow, view, picker, assignment, structure, dynamics, or mode switch) by PascalCase or snake_case name. Requires ReadWrite permission; file-backed actions obey approved-root sandboxing & overwrite refusal, and destructive actions (`ResetWorkspace`, `LoadUbiquitinDemo`, `LoadSessionNef`, `ReSimulateSyntheticNoise`) are denied unless explicitly enabled in MCP settings and confirmed (`confirm: true`); `LoadPathOrSpectrum` is blocked via MCP.",
+            "annotations": {
+                "readOnlyHint": false,
+                "destructiveHint": true
+            },
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -2520,11 +2807,13 @@ fn parse_workflow_command(args: &Value) -> Result<(&'static str, McpUiCommand), 
             let path = parse_optional_nonempty_str(args, "path")?
                 .ok_or_else(|| "load_study_folder requires non-empty string 'path'".to_string())?;
             let run_full_pipeline = parse_optional_bool(args, "run_full_pipeline", false)?;
+            let confirm = parse_optional_bool(args, "confirm", false)?;
             Ok((
                 "load_study_folder",
                 McpUiCommand::LoadStudyFolder {
                     path,
                     run_full_pipeline,
+                    confirm,
                 },
             ))
         }
@@ -2537,11 +2826,13 @@ fn parse_workflow_command(args: &Value) -> Result<(&'static str, McpUiCommand), 
                         .to_string(),
                 );
             }
+            let confirm = parse_optional_bool(args, "confirm", false)?;
             Ok((
                 "set_sequence",
                 McpUiCommand::SetSequence {
                     sequence: seq_opt.unwrap_or_default(),
                     sequence_path: path_opt,
+                    confirm,
                 },
             ))
         }
@@ -2925,12 +3216,29 @@ fn execute_inspect_workbench_data(
                         "title": meta.title,
                         "description": meta.description,
                         "chord_badge": meta.chord_badge,
+                        "destructive": workbench_action_is_destructive(act),
+                        "blocked_via_mcp": act == WorkbenchAction::LoadPathOrSpectrum,
+                    })
+                })
+                .collect();
+            let workflow_actions: Vec<Value> = ALL_WORKFLOW_ACTIONS
+                .iter()
+                .map(|&name| {
+                    let mode = workflow_action_destructive_mode(name);
+                    json!({
+                        "name": name,
+                        "destructive": mode.is_destructive(),
+                        "destructive_mode": mode.as_str(),
                     })
                 })
                 .collect();
             let mut body = slice_paginated_items(items, offset, limit);
             if let Some(m) = body.as_object_mut() {
                 m.insert("section".to_string(), json!("actions"));
+                m.insert(
+                    "workflow_actions".to_string(),
+                    Value::Array(workflow_actions),
+                );
             }
             body
         }
@@ -2964,6 +3272,49 @@ fn mcp_security_denied_response(
             true,
         ),
     )
+}
+
+fn check_destructive_action_gate(
+    inner: &mut SharedBridgeInner,
+    id: Value,
+    tool_label: &str,
+    action_name: &str,
+    effective_permission: McpBridgePermission,
+    confirm: bool,
+) -> Option<Value> {
+    if !inner.allow_destructive_actions {
+        let reason = format!(
+            "destructive action '{action_name}' is denied via MCP (enable 'Allow destructive MCP actions' in GUI MCP Bridge settings and pass confirm: true)"
+        );
+        inner
+            .undo_log
+            .record_blocked_security(format!("{tool_label}({action_name}): {reason}"));
+        return Some(mcp_security_denied_response(
+            id,
+            action_name,
+            effective_permission,
+            "destructive_action_denied",
+            nmr_core::mcp::ERR_SECURITY_VIOLATION,
+            reason,
+        ));
+    }
+    if !confirm {
+        let reason = format!(
+            "destructive action '{action_name}' requires explicit confirm: true in the MCP payload"
+        );
+        inner
+            .undo_log
+            .record_blocked_security(format!("{tool_label}({action_name}): {reason}"));
+        return Some(mcp_security_denied_response(
+            id,
+            action_name,
+            effective_permission,
+            "confirmation_required",
+            nmr_core::mcp::ERR_SECURITY_VIOLATION,
+            reason,
+        ));
+    }
+    None
 }
 
 /// Execute a JSON-RPC 2.0 MCP payload (single request, notification, or batch array) against
@@ -3128,6 +3479,10 @@ fn dispatch_mcp_jsonrpc_object(
                                 .map(|p| Value::String(p.display().to_string()))
                                 .collect();
                             m.insert("approved_roots".to_string(), Value::Array(roots));
+                            m.insert(
+                                "allow_cwd_fallback".to_string(),
+                                Value::Bool(inner.allow_cwd_fallback),
+                            );
                         }
                     }
                     Some(jsonrpc_ok(id, mcp_text_result(snap, false)))
@@ -3333,7 +3688,7 @@ fn dispatch_mcp_jsonrpc_object(
                     #[cfg(not(target_arch = "wasm32"))]
                     match &cmd {
                         McpUiCommand::LoadStudyFolder { path, .. } => {
-                            if let Err(sec) = inner.resolve_sandboxed_read_path(path, true) {
+                            if let Err(sec) = inner.resolve_sandboxed_study_path(path) {
                                 inner.undo_log.record_blocked_security(format!(
                                     "run_workbench_workflow(load_study_folder): {}",
                                     sec.message
@@ -3401,6 +3756,35 @@ fn dispatch_mcp_jsonrpc_object(
                         }
                         _ => {}
                     }
+                    match &cmd {
+                        McpUiCommand::LoadStudyFolder { confirm, .. } => {
+                            if let Some(denied) = check_destructive_action_gate(
+                                inner,
+                                id.clone(),
+                                "run_workbench_workflow",
+                                action_name,
+                                effective_permission,
+                                *confirm,
+                            ) {
+                                return Some(denied);
+                            }
+                        }
+                        McpUiCommand::SetSequence { confirm, .. }
+                            if inner.has_existing_sequence_or_assignments() =>
+                        {
+                            if let Some(denied) = check_destructive_action_gate(
+                                inner,
+                                id.clone(),
+                                "run_workbench_workflow",
+                                action_name,
+                                effective_permission,
+                                *confirm,
+                            ) {
+                                return Some(denied);
+                            }
+                        }
+                        _ => {}
+                    }
                     let summary = cmd.summary();
                     let action_id = inner.undo_log.apply_command(&mut inner.snapshot, cmd);
                     inner.request_ui_repaint();
@@ -3454,7 +3838,7 @@ fn dispatch_mcp_jsonrpc_object(
                         _ => unreachable!(),
                     };
                     if wb_action == WorkbenchAction::LoadPathOrSpectrum {
-                        let reason = "Use run_workbench_workflow(action='load_study_folder', path=...) to load sandboxed datasets via MCP".to_string();
+                        let reason = "Use run_workbench_workflow(action='load_study_folder', path=..., confirm=true) to load sandboxed datasets via MCP".to_string();
                         inner.undo_log.record_blocked_security(format!(
                             "dispatch_workbench_action: {reason}"
                         ));
@@ -3466,36 +3850,6 @@ fn dispatch_mcp_jsonrpc_object(
                             nmr_core::mcp::ERR_SECURITY_VIOLATION,
                             reason,
                         ));
-                    }
-                    if wb_action == WorkbenchAction::ResetWorkspace {
-                        if !inner.allow_destructive_actions {
-                            let reason = "destructive action 'ResetWorkspace' is denied via MCP (enable destructive actions in MCP Bridge settings and pass confirm: true, or reset manually in the GUI)".to_string();
-                            inner.undo_log.record_blocked_security(format!(
-                                "dispatch_workbench_action(ResetWorkspace): {reason}"
-                            ));
-                            return Some(mcp_security_denied_response(
-                                id,
-                                &canonical_action,
-                                effective_permission,
-                                "destructive_action_denied",
-                                nmr_core::mcp::ERR_SECURITY_VIOLATION,
-                                reason,
-                            ));
-                        }
-                        if !confirm {
-                            let reason = "destructive action 'ResetWorkspace' requires explicit confirm: true".to_string();
-                            inner.undo_log.record_blocked_security(format!(
-                                "dispatch_workbench_action(ResetWorkspace): {reason}"
-                            ));
-                            return Some(mcp_security_denied_response(
-                                id,
-                                &canonical_action,
-                                effective_permission,
-                                "confirmation_required",
-                                nmr_core::mcp::ERR_SECURITY_VIOLATION,
-                                reason,
-                            ));
-                        }
                     }
                     #[cfg(target_arch = "wasm32")]
                     let _ = overwrite;
@@ -3588,10 +3942,9 @@ fn dispatch_mcp_jsonrpc_object(
                         WorkbenchAction::ProcessAllRawFids
                         | WorkbenchAction::ReconstructNusIstFista => {
                             if let Some(ref ingest_root) = inner.active_ingest_root {
-                                if let Err(sec) = inner.resolve_sandboxed_read_path(
-                                    &ingest_root.to_string_lossy(),
-                                    true,
-                                ) {
+                                if let Err(sec) = inner
+                                    .resolve_sandboxed_study_path(&ingest_root.to_string_lossy())
+                                {
                                     inner.undo_log.record_blocked_security(format!(
                                         "dispatch_workbench_action({canonical_action}): {}",
                                         sec.message
@@ -3608,6 +3961,18 @@ fn dispatch_mcp_jsonrpc_object(
                             }
                         }
                         _ => {}
+                    }
+                    if workbench_action_is_destructive(wb_action) {
+                        if let Some(denied) = check_destructive_action_gate(
+                            inner,
+                            id.clone(),
+                            "dispatch_workbench_action",
+                            &canonical_action,
+                            effective_permission,
+                            confirm,
+                        ) {
+                            return Some(denied);
+                        }
                     }
                     let title = wb_action.metadata().title;
                     let summary = cmd.summary();
@@ -4713,7 +5078,9 @@ impl McpBridgeController {
         }
     }
 
-    /// Whether destructive MCP actions (`ResetWorkspace`) are enabled (false by default).
+    /// Whether destructive MCP actions (`ResetWorkspace`, `LoadUbiquitinDemo`, `LoadSessionNef`,
+    /// `ReSimulateSyntheticNoise`, `load_study_folder`, and `set_sequence` when replacing existing
+    /// sequence/assignment state) are enabled (false by default).
     pub fn destructive_actions_allowed(&self) -> bool {
         self.shared
             .lock()
@@ -4721,10 +5088,29 @@ impl McpBridgeController {
             .unwrap_or(false)
     }
 
-    /// Enable or disable destructive MCP actions (`ResetWorkspace`; still requires `confirm: true`).
+    /// Enable or disable destructive MCP actions (still requires explicit `confirm: true`).
     pub fn set_destructive_actions_allowed(&self, allowed: bool) {
         if let Ok(mut g) = self.shared.lock() {
             g.allow_destructive_actions = allowed;
+        }
+    }
+
+    /// Whether explicit current-working-directory fallback is enabled when no roots or active
+    /// study folder are configured (false by default; never permits `$HOME` or its ancestors).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn cwd_fallback_allowed(&self) -> bool {
+        self.shared
+            .lock()
+            .map(|g| g.allow_cwd_fallback)
+            .unwrap_or(false)
+    }
+
+    /// Explicitly opt in or out of using a non-`$HOME` current working directory as a fallback
+    /// sandbox root when no roots are customized and no study is open (false by default).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn set_cwd_fallback_allowed(&self, allowed: bool) {
+        if let Ok(mut g) = self.shared.lock() {
+            g.allow_cwd_fallback = allowed;
         }
     }
 
@@ -4809,16 +5195,19 @@ impl McpBridgeController {
         }
     }
 
-    /// Restore approved roots to the automatic default (active study or workspace directory).
+    /// Restore approved roots to the automatic fail-closed default (active non-`$HOME` study only;
+    /// empty when no study is active, and disables CWD fallback).
     #[cfg(not(target_arch = "wasm32"))]
     pub fn reset_approved_roots_to_default(&self) {
         if let Ok(mut g) = self.shared.lock() {
             g.roots_customized = false;
+            g.allow_cwd_fallback = false;
             g.approved_roots.clear();
         }
     }
 
-    /// Synchronize the active user-opened study directory (ignoring paths loaded via MCP itself).
+    /// Synchronize the active user-opened study directory (ignoring paths loaded via MCP itself,
+    /// and refusing `$HOME` or any ancestor of `$HOME` as an automatic sandbox root).
     #[cfg(not(target_arch = "wasm32"))]
     pub fn sync_user_study_root(&self, root_path_opt: Option<&Path>) {
         let Ok(mut g) = self.shared.lock() else {
@@ -4826,6 +5215,8 @@ impl McpBridgeController {
         };
         g.active_ingest_root = root_path_opt.map(Path::to_path_buf);
         let Some(raw) = root_path_opt else {
+            g.active_study_root = None;
+            g.last_mcp_loaded_path = None;
             return;
         };
         let dir_candidate = if raw.is_dir() {
@@ -4833,6 +5224,7 @@ impl McpBridgeController {
         } else if let Some(parent) = raw.parent() {
             parent.to_path_buf()
         } else {
+            g.active_study_root = None;
             return;
         };
         if let Some(ref mcp_loaded) = g.last_mcp_loaded_path {
@@ -4845,8 +5237,9 @@ impl McpBridgeController {
             }
         }
         g.last_mcp_loaded_path = None;
-        if let Ok(canon) = canonicalize_approved_root(&dir_candidate) {
-            g.active_study_root = Some(canon);
+        match canonicalize_automatic_root(&dir_candidate) {
+            Ok(canon) => g.active_study_root = Some(canon),
+            Err(_) => g.active_study_root = None,
         }
     }
 
@@ -4879,6 +5272,18 @@ impl McpBridgeController {
             .lock()
             .map_err(|_| "MCP bridge state lock poisoned".to_string())?;
         g.resolve_sandboxed_read_path(raw_path, allow_dir)
+            .map_err(|e| e.message)
+    }
+
+    /// Validate and canonicalize a study folder (or single spectrum file) inside approved roots,
+    /// recursively ensuring no nested symlink inside a study directory escapes the study root.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn resolve_sandboxed_study_path(&self, raw_path: &str) -> Result<PathBuf, String> {
+        let g = self
+            .shared
+            .lock()
+            .map_err(|_| "MCP bridge state lock poisoned".to_string())?;
+        g.resolve_sandboxed_study_path(raw_path)
             .map_err(|e| e.message)
     }
 
@@ -5186,7 +5591,7 @@ pub fn render_mcp_bridge_panel(
     let prev_destructive = allow_destructive;
     ui.checkbox(
         &mut allow_destructive,
-        "Allow destructive MCP actions (ResetWorkspace; still requires confirm: true)",
+        "Allow destructive MCP actions (ResetWorkspace, LoadUbiquitinDemo, LoadSessionNef, load_study_folder, replacing set_sequence; still requires confirm: true)",
     );
     if allow_destructive != prev_destructive {
         controller.set_destructive_actions_allowed(allow_destructive);
@@ -5197,22 +5602,34 @@ pub fn render_mcp_bridge_panel(
     {
         let roots = controller.approved_roots();
         let customized = controller.roots_customized();
+        let mut allow_cwd_fb = controller.cwd_fallback_allowed();
         ui.horizontal_wrapped(|ui| {
             ui.strong(if customized {
                 "Approved Filesystem Roots (Custom):"
             } else {
-                "Approved Filesystem Roots (Default Study/Workspace):"
+                "Approved Filesystem Roots (Active Study Only — Fail-Closed by Default):"
             });
-            if customized && ui.small_button("Reset Default").clicked() {
+            if (customized || allow_cwd_fb) && ui.small_button("Reset Default").clicked() {
                 controller.reset_approved_roots_to_default();
                 controller.status_banner =
-                    "Reset MCP sandbox roots to active study/workspace default".to_string();
+                    "Reset MCP sandbox roots to fail-closed active-study default".to_string();
+                allow_cwd_fb = false;
             }
         });
+        if !customized {
+            let prev_cwd_fb = allow_cwd_fb;
+            ui.checkbox(
+                &mut allow_cwd_fb,
+                "Allow current working directory fallback when no study is open (excludes $HOME and ancestors)",
+            );
+            if allow_cwd_fb != prev_cwd_fb {
+                controller.set_cwd_fallback_allowed(allow_cwd_fb);
+            }
+        }
         if roots.is_empty() {
             ui.colored_label(
                 egui::Color32::from_rgb(245, 180, 90),
-                "No approved roots configured — file read/write tools are blocked.",
+                "No approved roots configured — file read/write tools are blocked (open a study folder or add a root below).",
             );
         } else {
             let mut remove_idx = None;
@@ -6551,6 +6968,7 @@ mod tests {
             reason: "Anchor check".to_string(),
         });
         let _ = ctrl.drain_pending_ui_commands();
+        ctrl.set_destructive_actions_allowed(true);
 
         let valid_calls = [
             (
@@ -6558,21 +6976,24 @@ mod tests {
                 json!({
                     "action": "load_study_folder",
                     "path": study_str,
-                    "run_full_pipeline": true
+                    "run_full_pipeline": true,
+                    "confirm": true
                 }),
             ),
             (
                 "set_sequence",
                 json!({
                     "action": "set_sequence",
-                    "sequence": "MQIFVKTLTG"
+                    "sequence": "MQIFVKTLTG",
+                    "confirm": true
                 }),
             ),
             (
                 "set_sequence",
                 json!({
                     "action": "set_sequence",
-                    "sequence_path": fasta_str
+                    "sequence_path": fasta_str,
+                    "confirm": true
                 }),
             ),
             (
@@ -6678,14 +7099,17 @@ mod tests {
                 McpUiCommand::LoadStudyFolder {
                     path: study_str,
                     run_full_pipeline: true,
+                    confirm: true,
                 },
                 McpUiCommand::SetSequence {
                     sequence: "MQIFVKTLTG".to_string(),
                     sequence_path: None,
+                    confirm: true,
                 },
                 McpUiCommand::SetSequence {
                     sequence: String::new(),
                     sequence_path: Some(fasta_str),
+                    confirm: true,
                 },
                 McpUiCommand::PickAllSpectra {
                     snr_threshold: Some(7.5),
@@ -7162,12 +7586,13 @@ mod tests {
             assert_eq!(sym_dir_resp["result"]["isError"], true);
         }
 
-        // In-root reads succeed
-        let ok_study = call_tool(
+        // In-root reads: set_sequence on an empty workspace succeeds without destructive confirm,
+        // while load_study_folder is always destructive and requires allow_destructive_actions + confirm: true.
+        let study_no_perm = call_tool(
             "run_workbench_workflow",
-            json!({ "action": "load_study_folder", "path": study_dir.to_string_lossy() }),
+            json!({ "action": "load_study_folder", "path": study_dir.to_string_lossy(), "confirm": true }),
         );
-        assert_eq!(ok_study["result"]["isError"], false);
+        assert_denied(&study_no_perm, "destructive_action_denied");
         let ok_seq = call_tool(
             "run_workbench_workflow",
             json!({ "action": "set_sequence", "sequence_path": in_fasta.to_string_lossy() }),
@@ -7514,5 +7939,427 @@ mod tests {
         );
 
         ctrl.stop_bridge();
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn test_p1_9_fail_closed_default_roots_and_home_ancestor_rejection() {
+        // 1. Fresh controller with no configured roots and no active study allows NOTHING (fail-closed)
+        let ctrl = McpBridgeController::default();
+        assert!(
+            ctrl.approved_roots().is_empty(),
+            "default controller must have empty approved_roots (fail-closed)"
+        );
+        assert!(!ctrl.cwd_fallback_allowed());
+        ctrl.set_permission(McpBridgePermission::ReadWrite);
+        ctrl.set_destructive_actions_allowed(true);
+
+        // Simulate sensitive file like ~/.config/gh/hosts.yml inside a temp directory
+        let fake_home = TempTestDir::new("p1_9_home");
+        let gh_dir = fake_home.path().join(".config").join("gh");
+        std::fs::create_dir_all(&gh_dir).expect("create fake .config/gh");
+        let hosts_yml = gh_dir.join("hosts.yml");
+        std::fs::write(&hosts_yml, "github.com:\n  oauth_token: ghp_MQIFVKTLTG\n")
+            .expect("write fake hosts.yml");
+        let study_sub = fake_home.path().join("studies").join("ubq");
+        std::fs::create_dir_all(&study_sub).expect("create study subdir");
+
+        let call_tool = |name: &str, args: Value| -> Value {
+            let req = serde_json::to_vec(&json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": { "name": name, "arguments": args }
+            }))
+            .unwrap();
+            ctrl.handle_jsonrpc_bytes(&req).unwrap()
+        };
+        let assert_no_roots = |resp: &Value| {
+            assert_eq!(resp["result"]["isError"], true, "expected denial: {resp}");
+            let payload: Value =
+                serde_json::from_str(resp["result"]["content"][0]["text"].as_str().unwrap())
+                    .unwrap();
+            assert_eq!(payload["status"], "denied", "payload={payload}");
+            assert_eq!(payload["queued"], false, "payload={payload}");
+            assert_eq!(
+                payload["error_kind"], "no_allowed_roots",
+                "payload={payload}"
+            );
+        };
+
+        // All file-touching MCP tools must be denied fail-closed with no_allowed_roots
+        assert_no_roots(&call_tool(
+            "run_workbench_workflow",
+            json!({
+                "action": "set_sequence",
+                "sequence_path": hosts_yml.to_string_lossy(),
+                "confirm": true
+            }),
+        ));
+        assert_no_roots(&call_tool(
+            "run_workbench_workflow",
+            json!({
+                "action": "export_results",
+                "prefix": fake_home.path().join("leak").to_string_lossy(),
+                "format": "star",
+                "overwrite": true
+            }),
+        ));
+        assert_no_roots(&call_tool(
+            "run_workbench_workflow",
+            json!({
+                "action": "load_study_folder",
+                "path": study_sub.to_string_lossy(),
+                "confirm": true
+            }),
+        ));
+        ctrl.set_current_export_prefix(&fake_home.path().join("sess").to_string_lossy());
+        assert_no_roots(&call_tool(
+            "dispatch_workbench_action",
+            json!({ "action": "save_session_nef", "overwrite": true }),
+        ));
+        assert_no_roots(&call_tool(
+            "dispatch_workbench_action",
+            json!({ "action": "load_session_nef", "confirm": true }),
+        ));
+        assert!(ctrl.drain_pending_ui_commands().is_empty());
+
+        // 2. $HOME and any ancestor of $HOME are rejected as automatic/default roots,
+        //    while a dedicated subdirectory under $HOME is accepted.
+        let homes = vec![fake_home.path().to_path_buf()];
+        assert!(
+            canonicalize_automatic_root_with_homes(fake_home.path(), &homes).is_err(),
+            "$HOME must be rejected as an automatic root"
+        );
+        if let Some(parent_of_home) = fake_home.path().parent() {
+            assert!(
+                canonicalize_automatic_root_with_homes(parent_of_home, &homes).is_err(),
+                "ancestor of $HOME ({}) must be rejected as an automatic root",
+                parent_of_home.display()
+            );
+        }
+        assert!(canonicalize_automatic_root_with_homes(Path::new("/"), &homes).is_err());
+        assert_eq!(
+            canonicalize_automatic_root_with_homes(&study_sub, &homes).unwrap(),
+            study_sub
+        );
+
+        // Real process HOME / USERPROFILE must never become an automatic study root via sync_user_study_root
+        for home_dir in detected_home_dirs() {
+            if home_dir.is_dir() {
+                ctrl.sync_user_study_root(Some(&home_dir));
+                assert!(
+                    ctrl.approved_roots().is_empty(),
+                    "sync_user_study_root($HOME) must NOT expose {} as an automatic root",
+                    home_dir.display()
+                );
+                if let Some(parent) = home_dir.parent() {
+                    ctrl.sync_user_study_root(Some(parent));
+                    assert!(
+                        ctrl.approved_roots().is_empty(),
+                        "sync_user_study_root(ancestor of $HOME) must NOT expose {}",
+                        parent.display()
+                    );
+                }
+            }
+        }
+
+        // Syncing a non-$HOME study directory anchors only that study; clearing it returns to fail-closed empty
+        ctrl.sync_user_study_root(Some(&study_sub));
+        assert_eq!(ctrl.approved_roots(), vec![study_sub.clone()]);
+        ctrl.sync_user_study_root(None);
+        assert!(ctrl.approved_roots().is_empty());
+
+        // Explicit opt-in CWD fallback can be toggled (still excludes $HOME and ancestors)
+        ctrl.set_cwd_fallback_allowed(true);
+        assert!(ctrl.cwd_fallback_allowed());
+        if let Ok(cwd) = std::env::current_dir().and_then(std::fs::canonicalize) {
+            if is_home_or_ancestor_of_home(&cwd) {
+                assert!(ctrl.approved_roots().is_empty());
+            } else {
+                assert_eq!(ctrl.approved_roots(), vec![cwd]);
+            }
+        }
+        ctrl.reset_approved_roots_to_default();
+        assert!(!ctrl.cwd_fallback_allowed());
+        assert!(ctrl.approved_roots().is_empty());
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn test_p1_10_destructive_metadata_and_complete_gating() {
+        let sandbox = TempTestDir::new("p1_10_destructive");
+        let study_dir = sandbox.path().join("study");
+        std::fs::create_dir_all(&study_dir).expect("create study dir");
+        let sess_prefix = sandbox.path().join("session_save");
+        std::fs::write(sess_prefix.with_extension("nef"), "data_nef_demo\n")
+            .expect("write dummy nef");
+
+        let ctrl = McpBridgeController::default();
+        ctrl.set_approved_roots([sandbox.path()])
+            .expect("approve sandbox");
+        ctrl.set_current_export_prefix(&sess_prefix.to_string_lossy());
+        ctrl.set_permission(McpBridgePermission::ReadWrite);
+
+        let call_tool = |name: &str, args: Value| -> Value {
+            let req = serde_json::to_vec(&json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": { "name": name, "arguments": args }
+            }))
+            .unwrap();
+            ctrl.handle_jsonrpc_bytes(&req).unwrap()
+        };
+        let assert_denied = |resp: &Value, expected_kind: &str| {
+            assert_eq!(resp["result"]["isError"], true, "expected denial: {resp}");
+            let payload: Value =
+                serde_json::from_str(resp["result"]["content"][0]["text"].as_str().unwrap())
+                    .unwrap();
+            assert_eq!(payload["status"], "denied", "payload={payload}");
+            assert_eq!(payload["queued"], false, "payload={payload}");
+            assert_eq!(payload["error_kind"], expected_kind, "payload={payload}");
+        };
+
+        // 1. inspect_workbench_data(section="actions") carries explicit destructive metadata
+        let insp = call_tool(
+            "inspect_workbench_data",
+            json!({ "section": "actions", "limit": 500 }),
+        );
+        assert_eq!(insp["result"]["isError"], false);
+        let insp_json: Value =
+            serde_json::from_str(insp["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        let items = insp_json["items"].as_array().unwrap();
+        let find_act = |name: &str| -> &Value {
+            items
+                .iter()
+                .find(|it| it["name"].as_str() == Some(name))
+                .unwrap_or_else(|| panic!("missing action {name}"))
+        };
+        for d in [
+            "ResetWorkspace",
+            "LoadUbiquitinDemo",
+            "LoadSessionNef",
+            "LoadPathOrSpectrum",
+            "ReSimulateSyntheticNoise",
+        ] {
+            assert_eq!(find_act(d)["destructive"], true, "{d} must be destructive");
+        }
+        assert_eq!(find_act("LoadPathOrSpectrum")["blocked_via_mcp"], true);
+        for safe in ["SwitchModeAssign", "ZoomIn", "TogglePeakLabels"] {
+            assert_eq!(
+                find_act(safe)["destructive"],
+                false,
+                "{safe} must not be destructive"
+            );
+        }
+        let wf_acts = insp_json["workflow_actions"].as_array().unwrap();
+        let find_wf = |name: &str| -> &Value {
+            wf_acts
+                .iter()
+                .find(|it| it["name"].as_str() == Some(name))
+                .unwrap_or_else(|| panic!("missing workflow {name}"))
+        };
+        assert_eq!(find_wf("load_study_folder")["destructive"], true);
+        assert_eq!(find_wf("load_study_folder")["destructive_mode"], "always");
+        assert_eq!(find_wf("set_sequence")["destructive"], true);
+        assert_eq!(
+            find_wf("set_sequence")["destructive_mode"],
+            "when_replacing_state"
+        );
+        assert_eq!(find_wf("pick_peaks")["destructive"], false);
+
+        // 2. Every destructive WorkbenchAction requires allow_destructive_actions AND confirm: true
+        assert_denied(
+            &call_tool(
+                "dispatch_workbench_action",
+                json!({ "action": "load_path_or_spectrum", "confirm": true }),
+            ),
+            "sandbox_required",
+        );
+        for act_name in [
+            "reset_workspace",
+            "load_ubiquitin_demo",
+            "load_session_nef",
+            "re_simulate_synthetic_noise",
+        ] {
+            ctrl.set_destructive_actions_allowed(false);
+            assert_denied(
+                &call_tool(
+                    "dispatch_workbench_action",
+                    json!({ "action": act_name, "confirm": true }),
+                ),
+                "destructive_action_denied",
+            );
+            ctrl.set_destructive_actions_allowed(true);
+            assert_denied(
+                &call_tool("dispatch_workbench_action", json!({ "action": act_name })),
+                "confirmation_required",
+            );
+            assert_denied(
+                &call_tool(
+                    "dispatch_workbench_action",
+                    json!({ "action": act_name, "confirm": false }),
+                ),
+                "confirmation_required",
+            );
+            let ok = call_tool(
+                "dispatch_workbench_action",
+                json!({ "action": act_name, "confirm": true }),
+            );
+            assert_eq!(ok["result"]["isError"], false, "{act_name} failed: {ok}");
+        }
+        let _ = ctrl.drain_pending_ui_commands();
+
+        // 3. load_study_folder requires allow_destructive_actions AND confirm: true
+        ctrl.set_destructive_actions_allowed(false);
+        assert_denied(
+            &call_tool(
+                "run_workbench_workflow",
+                json!({ "action": "load_study_folder", "path": study_dir.to_string_lossy(), "confirm": true }),
+            ),
+            "destructive_action_denied",
+        );
+        ctrl.set_destructive_actions_allowed(true);
+        assert_denied(
+            &call_tool(
+                "run_workbench_workflow",
+                json!({ "action": "load_study_folder", "path": study_dir.to_string_lossy() }),
+            ),
+            "confirmation_required",
+        );
+        let ok_study = call_tool(
+            "run_workbench_workflow",
+            json!({ "action": "load_study_folder", "path": study_dir.to_string_lossy(), "confirm": true }),
+        );
+        assert_eq!(ok_study["result"]["isError"], false);
+        let _ = ctrl.drain_pending_ui_commands();
+
+        // 4. set_sequence is allowed on empty workspace, but gated when replacing existing state
+        ctrl.set_destructive_actions_allowed(false);
+        let ok_empty_seq = call_tool(
+            "run_workbench_workflow",
+            json!({ "action": "set_sequence", "sequence": "MQIFVK" }),
+        );
+        assert_eq!(ok_empty_seq["result"]["isError"], false);
+        // Second set_sequence while previous is still pending (or after snapshot sync) must be gated!
+        assert_denied(
+            &call_tool(
+                "run_workbench_workflow",
+                json!({ "action": "set_sequence", "sequence": "AAAA", "confirm": true }),
+            ),
+            "destructive_action_denied",
+        );
+        let _ = ctrl.drain_pending_ui_commands();
+        ctrl.update_snapshot(|s| s.sequence_len = 6);
+        assert_denied(
+            &call_tool(
+                "run_workbench_workflow",
+                json!({ "action": "set_sequence", "sequence": "AAAA", "confirm": true }),
+            ),
+            "destructive_action_denied",
+        );
+        ctrl.set_destructive_actions_allowed(true);
+        assert_denied(
+            &call_tool(
+                "run_workbench_workflow",
+                json!({ "action": "set_sequence", "sequence": "AAAA" }),
+            ),
+            "confirmation_required",
+        );
+        let ok_replace_seq = call_tool(
+            "run_workbench_workflow",
+            json!({ "action": "set_sequence", "sequence": "AAAA", "confirm": true }),
+        );
+        assert_eq!(ok_replace_seq["result"]["isError"], false);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_load_study_folder_rejects_nested_and_dangling_symlinks() {
+        let sandbox = TempTestDir::new("study_nested_symlink");
+        let outside = TempTestDir::new("study_outside_secret");
+        let secret = outside.path().join("secret.fasta");
+        std::fs::write(&secret, ">SECRET\nMQIFVK\n").expect("write outside secret");
+
+        let study = sandbox.path().join("my_study");
+        let sub = study.join("exp1");
+        std::fs::create_dir_all(&sub).expect("create study subdir");
+        let real_seq = study.join("real.fasta");
+        std::fs::write(&real_seq, ">REAL\nMQIFVK\n").expect("write real fasta");
+
+        let ctrl = McpBridgeController::default();
+        ctrl.set_approved_roots([sandbox.path()])
+            .expect("approve sandbox");
+        ctrl.set_permission(McpBridgePermission::ReadWrite);
+        ctrl.set_destructive_actions_allowed(true);
+
+        let call_load = |p: &Path| -> Value {
+            let req = serde_json::to_vec(&json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "run_workbench_workflow",
+                    "arguments": {
+                        "action": "load_study_folder",
+                        "path": p.to_string_lossy(),
+                        "confirm": true
+                    }
+                }
+            }))
+            .unwrap();
+            ctrl.handle_jsonrpc_bytes(&req).unwrap()
+        };
+
+        // Internal in-root symlink is allowed
+        let internal_link = sub.join("seq_alias.fasta");
+        std::os::unix::fs::symlink(&real_seq, &internal_link).expect("create internal symlink");
+        let ok_resp = call_load(&study);
+        assert_eq!(
+            ok_resp["result"]["isError"], false,
+            "in-root symlink should be allowed: {ok_resp}"
+        );
+
+        // Escaping file symlink inside nested subdir is refused
+        let escape_file_link = sub.join("leak.fasta");
+        std::os::unix::fs::symlink(&secret, &escape_file_link).expect("create escaping file link");
+        let esc_resp = call_load(&study);
+        assert_eq!(esc_resp["result"]["isError"], true);
+        let esc_payload: Value =
+            serde_json::from_str(esc_resp["result"]["content"][0]["text"].as_str().unwrap())
+                .unwrap();
+        assert_eq!(esc_payload["error_kind"], "symlink_escape");
+        std::fs::remove_file(&escape_file_link).unwrap();
+
+        // Escaping directory symlink inside nested subdir is refused
+        let escape_dir_link = sub.join("ext_dir");
+        std::os::unix::fs::symlink(outside.path(), &escape_dir_link)
+            .expect("create escaping dir link");
+        let esc_dir_resp = call_load(&study);
+        assert_eq!(esc_dir_resp["result"]["isError"], true);
+        std::fs::remove_file(&escape_dir_link).unwrap();
+
+        // Dangling symlink inside study folder is refused
+        let dangling_link = sub.join("broken.ucsf");
+        std::os::unix::fs::symlink(
+            outside.path().join("nonexistent_target_xyz"),
+            &dangling_link,
+        )
+        .expect("create dangling symlink");
+        let dang_resp = call_load(&study);
+        assert_eq!(dang_resp["result"]["isError"], true);
+        let dang_payload: Value =
+            serde_json::from_str(dang_resp["result"]["content"][0]["text"].as_str().unwrap())
+                .unwrap();
+        assert_eq!(dang_payload["error_kind"], "symlink_escape");
+    }
+
+    #[test]
+    fn test_validate_loopback_host_rejects_ipv6_loopback_matching_manual() {
+        assert!(validate_loopback_host_and_origin("127.0.0.1:17420", false, None, 17420).is_ok());
+        assert!(validate_loopback_host_and_origin("localhost:17420", false, None, 17420).is_ok());
+        assert!(validate_loopback_host_and_origin("[::1]:17420", false, None, 17420).is_err());
+        assert!(validate_loopback_host_and_origin("[::1]", false, None, 17420).is_err());
     }
 }
