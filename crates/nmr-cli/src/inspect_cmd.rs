@@ -4,7 +4,7 @@
 
 use std::path::PathBuf;
 
-use nmr_core::classify::{classify_nmr_workspace, WorkspaceInventory};
+use nmr_core::classify::{classify_nmr_workspace, CasSelectionScope, WorkspaceInventory};
 
 /// Format a human-readable tabular summary of `WorkspaceInventory`.
 pub fn format_inventory_table(inv: &WorkspaceInventory) -> String {
@@ -29,10 +29,20 @@ pub fn format_inventory_table(inv: &WorkspaceInventory) -> String {
 
     if !inv.experiments.is_empty() {
         out.push_str(&format!(
-            "{:<3} {:<30} {:<10} {:<8} {:<9} {:>7} {:<18} {:<14} {:<10} {:<14}\n",
-            "Sel", "Path", "Vendor", "Dim", "State", "MHz", "Axes", "PulseClass", "NUS", "Quad"
+            "{:<3} {:<30} {:<10} {:<8} {:<9} {:>7} {:<16} {:<15} {:<14} {:<10} {:<14}\n",
+            "Sel",
+            "Path",
+            "Vendor",
+            "Dim",
+            "State",
+            "MHz",
+            "Axes",
+            "Sizes",
+            "PulseClass",
+            "NUS",
+            "Quad"
         ));
-        out.push_str(&"-".repeat(128));
+        out.push_str(&"-".repeat(144));
         out.push('\n');
 
         for exp in &inv.experiments {
@@ -57,19 +67,68 @@ pub fn format_inventory_table(inv: &WorkspaceInventory) -> String {
                 })
                 .collect::<Vec<_>>()
                 .join(",");
+            let sizes_str = exp
+                .axes
+                .iter()
+                .map(|a| a.points.to_string())
+                .collect::<Vec<_>>()
+                .join("x");
             let short_path = truncate_middle(&exp.relative_path, 30);
             out.push_str(&format!(
-                "{:<3} {:<30} {:<10} {:<8} {:<9} {:>7} {:<18} {:<14} {:<10} {:<14}\n",
+                "{:<3} {:<30} {:<10} {:<8} {:<9} {:>7} {:<16} {:<15} {:<14} {:<10} {:<14}\n",
                 sel,
                 short_path,
                 exp.vendor.as_str(),
                 exp.dimensionality.as_str(),
                 exp.data_state.as_str(),
                 mhz,
-                truncate_middle(&axes_str, 18),
+                truncate_middle(&axes_str, 16),
+                truncate_middle(&sizes_str, 15),
                 exp.pulse_class.as_str(),
                 truncate_middle(&exp.nus.badge, 10),
                 truncate_middle(&exp.quadrature_badge, 14),
+            ));
+        }
+        out.push('\n');
+    }
+
+    let nus_rows: Vec<_> = inv
+        .experiments
+        .iter()
+        .filter_map(|e| {
+            e.notes
+                .iter()
+                .find(|n| n.starts_with("NUS indirect sizes:"))
+                .map(|n| (&e.relative_path, n))
+        })
+        .collect();
+    if !nus_rows.is_empty() {
+        out.push_str("NUS Indirect Sizes (NusTD / nuslist / proc SI):\n");
+        for (path, note) in nus_rows {
+            out.push_str(&format!("  * {path}: {note}\n"));
+        }
+        out.push('\n');
+    }
+
+    let cas_rows: Vec<_> = inv
+        .experiments
+        .iter()
+        .filter_map(|e| e.cas_residue_filter().map(|f| (e, f)))
+        .collect();
+    if !cas_rows.is_empty() {
+        out.push_str("CAS Residue Filters:\n");
+        for (exp, f) in cas_rows {
+            let scope = match f.scope {
+                CasSelectionScope::Predecessor => "i-1",
+                CasSelectionScope::IntraAndPredecessor => "i,i-1",
+            };
+            out.push_str(&format!(
+                "  * {} -> {} ({}) [{}]: {}\n",
+                exp.relative_path,
+                exp.pulse_class.as_str(),
+                scope,
+                f.filter_tag,
+                f.residue_types.join(", ")
             ));
         }
         out.push('\n');

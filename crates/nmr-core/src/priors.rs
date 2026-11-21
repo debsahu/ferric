@@ -136,6 +136,24 @@ impl Default for Priors {
     }
 }
 
+/// Tertiary-imide `15N` chemical shift distribution for Proline in protonless `CON` / `13C`-detected
+/// IDP spectra (Tamiola, Acar & Mulder *JACS* 2010; Wishart et al. *J. Biomol. NMR* 1995).
+/// Used only in [`predict_aa_types_from_shifts_with_n`] when `allow_pro = true` and `Priors` omits
+/// `PRO.N` (e.g. `Priors::bmrb()`, which is trained on `1H`-detected amide entries).
+const PRO_IMIDE_N_PRIOR: (f64, f64) = (136.8, 3.5);
+
+/// Redox-resolved Cysteine `(CA, CB)` Gaussian components from Sharma & Rajarathnam (*J. Biomol. NMR*
+/// 2000, 18, 165–171), avoiding the unphysical `~33 ppm` valley created by pooling reduced (~28 ppm)
+/// and oxidized/disulfide (~41 ppm) `CYS.CB` shifts into a single wide Gaussian.
+const CYS_REDUCED_CA: (f64, f64) = (58.30, 3.10);
+const CYS_REDUCED_CB: (f64, f64) = (28.05, 2.20);
+const CYS_OXIDIZED_CA: (f64, f64) = (55.60, 3.10);
+const CYS_OXIDIZED_CB: (f64, f64) = (41.10, 3.20);
+const BMRB_CYS_POOLED_CA_MU: f64 = 58.470;
+const BMRB_CYS_POOLED_CA_SD: f64 = 3.371;
+const BMRB_CYS_POOLED_CB_MU: f64 = 32.948;
+const BMRB_CYS_POOLED_CB_SD: f64 = 6.199;
+
 impl Priors {
     /// Empirical BMRB backbone priors (`CA, CB, C, N, H`) trained on 21 disjoint BMRB entries.
     pub fn bmrb() -> Self {
@@ -506,6 +524,87 @@ impl Priors {
         (lp - self.background(atom, v)).max(floor)
     }
 
+    fn typing_llr_atom(&self, res: &str, atom: &str, v: f64, allow_pro_imide_n: bool) -> f64 {
+        if res == "PRO" && atom == "N" && allow_pro_imide_n && !self.has("PRO", "N") {
+            let dn = BMRB_BACKBONE_PRIORS
+                .get()
+                .and_then(|base| Some((self.get("ALA", "N")?, base.get("ALA", "N")?)))
+                .filter(|((_, sd), (_, bsd))| (sd - bsd).abs() < 1e-3)
+                .map(|((m, _), (bm, _))| m - bm)
+                .unwrap_or(0.0);
+            return (logpdf(v, PRO_IMIDE_N_PRIOR.0 + dn, PRO_IMIDE_N_PRIOR.1)
+                - self.background("N", v))
+            .max(-12.0);
+        }
+        self.llr(res, atom, v)
+    }
+
+    fn typing_cys_joint_llr(
+        &self,
+        n: Option<f64>,
+        ca: Option<f64>,
+        cb: Option<f64>,
+        c: Option<f64>,
+        allow_pro_imide_n: bool,
+    ) -> f64 {
+        let mut total = 0.0;
+        if let Some(vn) = n {
+            total += self.typing_llr_atom("CYS", "N", vn, allow_pro_imide_n);
+        }
+        if let Some(vc) = c {
+            total += self.typing_llr_atom("CYS", "C", vc, allow_pro_imide_n);
+        }
+        // Only split pooled wide Cys CB distributions (`sd >= 4.5`, e.g. BMRB 6.199 or fallback 5.5)
+        // into reduced (~28.05 ppm) and oxidized (~41.10 ppm) redox components; narrow custom priors
+        // are already redox-specific and pass through unchanged.
+        if let (Some(vcb), Some((mu_cb, sd_cb))) = (cb, self.get("CYS", "CB")) {
+            if sd_cb >= 4.5 {
+                let is_bmrb_frame = (sd_cb - BMRB_CYS_POOLED_CB_SD).abs() < 0.05;
+                let d_cb = if is_bmrb_frame {
+                    mu_cb - BMRB_CYS_POOLED_CB_MU
+                } else {
+                    0.0
+                };
+                let d_ca = if is_bmrb_frame {
+                    self.get("CYS", "CA")
+                        .filter(|&(_, s)| (s - BMRB_CYS_POOLED_CA_SD).abs() < 0.05)
+                        .map(|(m, _)| m - BMRB_CYS_POOLED_CA_MU)
+                        .unwrap_or(0.0)
+                } else {
+                    0.0
+                };
+                let bg_cb = self.background("CB", vcb);
+                let red_cb =
+                    (logpdf(vcb, CYS_REDUCED_CB.0 + d_cb, CYS_REDUCED_CB.1) - bg_cb).max(-12.0);
+                let ox_cb =
+                    (logpdf(vcb, CYS_OXIDIZED_CB.0 + d_cb, CYS_OXIDIZED_CB.1) - bg_cb).max(-12.0);
+                let (red_ca, ox_ca) = if let Some(vca) = ca {
+                    let bg_ca = self.background("CA", vca);
+                    (
+                        (logpdf(vca, CYS_REDUCED_CA.0 + d_ca, CYS_REDUCED_CA.1) - bg_ca).max(-12.0),
+                        (logpdf(vca, CYS_OXIDIZED_CA.0 + d_ca, CYS_OXIDIZED_CA.1) - bg_ca)
+                            .max(-12.0),
+                    )
+                } else {
+                    (0.0, 0.0)
+                };
+                let w = 0.5_f64.ln();
+                let lp_red = w + red_ca + red_cb;
+                let lp_ox = w + ox_ca + ox_cb;
+                let m = lp_red.max(lp_ox);
+                total += m + ((lp_red - m).exp() + (lp_ox - m).exp()).ln();
+                return total;
+            }
+        }
+        if let Some(vca) = ca {
+            total += self.typing_llr_atom("CYS", "CA", vca, allow_pro_imide_n);
+        }
+        if let Some(vcb) = cb {
+            total += self.typing_llr_atom("CYS", "CB", vcb, allow_pro_imide_n);
+        }
+        total
+    }
+
     /// Return a copy of `self` with backbone prior means shifted by `offsets` (`mu_shifted = mu + offset`),
     /// leaving standard deviations untouched so scoring matches the experimental spectrum's referencing frame.
     pub fn with_offsets(&self, offsets: &ShiftOffsets) -> Self {
@@ -525,6 +624,109 @@ impl Priors {
         }
         Self { table }
     }
+}
+
+/// Predict posterior amino-acid type probabilities from observed `(CA, CB, C)` chemical shifts.
+///
+/// Handles bimodal reduced (`~28.05 ppm`) vs oxidized (`~41.10 ppm`) Cysteine `CB` priors cleanly
+/// whenever the loaded `Priors` pools Cys into a wide distribution (`sd >= 4.5`), avoiding the
+/// artificial `~33 ppm` midpoint peak. Set `allow_pro = true` for protonless/CON-rooted systems.
+pub fn predict_aa_types_from_shifts(
+    priors: &Priors,
+    ca: Option<f64>,
+    cb: Option<f64>,
+    c: Option<f64>,
+    allow_pro: bool,
+    top_k: usize,
+) -> Vec<(String, f64)> {
+    predict_aa_types_from_shifts_with_n(priors, None, ca, cb, c, allow_pro, top_k)
+}
+
+/// Predict posterior amino-acid type probabilities from observed `(N, CA, CB, C)` chemical shifts.
+///
+/// When `allow_pro = true` (required for CON-rooted IDP spin systems where Proline tertiary-imide
+/// `15N` near `~136.8 ppm` is observed directly), Proline is included in the candidate set using
+/// `priors.get("PRO", "N")` or [`PRO_IMIDE_N_PRIOR`] when the `Priors` table omits `PRO.N`.
+/// Reduced (`~28 ppm`) vs oxidized (`~41 ppm`) Cysteine `CB` shifts are modeled as an explicit
+/// two-state redox mixture rather than a pooled `~32.9 ppm` Gaussian.
+pub fn predict_aa_types_from_shifts_with_n(
+    priors: &Priors,
+    n: Option<f64>,
+    ca: Option<f64>,
+    cb: Option<f64>,
+    c: Option<f64>,
+    allow_pro: bool,
+    top_k: usize,
+) -> Vec<(String, f64)> {
+    let n = n.filter(|v| v.is_finite());
+    let ca = ca.filter(|v| v.is_finite());
+    let cb = cb.filter(|v| v.is_finite());
+    let c = c.filter(|v| v.is_finite());
+    if n.is_none() && ca.is_none() && cb.is_none() && c.is_none() {
+        return Vec::new();
+    }
+
+    let mut scores: Vec<(&'static str, f64)> = Vec::with_capacity(STANDARD_RESIDUES.len());
+    for &(res, _) in &STANDARD_RESIDUES {
+        if res == "PRO" && !allow_pro {
+            continue;
+        }
+        let s = if res == "CYS" {
+            priors.typing_cys_joint_llr(n, ca, cb, c, allow_pro)
+        } else {
+            let mut sum = 0.0;
+            if let Some(vn) = n {
+                sum += priors.typing_llr_atom(res, "N", vn, allow_pro);
+            }
+            if let Some(vca) = ca {
+                sum += priors.typing_llr_atom(res, "CA", vca, allow_pro);
+            }
+            if let Some(vcb) = cb {
+                sum += priors.typing_llr_atom(res, "CB", vcb, allow_pro);
+            }
+            if let Some(vc) = c {
+                sum += priors.typing_llr_atom(res, "C", vc, allow_pro);
+            }
+            sum
+        };
+        scores.push((res, s));
+    }
+
+    if scores.is_empty() || top_k == 0 {
+        return Vec::new();
+    }
+    let max_s = scores
+        .iter()
+        .map(|(_, s)| *s)
+        .fold(f64::NEG_INFINITY, f64::max);
+    let mut probs: Vec<(String, f64)> = scores
+        .into_iter()
+        .map(|(res, s)| (res.to_string(), (s - max_s).exp()))
+        .collect();
+    let total: f64 = probs.iter().map(|(_, w)| *w).sum();
+    if total > 0.0 && total.is_finite() {
+        for (_, w) in &mut probs {
+            *w /= total;
+        }
+    }
+    probs.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    probs.truncate(top_k);
+    probs
+}
+
+/// Predict posterior amino-acid type candidates for a `2D CON`-rooted IDP spin system (`allow_pro = true`).
+///
+/// Protonless `CON` / `CANCO` / `CBCACON` experiments observe Proline `15N` directly, so `Pro` MUST
+/// remain allowed when typing either residue `i` (`N_i, CA_i, C'_i`) or residue `i-1` (`C'_{i-1}, CA_{i-1}, CB_{i-1}`).
+pub fn predict_aa_types_for_con_system(
+    priors: &Priors,
+    n: Option<f64>,
+    ca: Option<f64>,
+    cb: Option<f64>,
+    c: Option<f64>,
+    top_k: usize,
+) -> Vec<(String, f64)> {
+    predict_aa_types_from_shifts_with_n(priors, n, ca, cb, c, true, top_k)
 }
 
 /// Global chemical-shift referencing offsets `(experimental_ppm - dss_prior_ppm)` per backbone nucleus.
@@ -1924,5 +2126,82 @@ mod tests {
         let hel_drop =
             priors.llr("PHE", "CA", 63.59) - priors.llr_shifted("PHE", "CA", 63.59, phe_pro_ca);
         assert!(hel_drop < 1.95, "hel_drop={hel_drop}");
+    }
+
+    #[test]
+    fn test_bimodal_cys_cb_redox_typing_and_valley_suppression() {
+        let priors = Priors::bmrb();
+
+        // Reduced Cys (`CA=58.3, CB=28.05`) gets higher CYS posterior than pooled baseline
+        let red = predict_aa_types_from_shifts(&priors, Some(58.3), Some(28.05), None, false, 20);
+        let p_cys_red = red
+            .iter()
+            .find(|(r, _)| r == "CYS")
+            .map(|(_, p)| *p)
+            .unwrap_or(0.0);
+        assert!(
+            p_cys_red > 0.10,
+            "reduced Cys should receive strong probability near CB=28.05, got {p_cys_red:.4} (top={:?})",
+            &red[..5]
+        );
+
+        // Oxidized/disulfide Cys (`CA=55.6, CB=41.1`) stays competitive instead of collapsing
+        let ox = predict_aa_types_from_shifts(&priors, Some(55.6), Some(41.1), None, false, 20);
+        let p_cys_ox = ox
+            .iter()
+            .find(|(r, _)| r == "CYS")
+            .map(|(_, p)| *p)
+            .unwrap_or(0.0);
+        assert!(
+            p_cys_ox > 0.04,
+            "oxidized Cys should remain supported near CB=41.1, got {p_cys_ox:.4} (top={:?})",
+            &ox[..5]
+        );
+
+        // Unpopulated midpoint valley (`CB=33.0 ppm`) should NOT inflate CYS probability
+        let mid = predict_aa_types_from_shifts(&priors, Some(58.3), Some(33.0), None, false, 20);
+        let p_cys_mid = mid
+            .iter()
+            .find(|(r, _)| r == "CYS")
+            .map(|(_, p)| *p)
+            .unwrap_or(0.0);
+        assert!(
+            p_cys_mid < 0.025 && p_cys_red > 4.0 * p_cys_mid,
+            "midpoint CB=33.0 should stay suppressed (mid={p_cys_mid:.4}, red={p_cys_red:.4})"
+        );
+    }
+
+    #[test]
+    fn test_con_system_aa_typing_allows_proline() {
+        let priors = Priors::bmrb();
+
+        // Standard HN-rooted helper with `allow_pro=false` excludes PRO
+        let hn_preds = predict_aa_types_from_shifts_with_n(
+            &priors,
+            Some(136.8),
+            Some(63.4),
+            Some(32.1),
+            None,
+            false,
+            10,
+        );
+        assert!(
+            !hn_preds.iter().any(|(r, _)| r == "PRO"),
+            "allow_pro=false must exclude PRO, got {hn_preds:?}"
+        );
+
+        // CON-rooted IDP system with Pro imide `15N=136.8`, `CA=63.4`, `CB=32.1` predicts PRO #1
+        let con_preds =
+            predict_aa_types_for_con_system(&priors, Some(136.8), Some(63.4), Some(32.1), None, 5);
+        assert_eq!(con_preds[0].0, "PRO", "CON Pro prediction={con_preds:?}");
+        assert!(
+            con_preds[0].1 > 0.75,
+            "PRO posterior should dominate at N=136.8/CA=63.4/CB=32.1, got {con_preds:?}"
+        );
+
+        // Even `(N, CA)` alone from CANCO/CON (`N=136.8, CA=63.4`) ranks PRO first
+        let con_ca_only =
+            predict_aa_types_for_con_system(&priors, Some(136.8), Some(63.4), None, None, 5);
+        assert_eq!(con_ca_only[0].0, "PRO", "got {con_ca_only:?}");
     }
 }

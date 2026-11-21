@@ -25,9 +25,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use nmr_core::classify::{
     classify_nmr_entries, classify_nmr_workspace, extract_archive_full_entries_bounded,
-    extract_archive_virtual_entries, extract_archive_virtual_entries_bounded, DataState,
-    ExperimentDimensionality, ExperimentVendor, ProblemRegime, PulseSequenceClass, QuadratureKind,
-    VirtualEntry, WorkspaceInventory,
+    extract_archive_virtual_entries, extract_archive_virtual_entries_bounded, CasSelectionScope,
+    DataState, ExperimentDimensionality, ExperimentVendor, ProblemRegime, PulseSequenceClass,
+    QuadratureKind, VirtualEntry, WorkspaceInventory,
 };
 use nmr_core::service::{
     spawn_background_server, spawn_background_server_with_options, ServiceOptions,
@@ -2502,5 +2502,491 @@ fn test_v0150_p2_nucleus_inference_31p_1h_vs_13c_15n_and_fqlist_indirect_loop_ga
     assert_ne!(
         inv_sel_fq.experiments[0].pulse_class,
         PulseSequenceClass::Cest
+    );
+}
+
+#[test]
+fn test_rd3_clec16a_real_data_pulse_program_classes_and_axis_validation() {
+    #[allow(clippy::too_many_arguments)]
+    fn mk_acq(
+        pp: Option<&str>,
+        nuc: &str,
+        sfo1: f64,
+        bf1: f64,
+        sw: f64,
+        td: usize,
+        fnmode: usize,
+        nustd: usize,
+        fntype: usize,
+    ) -> Vec<u8> {
+        let pp_line = pp
+            .map(|p| format!("##$PULPROG= <{p}>\n##$FnTYPE= {fntype}\n"))
+            .unwrap_or_default();
+        format!(
+            "{pp_line}##$NUC1= <{nuc}>\n##$SFO1= {sfo1}\n##$BF1= {bf1}\n##$SW= {sw}\n##$TD= {td}\n##$FnMODE= {fnmode}\n##$NusTD= {nustd}\n##END=\n"
+        )
+        .into_bytes()
+    }
+
+    let mut entries = Vec::new();
+    // Generic CON must stay Con2D alongside CAS experiments (no duplicate Con2D merge!)
+    entries.push(VirtualEntry::new(
+        "01_con/acqus",
+        mk_acq(
+            Some("c_hcacon_ia"),
+            "13C",
+            201.258,
+            201.223,
+            11.83,
+            1024,
+            0,
+            0,
+            0,
+        ),
+    ));
+    entries.push(VirtualEntry::new(
+        "01_con/acqu2s",
+        mk_acq(None, "15N", 81.0987, 81.0886, 36.0, 128, 5, 128, 0),
+    ));
+    entries.push(VirtualEntry::header_only("01_con/ser", Vec::new(), 65536));
+
+    // 1. Amino-acid-selective CAS-CACON (ala, gly, ser, tavi) & CAS-CANCO (ala, gly, ser, tavi)
+    let cas_cases = [
+        (
+            "02_cacon_ala",
+            "c_cacon_ala_iasq_official.sas",
+            PulseSequenceClass::CasCacon2D,
+            CasSelectionScope::Predecessor,
+            "ALA",
+            vec!["ALA"],
+        ),
+        (
+            "03_cacon_gly",
+            "c_cacon_gly_iasq_official.sas",
+            PulseSequenceClass::CasCacon2D,
+            CasSelectionScope::Predecessor,
+            "GLY",
+            vec!["GLY"],
+        ),
+        (
+            "04_cacon_ser",
+            "c_cacon_ser_iasq_official.sas",
+            PulseSequenceClass::CasCacon2D,
+            CasSelectionScope::Predecessor,
+            "SER",
+            vec!["SER"],
+        ),
+        (
+            "05_cacon_tavi",
+            "c_cacon_tavi_iasq_official.sas",
+            PulseSequenceClass::CasCacon2D,
+            CasSelectionScope::Predecessor,
+            "TAVI",
+            vec!["THR", "ALA", "VAL", "ILE"],
+        ),
+        (
+            "06_canco_ala",
+            "c_canco_ala_iasq_official.sas",
+            PulseSequenceClass::CasCanco2D,
+            CasSelectionScope::IntraAndPredecessor,
+            "ALA",
+            vec!["ALA"],
+        ),
+        (
+            "07_canco_gly",
+            "c_canco_gly_iasq_official.sas",
+            PulseSequenceClass::CasCanco2D,
+            CasSelectionScope::IntraAndPredecessor,
+            "GLY",
+            vec!["GLY"],
+        ),
+        (
+            "08_canco_ser",
+            "c_canco_ser_iasq_official.sas",
+            PulseSequenceClass::CasCanco2D,
+            CasSelectionScope::IntraAndPredecessor,
+            "SER",
+            vec!["SER"],
+        ),
+        (
+            "09_canco_tavi",
+            "c_canco_tavi_iasq_official.sas",
+            PulseSequenceClass::CasCanco2D,
+            CasSelectionScope::IntraAndPredecessor,
+            "TAVI",
+            vec!["THR", "ALA", "VAL", "ILE"],
+        ),
+    ];
+    for (dir, pp, expected_cls, expected_scope, expected_tag, expected_aas) in &cas_cases {
+        entries.push(VirtualEntry::new(
+            format!("{dir}/acqus"),
+            mk_acq(Some(pp), "13C", 201.258, 201.223, 11.83, 1024, 0, 0, 0),
+        ));
+        entries.push(VirtualEntry::new(
+            format!("{dir}/acqu2s"),
+            mk_acq(None, "15N", 81.0987, 81.0886, 36.0, 128, 5, 128, 0),
+        ));
+        entries.push(VirtualEntry::header_only(
+            format!("{dir}/ser"),
+            Vec::new(),
+            65536,
+        ));
+        let _ = (expected_cls, expected_scope, expected_tag, expected_aas);
+    }
+
+    // 2. 13C-detected (H)N(CA)CON / (HACA)N(CA)CON N-N sequential correlation (`13C, 15N, 15N`) -> Hncacon3D
+    for (dir, pp) in [
+        ("10_hncacon", "c_hncacon_iare3d"),
+        ("11_hacancacon", "c_hacancacon_official_ia3d.sas"),
+    ] {
+        entries.push(VirtualEntry::new(
+            format!("{dir}/acqus"),
+            mk_acq(Some(pp), "13C", 201.258, 201.223, 11.83, 1024, 0, 0, 2),
+        ));
+        entries.push(VirtualEntry::new(
+            format!("{dir}/acqu2s"),
+            mk_acq(None, "15N", 81.0987, 81.0886, 36.0, 1280, 5, 128, 0),
+        ));
+        entries.push(VirtualEntry::new(
+            format!("{dir}/acqu3s"),
+            mk_acq(None, "15N", 81.0987, 81.0886, 36.0, 1, 5, 40, 0),
+        ));
+        entries.push(VirtualEntry::header_only(
+            format!("{dir}/ser"),
+            Vec::new(),
+            65536,
+        ));
+    }
+
+    // Negative control: 2D plane of `c_hncacon_iare3d` (`13C, 15N`) stays Con2D
+    entries.push(VirtualEntry::new(
+        "11b_hncacon_2d/acqus",
+        mk_acq(
+            Some("c_hncacon_iare3d"),
+            "13C",
+            201.258,
+            201.223,
+            11.83,
+            1024,
+            0,
+            0,
+            0,
+        ),
+    ));
+    entries.push(VirtualEntry::new(
+        "11b_hncacon_2d/acqu2s",
+        mk_acq(None, "15N", 81.0987, 81.0886, 36.0, 128, 5, 128, 0),
+    ));
+    entries.push(VirtualEntry::header_only(
+        "11b_hncacon_2d/ser",
+        Vec::new(),
+        65536,
+    ));
+
+    // 3. 13C-detected `(H)CC(CO)N` (`13C, 15N, 13C`) -> Cccon3D (NOT 1H-detected Hccconh!)
+    entries.push(VirtualEntry::new(
+        "12_hcccon/acqus",
+        mk_acq(
+            Some("c_hcccon_ia3d"),
+            "13C",
+            201.258,
+            201.223,
+            8.01,
+            1024,
+            0,
+            0,
+            2,
+        ),
+    ));
+    entries.push(VirtualEntry::new(
+        "12_hcccon/acqu2s",
+        mk_acq(None, "15N", 81.0987, 81.0886, 36.0, 1536, 5, 128, 0),
+    ));
+    entries.push(VirtualEntry::new(
+        "12_hcccon/acqu3s",
+        mk_acq(None, "13C", 201.232, 201.223, 79.88, 1, 5, 48, 0),
+    ));
+    entries.push(VirtualEntry::header_only(
+        "12_hcccon/ser",
+        Vec::new(),
+        65536,
+    ));
+
+    // Genuine 3D `c_canco_ia3d` (`13C, 15N, 13C`) must remain Canco3D
+    entries.push(VirtualEntry::new(
+        "13_canco/acqus",
+        mk_acq(
+            Some("c_canco_ia3d"),
+            "13C",
+            201.258,
+            201.223,
+            11.83,
+            1024,
+            0,
+            0,
+            0,
+        ),
+    ));
+    entries.push(VirtualEntry::new(
+        "13_canco/acqu2s",
+        mk_acq(None, "15N", 81.0987, 81.0886, 36.0, 64, 5, 0, 0),
+    ));
+    entries.push(VirtualEntry::new(
+        "13_canco/acqu3s",
+        mk_acq(None, "13C", 201.234, 201.223, 40.0, 64, 5, 0, 0),
+    ));
+    entries.push(VirtualEntry::header_only("13_canco/ser", Vec::new(), 65536));
+
+    // 4. `BT_HNCACONH` (`1H, 15N, 15N`) -> Hncaconh (NOT Hncaco!)
+    entries.push(VirtualEntry::new(
+        "14_bt_hnn/acqus",
+        mk_acq(
+            Some("BT_HNCACONH"),
+            "1H",
+            800.254,
+            800.25,
+            12.01,
+            1362,
+            0,
+            0,
+            2,
+        ),
+    ));
+    entries.push(VirtualEntry::new(
+        "14_bt_hnn/acqu2s",
+        mk_acq(None, "15N", 81.0982, 81.0886, 36.0, 4096, 6, 64, 0),
+    ));
+    entries.push(VirtualEntry::new(
+        "14_bt_hnn/acqu3s",
+        mk_acq(None, "15N", 81.0982, 81.0886, 36.0, 1, 5, 128, 0),
+    ));
+    entries.push(VirtualEntry::header_only(
+        "14_bt_hnn/ser",
+        Vec::new(),
+        65536,
+    ));
+
+    let inv = classify_nmr_entries(&entries);
+    assert_eq!(inv.problem_regime, ProblemRegime::GlobularBackbone);
+    assert!(inv
+        .secondary_regimes
+        .contains(&ProblemRegime::Idp13cDetected));
+
+    let by_path = |rel: &str| {
+        inv.experiments
+            .iter()
+            .find(|e| e.relative_path == rel)
+            .unwrap_or_else(|| panic!("missing experiment {rel}"))
+    };
+    assert_eq!(by_path("01_con").pulse_class, PulseSequenceClass::Con2D);
+    assert!(by_path("01_con").cas_residue_filter().is_none());
+
+    let con2d_count = inv
+        .experiments
+        .iter()
+        .filter(|e| e.pulse_class == PulseSequenceClass::Con2D)
+        .count();
+    assert_eq!(
+        con2d_count, 2,
+        "only generic CONs should be Con2D, never CAS"
+    );
+
+    for (dir, _, expected_cls, expected_scope, expected_tag, expected_aas) in &cas_cases {
+        let exp = by_path(dir);
+        assert_eq!(exp.pulse_class, *expected_cls, "{dir}");
+        assert_eq!(
+            exp.axes
+                .iter()
+                .map(|a| a.nucleus.as_str())
+                .collect::<Vec<_>>(),
+            vec!["13C", "15N"]
+        );
+        let f = exp.cas_residue_filter().expect("CAS filter metadata");
+        assert_eq!(f.scope, *expected_scope, "{dir}");
+        assert_eq!(f.filter_tag, *expected_tag, "{dir}");
+        assert_eq!(f.residue_types, *expected_aas, "{dir}");
+    }
+
+    for dir in ["10_hncacon", "11_hacancacon"] {
+        let exp = by_path(dir);
+        assert_eq!(exp.pulse_class, PulseSequenceClass::Hncacon3D, "{dir}");
+        assert_eq!(exp.pulse_class.canonical_solver_exp(), None);
+        assert_eq!(
+            exp.axes
+                .iter()
+                .map(|a| a.nucleus.as_str())
+                .collect::<Vec<_>>(),
+            vec!["13C", "15N", "15N"]
+        );
+    }
+    assert_eq!(
+        by_path("11b_hncacon_2d").pulse_class,
+        PulseSequenceClass::Con2D
+    );
+
+    let cccon = by_path("12_hcccon");
+    assert_eq!(cccon.pulse_class, PulseSequenceClass::Cccon3D);
+    assert_eq!(cccon.pulse_class.canonical_solver_exp(), Some("CCCON"));
+    assert!(cccon.pulse_class.is_13c_detected());
+    assert_eq!(
+        cccon
+            .axes
+            .iter()
+            .map(|a| a.nucleus.as_str())
+            .collect::<Vec<_>>(),
+        vec!["13C", "15N", "13C"]
+    );
+
+    assert_eq!(by_path("13_canco").pulse_class, PulseSequenceClass::Canco3D);
+
+    let hnn = by_path("14_bt_hnn");
+    assert_eq!(hnn.pulse_class, PulseSequenceClass::Hncaconh);
+    assert_eq!(
+        hnn.axes
+            .iter()
+            .map(|a| a.nucleus.as_str())
+            .collect::<Vec<_>>(),
+        vec!["1H", "15N", "15N"]
+    );
+
+    // Axis-mismatch protection (`RD-3`): `c_canco_ia3d` with wrong `13C, 15N, 15N` axes MUST NOT
+    // trust the `canco` substring to claim `Canco3D`!
+    let mismatched_inv = classify_nmr_entries(&[
+        VirtualEntry::new(
+            "bad_canco/acqus",
+            mk_acq(
+                Some("c_canco_ia3d"),
+                "13C",
+                201.258,
+                201.223,
+                11.83,
+                1024,
+                0,
+                0,
+                0,
+            ),
+        ),
+        VirtualEntry::new(
+            "bad_canco/acqu2s",
+            mk_acq(None, "15N", 81.0987, 81.0886, 36.0, 64, 5, 0, 0),
+        ),
+        VirtualEntry::new(
+            "bad_canco/acqu3s",
+            mk_acq(None, "15N", 81.0987, 81.0886, 36.0, 64, 5, 0, 0),
+        ),
+        VirtualEntry::header_only("bad_canco/ser", Vec::new(), 4096),
+    ]);
+    assert_ne!(
+        mismatched_inv.experiments[0].pulse_class,
+        PulseSequenceClass::Canco3D
+    );
+}
+
+#[test]
+fn test_rd6_and_rd9_nus_indirect_td_and_processed_axis_range_warnings() {
+    // RD-6: `b_hncogp3d.2` with Bruker NUS bookkeeping (`acqu2s TD=4096`, `acqu3s TD=1`)
+    // MUST derive indirect points from `NusTD`/`nuslist`/`proc SI` (NOT 4096 or 1), plus
+    // test fallback when `NusTD = 0` using `nuslist` col extents (`31, 63` -> `64, 128`).
+    let mut nuslist = String::new();
+    for i in 0..1024usize {
+        let a = (i * 7) % 32;
+        let b = (i * 11) % 64;
+        nuslist.push_str(&format!("{a} {b}\n"));
+    }
+
+    let inv_nustd = classify_nmr_entries(&[
+        VirtualEntry::new(
+            "hnco_nus/acqus",
+            b"##$PULPROG= <b_hncogp3d.2>\n##$FnTYPE= 2\n##$NUC1= <1H>\n##$SFO1= 800.25\n##$BF1= 800.25\n##$SW= 14.2\n##$TD= 698\n##$NusTD= 0\n".to_vec(),
+        ),
+        VirtualEntry::new(
+            "hnco_nus/acqu2s",
+            b"##$NUC1= <15N>\n##$SFO1= 81.09\n##$BF1= 81.0886\n##$SW= 35.0\n##$TD= 4096\n##$FnMODE= 6\n##$NusTD= 64\n".to_vec(),
+        ),
+        VirtualEntry::new(
+            "hnco_nus/acqu3s",
+            b"##$NUC1= <13C>\n##$SFO1= 201.258\n##$BF1= 201.223\n##$SW= 14.0\n##$TD= 1\n##$FnMODE= 5\n##$NusTD= 128\n".to_vec(),
+        ),
+        VirtualEntry::new("hnco_nus/nuslist", nuslist.as_bytes().to_vec()),
+        VirtualEntry::new("hnco_nus/pdata/1/procs", b"##$SI= 4096\n##$XDIM= 4\n##$SW_p= 11363.6\n##$SF= 800.25\n##$OFFSET= 11.8\n".to_vec()),
+        VirtualEntry::new("hnco_nus/pdata/1/proc2s", b"##$SI= 128\n##$XDIM= 8\n##$SW_p= 2838.4\n##$SF= 81.0886\n##$OFFSET= 134.5\n".to_vec()),
+        VirtualEntry::new("hnco_nus/pdata/1/proc3s", b"##$SI= 256\n##$XDIM= 8\n##$SW_p= 2817.6\n##$SF= 201.223\n##$OFFSET= 180.5\n".to_vec()),
+        VirtualEntry::header_only("hnco_nus/pdata/1/3rrr", Vec::new(), 4096),
+    ]);
+    let exp = &inv_nustd.experiments[0];
+    assert_eq!(exp.pulse_class, PulseSequenceClass::Hnco);
+    assert_eq!(exp.axes[0].points, 698);
+    assert_eq!(exp.axes[1].points, 64, "must NOT report acqu2s TD=4096");
+    assert_eq!(exp.axes[2].points, 128, "must NOT report acqu3s TD=1");
+    assert!(
+        exp.notes
+            .iter()
+            .any(|n| n.contains("procSI=128") && n.contains("procSI=256")),
+        "expected labeled NUS procSI note, got {:?}",
+        exp.notes
+    );
+    assert!(inv_nustd
+        .missing_input_hints
+        .iter()
+        .all(|h| !h.contains("Axis warning")));
+
+    // When `NusTD = 0`, falls back to `nuslist` col extents (`31, 63` -> `64, 128`)
+    let inv_nl = classify_nmr_entries(&[
+        VirtualEntry::new(
+            "hnco_nl/acqus",
+            b"##$PULPROG= <b_hncogp3d.2>\n##$FnTYPE= 2\n##$NUC1= <1H>\n##$SFO1= 800.25\n##$BF1= 800.25\n##$SW= 14.2\n##$TD= 698\n".to_vec(),
+        ),
+        VirtualEntry::new(
+            "hnco_nl/acqu2s",
+            b"##$NUC1= <15N>\n##$SFO1= 81.09\n##$SW= 35.0\n##$TD= 4096\n##$FnMODE= 6\n##$NusTD= 0\n".to_vec(),
+        ),
+        VirtualEntry::new(
+            "hnco_nl/acqu3s",
+            b"##$NUC1= <13C>\n##$SFO1= 201.258\n##$SW= 14.0\n##$TD= 1\n##$FnMODE= 5\n##$NusTD= 0\n".to_vec(),
+        ),
+        VirtualEntry::new("hnco_nl/nuslist", nuslist.into_bytes()),
+        VirtualEntry::header_only("hnco_nl/ser", Vec::new(), 4096),
+    ]);
+    assert_eq!(inv_nl.experiments[0].axes[1].points, 64);
+    assert_eq!(inv_nl.experiments[0].axes[2].points, 128);
+
+    // RD-9: `c_hcccon_ia3d` where `proc3s` left `SF = BF1` and `OFFSET = 211.95` (carrier 172 ppm)
+    let inv_bad_ref = classify_nmr_entries(&[
+        VirtualEntry::new(
+            "cccon_badref/acqus",
+            b"##$PULPROG= <c_hcccon_ia3d>\n##$FnTYPE= 2\n##$NUC1= <13C>\n##$SFO1= 201.2576\n##$BF1= 201.22302255\n##$SW= 8.01\n##$TD= 1024\n".to_vec(),
+        ),
+        VirtualEntry::new(
+            "cccon_badref/acqu2s",
+            b"##$NUC1= <15N>\n##$SFO1= 81.09868\n##$BF1= 81.08862828\n##$SW= 35.99\n##$TD= 1536\n##$NusTD= 128\n##$FnMODE= 5\n".to_vec(),
+        ),
+        VirtualEntry::new(
+            "cccon_badref/acqu3s",
+            b"##$NUC1= <13C>\n##$SFO1= 201.25763\n##$BF1= 201.22302255\n##$SW= 79.88\n##$TD= 1\n##$NusTD= 48\n##$FnMODE= 5\n".to_vec(),
+        ),
+        VirtualEntry::new("cccon_badref/pdata/1/procs", b"##$SI= 2048\n##$XDIM= 4\n##$SW_p= 1612.9\n##$SF= 201.22302255\n##$OFFSET= 176.0\n".to_vec()),
+        VirtualEntry::new("cccon_badref/pdata/1/proc2s", b"##$SI= 256\n##$XDIM= 8\n##$SW_p= 2918.9\n##$SF= 81.08862828\n##$OFFSET= 142.0\n".to_vec()),
+        VirtualEntry::new("cccon_badref/pdata/1/proc3s", b"##$SI= 128\n##$XDIM= 8\n##$SW_p= 16077.17\n##$SF= 201.22302255\n##$OFFSET= 211.9486\n".to_vec()),
+        VirtualEntry::header_only("cccon_badref/pdata/1/3rrr", Vec::new(), 4096),
+    ]);
+    assert_eq!(
+        inv_bad_ref.experiments[0].pulse_class,
+        PulseSequenceClass::Cccon3D
+    );
+    assert!(
+        inv_bad_ref.experiments[0]
+            .notes
+            .iter()
+            .any(|n| n.contains("Axis warning (F1)") && n.contains("SR/SF")),
+        "expected RD-9 axis warning on F1, notes={:?}",
+        inv_bad_ref.experiments[0].notes
+    );
+    assert!(
+        inv_bad_ref
+            .missing_input_hints
+            .iter()
+            .any(|h| h.contains("cccon_badref") && h.contains("SF == BF")),
+        "hints={:?}",
+        inv_bad_ref.missing_input_hints
     );
 }

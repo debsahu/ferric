@@ -5432,3 +5432,108 @@ fn test_condition3_real_3_cubes_raw_ln_bf_miscalibration_vs_plausibility_gates()
         );
     }
 }
+
+#[test]
+fn test_rd3_pulprog_graph_deduces_hncacon3d_cccon3d_and_hncaconh() {
+    let acqus_c = "\
+##$PULPROG= <c_hncacon_iare3d>\n\
+##$PARMODE= 2\n\
+##$AQSEQ= 0\n\
+##$FnTYPE= 0\n\
+##$SFO1= 201.258\n##$BF1= 201.223\n##$O1= 35000.0\n\
+##$SFO2= 201.232\n##$BF2= 201.223\n##$O2= 11000.0\n\
+##$SFO3= 81.099\n##$BF3= 81.089\n##$O3= 9900.0\n\
+##$NUC1= <13C>\n##$NUC2= <13C>\n##$NUC3= <15N>\n##END=\n";
+    let acqu_n = "\
+##$NUC1= <15N>\n##$SFO1= 81.099\n##$BF1= 81.089\n##$SW= 36.0\n##$TD= 64\n##$FnMODE= 5\n##END=\n";
+    let pp_hncacon = ";(H)N(CA)CON\n1 ze\n2 d1\nd0\nd10\ngo=2 ph31\n";
+    let pi_nn = interpret_bruker_experiment(&BrukerExperimentInputs {
+        acqus_text: acqus_c,
+        acqu2s_text: Some(acqu_n),
+        acqu3s_text: Some(acqu_n),
+        acqu4s_text: None,
+        pulseprogram_text: Some(pp_hncacon),
+        nuslist_text: None,
+        vdlist_text: None,
+        vclist_text: None,
+        fqlist_text: None,
+        difflist_text: None,
+        local_includes: HashMap::new(),
+    })
+    .expect("c_hncacon_iare3d");
+    assert_eq!(
+        pi_nn.transfer_graph.deduced_family,
+        PulprogSequenceFamily::Hncacon3D
+    );
+    assert_eq!(
+        pi_nn
+            .transfer_graph
+            .deduced_family
+            .to_pulse_sequence_class(),
+        PulseSequenceClass::Hncacon3D
+    );
+
+    let acqu_c = "\
+##$NUC1= <13C>\n##$SFO1= 201.232\n##$BF1= 201.223\n##$SW= 80.0\n##$TD= 48\n##$FnMODE= 5\n##END=\n";
+    let pp_hcccon = ";(H)CC(CO)N\n1 ze\n2 d1\ndipsi2 ph1\nd0\nd10\ngo=2 ph31\n";
+    let pi_cccon = interpret_bruker_experiment(&BrukerExperimentInputs {
+        acqus_text: acqus_c,
+        acqu2s_text: Some(acqu_n),
+        acqu3s_text: Some(acqu_c),
+        acqu4s_text: None,
+        pulseprogram_text: Some(pp_hcccon),
+        nuslist_text: None,
+        vdlist_text: None,
+        vclist_text: None,
+        fqlist_text: None,
+        difflist_text: None,
+        local_includes: HashMap::new(),
+    })
+    .expect("c_hcccon_ia3d");
+    assert_eq!(
+        pi_cccon.transfer_graph.deduced_family,
+        PulprogSequenceFamily::Cccon3D
+    );
+    assert_eq!(
+        pi_cccon
+            .transfer_graph
+            .deduced_family
+            .to_pulse_sequence_class(),
+        PulseSequenceClass::Cccon3D
+    );
+
+    let acqus_h = "\
+##$PULPROG= <BT_HNCACONH>\n\
+##$PARMODE= 2\n\
+##$AQSEQ= 0\n\
+##$FnTYPE= 0\n\
+##$SFO1= 800.254\n##$BF1= 800.250\n##$O1= 3760.0\n\
+##$SFO2= 201.232\n##$BF2= 201.223\n##$O2= 11000.0\n\
+##$SFO3= 81.098\n##$BF3= 81.089\n##$O3= 9500.0\n\
+##$NUC1= <1H>\n##$NUC2= <13C>\n##$NUC3= <15N>\n##END=\n";
+    let pi_hnn = interpret_bruker_experiment(&BrukerExperimentInputs {
+        acqus_text: acqus_h,
+        acqu2s_text: Some(acqu_n),
+        acqu3s_text: Some(acqu_n),
+        acqu4s_text: None,
+        pulseprogram_text: Some(";H-N-N\n1 ze\n2 d1\nd0\nd10\ngo=2 ph31\n"),
+        nuslist_text: None,
+        vdlist_text: None,
+        vclist_text: None,
+        fqlist_text: None,
+        difflist_text: None,
+        local_includes: HashMap::new(),
+    })
+    .expect("BT_HNCACONH");
+    assert_eq!(
+        pi_hnn.transfer_graph.deduced_family,
+        PulprogSequenceFamily::Hncaconh
+    );
+    assert_eq!(
+        pi_hnn
+            .transfer_graph
+            .deduced_family
+            .to_pulse_sequence_class(),
+        PulseSequenceClass::Hncaconh
+    );
+}

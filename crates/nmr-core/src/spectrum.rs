@@ -8,6 +8,7 @@
 //!   UCSF NMR Data Format*, University of California, San Francisco: 180-byte global header,
 //!   128-byte big-endian axis headers, and zero-padded big-endian IEEE 754 `f32` data tiles).
 
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{BufReader, BufWriter, Read, Write};
@@ -596,29 +597,115 @@ pub fn resolve_bruker_pdata_dir(base: &Path, bin_name: &str) -> std::path::PathB
     base.to_path_buf()
 }
 
-fn read_sibling_bruker_acqu_nuc1(pdata_dir: &Path, acqu_filename: &str) -> Option<String> {
-    let candidates = [
-        pdata_dir.join(acqu_filename),
-        pdata_dir
-            .parent()
-            .and_then(|p| p.parent())
-            .map(|p| p.join(acqu_filename))
-            .unwrap_or_default(),
-    ];
+fn read_sibling_bruker_acqu_params(
+    pdata_dir: &Path,
+    acqu_filename: &str,
+    fallback_filename: &str,
+) -> Option<HashMap<String, String>> {
+    let mut candidates = Vec::with_capacity(4);
+    candidates.push(pdata_dir.join(acqu_filename));
+    candidates.push(pdata_dir.join(fallback_filename));
+    if let Some(exp_dir) = pdata_dir.parent().and_then(|p| p.parent()) {
+        candidates.push(exp_dir.join(acqu_filename));
+        candidates.push(exp_dir.join(fallback_filename));
+    }
     for cand in candidates {
-        if !cand.as_os_str().is_empty() && cand.is_file() {
+        if cand.is_file() {
             if let Ok(txt) = fs::read_to_string(&cand) {
-                let map = parse_jcamp_params(&txt);
-                if let Some(nuc) = map
-                    .get("NUC1")
-                    .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("off"))
-                {
-                    return Some(nuc.clone());
-                }
+                return Some(parse_jcamp_params(&txt));
             }
         }
     }
     None
+}
+
+fn read_sibling_bruker_acqu_nuc1(pdata_dir: &Path, acqu_filename: &str) -> Option<String> {
+    let fallback = acqu_filename.trim_end_matches('s');
+    let map = read_sibling_bruker_acqu_params(pdata_dir, acqu_filename, fallback)?;
+    map.get("NUC1")
+        .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("off"))
+        .cloned()
+}
+
+/// Validate a processed Bruker `procNs` `SF` (and scale) against its sibling `acquNs` `BF1` (`±1%`).
+///
+/// When `SF` fails the `±1%` consistency check against `BF1` (or `OFFSET`/`SW` are corrupt, as seen on
+/// real `BT_HNCACONH` cubes), rebuilds the axis scale from `acquNs` (`carrier = (SFO1 - BF1) / BF1 * 1e6`,
+/// `SW`) while retaining the processed point count `SI`, and returns a diagnostic warning (`RD-12`).
+pub fn reconcile_bruker_proc_axis_with_acqu(
+    axis: &mut AxisPpm,
+    proc_params: &HashMap<String, String>,
+    acqu_params: &HashMap<String, String>,
+    axis_label: &str,
+) -> Option<String> {
+    if !has_explicit_bruker_axnuc(proc_params) {
+        if let Some(nuc) = acqu_params
+            .get("NUC1")
+            .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("off"))
+        {
+            axis.label = nuc.clone();
+        }
+    }
+
+    let bf1 = acqu_params
+        .get("BF1")
+        .or_else(|| acqu_params.get("SFO1"))
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|v| v.is_finite() && *v > 1.0)?;
+    let sfo1 = acqu_params
+        .get("SFO1")
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|v| v.is_finite() && *v > 1.0)
+        .unwrap_or(bf1);
+
+    let proc_sf = proc_params
+        .get("SF")
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(0.0);
+    let proc_offset = proc_params
+        .get("OFFSET")
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(f64::NAN);
+
+    let sf_ok = proc_sf.is_finite() && proc_sf > 1.0 && ((proc_sf - bf1).abs() / bf1) <= 0.01;
+    let offset_ok = proc_offset.is_finite()
+        && proc_offset.abs() <= 1000.0
+        && axis.step_ppm.is_finite()
+        && axis.sw_ppm() > 0.0
+        && axis.sw_ppm() <= 500.0;
+    if sf_ok && offset_ok {
+        return None;
+    }
+
+    let carrier = (sfo1 - bf1) / bf1 * 1.0e6;
+    let sw_ppm = acqu_params
+        .get("SW")
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|&w| w.is_finite() && w > 0.0)
+        .or_else(|| {
+            acqu_params
+                .get("SW_h")
+                .and_then(|v| v.parse::<f64>().ok())
+                .map(|hz| hz / bf1)
+        })
+        .or_else(|| {
+            proc_params
+                .get("SW_p")
+                .and_then(|v| v.parse::<f64>().ok())
+                .map(|hz| hz / bf1)
+        })
+        .filter(|&w| w.is_finite() && w > 0.0 && w <= 500.0)
+        .unwrap_or_else(|| axis.sw_ppm());
+
+    let n = axis.size.max(1);
+    axis.first_ppm = carrier + 0.5 * sw_ppm;
+    axis.step_ppm = -sw_ppm / (n as f64);
+    axis.obs_mhz = sfo1;
+
+    Some(format!(
+        "RD-12: {axis_label} ({}) proc SF={proc_sf:.6} MHz (OFFSET={proc_offset:.3}) invalid vs acqu BF1={bf1:.6} MHz (±1%); rebuilt from acquNs (carrier={carrier:.3} ppm, SW={sw_ppm:.3} ppm)",
+        axis.label
+    ))
 }
 
 /// Decode a Bruker TopSpin 2D processed dataset directly from in-memory `procs`, `proc2s`, and `2rr` byte slices.
@@ -673,8 +760,11 @@ pub fn read_bruker_pdata_2d_from_bytes(
     })
 }
 
-/// Read a Bruker TopSpin 2D processed directory (containing `procs`, `proc2s`, and `2rr`, or its parent `<expno>`).
-pub fn read_bruker_pdata_2d(pdata_dir: impl AsRef<Path>) -> Result<Spectrum2D, String> {
+/// Read a Bruker TopSpin 2D processed directory (`procs`, `proc2s`, and `2rr`, or its parent `<expno>`),
+/// reconciling corrupt `procNs SF` against sibling `acquNs BF1 (±1%)` and returning any warnings.
+pub fn read_bruker_pdata_2d_with_warnings(
+    pdata_dir: impl AsRef<Path>,
+) -> Result<(Spectrum2D, Vec<String>), String> {
     let dir = resolve_bruker_pdata_dir(pdata_dir.as_ref(), "2rr");
     let procs_txt = fs::read_to_string(dir.join("procs"))
         .map_err(|e| format!("failed to read {}: {e}", dir.join("procs").display()))?;
@@ -716,6 +806,26 @@ pub fn read_bruker_pdata_2d(pdata_dir: impl AsRef<Path>) -> Result<Spectrum2D, S
             acq1.as_deref(),
             acq2.as_deref(),
         );
+    }
+    let mut warnings = Vec::new();
+    if let Some(a1) = read_sibling_bruker_acqu_params(&dir, "acqus", "acqu") {
+        if let Some(w) = reconcile_bruker_proc_axis_with_acqu(&mut spec.axis_x, &p1, &a1, "X/F2") {
+            warnings.push(w);
+        }
+    }
+    if let Some(a2) = read_sibling_bruker_acqu_params(&dir, "acqu2s", "acqu2") {
+        if let Some(w) = reconcile_bruker_proc_axis_with_acqu(&mut spec.axis_y, &p2, &a2, "Y/F1") {
+            warnings.push(w);
+        }
+    }
+    Ok((spec, warnings))
+}
+
+/// Read a Bruker TopSpin 2D processed directory (containing `procs`, `proc2s`, and `2rr`, or its parent `<expno>`).
+pub fn read_bruker_pdata_2d(pdata_dir: impl AsRef<Path>) -> Result<Spectrum2D, String> {
+    let (spec, warnings) = read_bruker_pdata_2d_with_warnings(pdata_dir)?;
+    for w in &warnings {
+        eprintln!("[nmr-core::spectrum warning] {w}");
     }
     Ok(spec)
 }
@@ -892,8 +1002,12 @@ fn read_bruker_pdata_3d_from_reader<R: Read>(
     })
 }
 
-/// Read a Bruker TopSpin 3D processed directory (`procs`, `proc2s`, `proc3s`, and `3rrr`, or its parent `<expno>`).
-pub fn read_bruker_pdata_3d(pdata_dir: impl AsRef<Path>, exp: &str) -> Result<Spectrum3D, String> {
+/// Read a Bruker TopSpin 3D processed directory (`procs`, `proc2s`, `proc3s`, and `3rrr`, or its parent `<expno>`),
+/// reconciling corrupt `procNs SF` against sibling `acquNs BF1 (±1%)` and returning any warnings.
+pub fn read_bruker_pdata_3d_with_warnings(
+    pdata_dir: impl AsRef<Path>,
+    exp: &str,
+) -> Result<(Spectrum3D, Vec<String>), String> {
     let dir = resolve_bruker_pdata_dir(pdata_dir.as_ref(), "3rrr");
     let procs_txt =
         fs::read_to_string(dir.join("procs")).map_err(|e| format!("failed to read procs: {e}"))?;
@@ -912,7 +1026,7 @@ pub fn read_bruker_pdata_3d(pdata_dir: impl AsRef<Path>, exp: &str) -> Result<Sp
         .file_name()
         .and_then(|s| s.to_str())
         .unwrap_or("3rrr");
-    read_bruker_pdata_3d_from_reader(
+    let mut spec = read_bruker_pdata_3d_from_reader(
         name,
         exp,
         &procs_txt,
@@ -920,7 +1034,37 @@ pub fn read_bruker_pdata_3d(pdata_dir: impl AsRef<Path>, exp: &str) -> Result<Sp
         &proc3s_txt,
         total_len,
         reader,
-    )
+    )?;
+
+    let p1 = parse_jcamp_params(&procs_txt);
+    let p2 = parse_jcamp_params(&proc2s_txt);
+    let p3 = parse_jcamp_params(&proc3s_txt);
+    let mut warnings = Vec::new();
+    if let Some(a1) = read_sibling_bruker_acqu_params(&dir, "acqus", "acqu") {
+        if let Some(w) = reconcile_bruker_proc_axis_with_acqu(&mut spec.axis_x, &p1, &a1, "X/F3") {
+            warnings.push(w);
+        }
+    }
+    if let Some(a2) = read_sibling_bruker_acqu_params(&dir, "acqu2s", "acqu2") {
+        if let Some(w) = reconcile_bruker_proc_axis_with_acqu(&mut spec.axis_y, &p2, &a2, "Y/F2") {
+            warnings.push(w);
+        }
+    }
+    if let Some(a3) = read_sibling_bruker_acqu_params(&dir, "acqu3s", "acqu3") {
+        if let Some(w) = reconcile_bruker_proc_axis_with_acqu(&mut spec.axis_z, &p3, &a3, "Z/F1") {
+            warnings.push(w);
+        }
+    }
+    Ok((spec, warnings))
+}
+
+/// Read a Bruker TopSpin 3D processed directory (`procs`, `proc2s`, `proc3s`, and `3rrr`, or its parent `<expno>`).
+pub fn read_bruker_pdata_3d(pdata_dir: impl AsRef<Path>, exp: &str) -> Result<Spectrum3D, String> {
+    let (spec, warnings) = read_bruker_pdata_3d_with_warnings(pdata_dir, exp)?;
+    for w in &warnings {
+        eprintln!("[nmr-core::spectrum warning] {w}");
+    }
+    Ok(spec)
 }
 
 /// Write a Bruker TopSpin 3D processed directory (`procs`, `proc2s`, `proc3s`, `3rrr`) for round-trip export.
@@ -1952,6 +2096,338 @@ pub fn write_ucsf_3d_tiled(
         .map_err(|e| format!("flush error {}: {e}", p.display()))
 }
 
+// ============================================================================
+// Processed axis chemical-shift window sanity checking (`RD-9`)
+// ============================================================================
+
+/// Expected chemical-shift window (in ppm) for a spectral axis in a specific experiment class.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct AxisShiftWindow {
+    pub min_ppm: f64,
+    pub max_ppm: f64,
+    pub label: &'static str,
+}
+
+/// Diagnostic warning emitted when a processed spectral axis misses its expected chemical-shift window.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AxisRangeWarning {
+    pub axis_label: String,
+    pub nucleus: String,
+    pub observed_min_ppm: f64,
+    pub observed_max_ppm: f64,
+    pub expected_min_ppm: f64,
+    pub expected_max_ppm: f64,
+    pub expected_label: String,
+    pub miss_ppm: f64,
+    pub message: String,
+}
+
+fn canonical_sanity_nucleus(raw: &str) -> &'static str {
+    let up = raw
+        .trim()
+        .trim_matches(|c| c == '<' || c == '>')
+        .to_ascii_uppercase();
+    if up == "1H" || up == "H1" || up == "H" || up == "HN" || up.starts_with("1H") {
+        "1H"
+    } else if up == "15N" || up == "N15" || up == "N" || up == "NH" || up.starts_with("15N") {
+        "15N"
+    } else if up == "13C"
+        || up == "C13"
+        || up == "C"
+        || up == "CA"
+        || up == "CB"
+        || up == "CAB"
+        || up == "CO"
+        || up == "C'"
+        || up.starts_with("13C")
+    {
+        "13C"
+    } else {
+        ""
+    }
+}
+
+/// Return the expected processed chemical-shift window for `(axis_index, nucleus)` given
+/// the experiment/class name (`PulseSequenceClass::as_str()`, `canonical_solver_exp()`, or `Spectrum3D.exp`).
+pub fn expected_axis_shift_window(
+    exp_or_class: &str,
+    axis_index: usize,
+    total_axes: usize,
+    nucleus: &str,
+) -> Option<AxisShiftWindow> {
+    let nuc = canonical_sanity_nucleus(nucleus);
+    let key: String = exp_or_class
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .map(|c| c.to_ascii_uppercase())
+        .collect();
+
+    match nuc {
+        "1H" => {
+            if matches!(
+                key.as_str(),
+                "N15HSQC"
+                    | "HSQC"
+                    | "C13HSQC"
+                    | "C13HMQC"
+                    | "HNCO"
+                    | "HNCACO"
+                    | "HNCACONH"
+                    | "HNCOCANH"
+                    | "HNN"
+                    | "HNCA"
+                    | "HNCOCA"
+                    | "HNCACB"
+                    | "CBCACONH"
+                    | "CCCONH"
+                    | "HCCCONH"
+                    | "HCCHTOCSY"
+                    | "N15NOESY"
+                    | "C13NOESY"
+                    | "RELAXR1"
+                    | "RELAXR2"
+                    | "HETNOE"
+                    | "CPMG"
+                    | "CEST"
+            ) {
+                Some(AxisShiftWindow {
+                    min_ppm: -2.0,
+                    max_ppm: 16.0,
+                    label: "1H",
+                })
+            } else {
+                None
+            }
+        }
+        "15N" => {
+            if matches!(
+                key.as_str(),
+                "N15HSQC"
+                    | "HSQC"
+                    | "HNCO"
+                    | "HNCACO"
+                    | "HNCACONH"
+                    | "HNCOCANH"
+                    | "HNN"
+                    | "HNCA"
+                    | "HNCOCA"
+                    | "HNCACB"
+                    | "CBCACONH"
+                    | "CCCONH"
+                    | "HCCCONH"
+                    | "N15NOESY"
+                    | "CON2D"
+                    | "CON"
+                    | "CASCACON2D"
+                    | "CASCANCO2D"
+                    | "CANCO3D"
+                    | "CANCO"
+                    | "CBCACO3D"
+                    | "CBCACON"
+                    | "CBCACO"
+                    | "HNCACON3D"
+                    | "HNCACON"
+                    | "CCCON3D"
+                    | "CCCON"
+                    | "NCACO"
+                    | "NCACO3D"
+                    | "RELAXR1"
+                    | "RELAXR2"
+                    | "HETNOE"
+                    | "CPMG"
+                    | "CEST"
+            ) {
+                Some(AxisShiftWindow {
+                    min_ppm: 95.0,
+                    max_ppm: 145.0,
+                    label: "amide 15N",
+                })
+            } else {
+                None
+            }
+        }
+        "13C" => match key.as_str() {
+            "HNCO" | "HNCACO" | "CON2D" | "CON" | "CASCACON2D" | "CASCANCO2D" | "HNCACON3D"
+            | "HNCACON" => Some(AxisShiftWindow {
+                min_ppm: 165.0,
+                max_ppm: 185.0,
+                label: "carbonyl 13C'",
+            }),
+            "HNCA" | "HNCOCA" | "HNCACB" | "CBCACONH" | "CCCONH" | "HCCCONH" | "HCCHTOCSY"
+            | "C13HMQC" => Some(AxisShiftWindow {
+                min_ppm: -5.0,
+                max_ppm: 90.0,
+                label: "aliphatic 13C",
+            }),
+            "C13HSQC" | "C13NOESY" => Some(AxisShiftWindow {
+                min_ppm: -5.0,
+                max_ppm: 150.0,
+                label: "13C aliphatic/aromatic",
+            }),
+            "CACO2D" | "CACO" | "CANCO3D" | "CANCO" | "CBCACO3D" | "CBCACON" | "CBCACO"
+            | "CCCON3D" | "CCCON" | "NCACO" | "NCACO3D" => {
+                if total_axes >= 2 && axis_index == 0 {
+                    Some(AxisShiftWindow {
+                        min_ppm: 165.0,
+                        max_ppm: 185.0,
+                        label: "carbonyl 13C'",
+                    })
+                } else {
+                    Some(AxisShiftWindow {
+                        min_ppm: -5.0,
+                        max_ppm: 90.0,
+                        label: "aliphatic 13C",
+                    })
+                }
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Check a single processed spectral axis range `[obs_min_ppm, obs_max_ppm]` against the
+/// expected window for `(exp_or_class, axis_index, total_axes, nucleus)`.
+///
+/// Emits a warning whenever coordinates are non-finite / corrupt or when the processed interval
+/// is disjoint from the expected window by more than half the axis sweep width (`gap > 0.5 * width`),
+/// suggesting an `SR`/`SF` referencing check.
+#[allow(clippy::too_many_arguments)]
+pub fn check_axis_shift_window(
+    axis_index: usize,
+    total_axes: usize,
+    axis_label: &str,
+    nucleus: &str,
+    obs_min_ppm: f64,
+    obs_max_ppm: f64,
+    exp_or_class: &str,
+    sf_equals_bf: Option<bool>,
+) -> Option<AxisRangeWarning> {
+    let expected = expected_axis_shift_window(exp_or_class, axis_index, total_axes, nucleus)?;
+    let (obs_min, obs_max) = if obs_min_ppm <= obs_max_ppm {
+        (obs_min_ppm, obs_max_ppm)
+    } else {
+        (obs_max_ppm, obs_min_ppm)
+    };
+    let width = obs_max - obs_min;
+    if !obs_min.is_finite()
+        || !obs_max.is_finite()
+        || width <= 0.0
+        || width > 500.0
+        || obs_min.abs() > 1000.0
+        || obs_max.abs() > 1000.0
+    {
+        return Some(AxisRangeWarning {
+            axis_label: axis_label.to_string(),
+            nucleus: nucleus.to_string(),
+            observed_min_ppm: obs_min,
+            observed_max_ppm: obs_max,
+            expected_min_ppm: expected.min_ppm,
+            expected_max_ppm: expected.max_ppm,
+            expected_label: expected.label.to_string(),
+            miss_ppm: f64::INFINITY,
+            message: format!(
+                "processed {axis_label} ({nucleus}) scale [{obs_min:.3}..{obs_max:.3} ppm] is invalid or corrupt vs expected {} window [{:.0}..{:.0} ppm] (check SF/SR/OFFSET referencing parameters)",
+                expected.label, expected.min_ppm, expected.max_ppm
+            ),
+        });
+    }
+
+    let gap = if obs_max < expected.min_ppm {
+        expected.min_ppm - obs_max
+    } else if obs_min > expected.max_ppm {
+        obs_min - expected.max_ppm
+    } else {
+        0.0
+    };
+    if gap > 0.5 * width {
+        let ref_hint = if sf_equals_bf == Some(true) {
+            "SF == BF with unadjusted carrier offset; likely missing SR/SF referencing error"
+        } else {
+            "likely SR/SF referencing or carrier offset error"
+        };
+        return Some(AxisRangeWarning {
+            axis_label: axis_label.to_string(),
+            nucleus: nucleus.to_string(),
+            observed_min_ppm: obs_min,
+            observed_max_ppm: obs_max,
+            expected_min_ppm: expected.min_ppm,
+            expected_max_ppm: expected.max_ppm,
+            expected_label: expected.label.to_string(),
+            miss_ppm: gap,
+            message: format!(
+                "processed {axis_label} ({nucleus}) window [{obs_min:.1}..{obs_max:.1} ppm] misses expected {} window [{:.0}..{:.0} ppm] by {gap:.1} ppm ({ref_hint})",
+                expected.label, expected.min_ppm, expected.max_ppm
+            ),
+        });
+    }
+    None
+}
+
+/// Check all axes of a processed [`Spectrum2D`] against expected shift windows (`exp_or_class`
+/// defaults to `spec.name` when `None`).
+pub fn check_spectrum2d_axis_ranges(
+    spec: &Spectrum2D,
+    exp_or_class: Option<&str>,
+) -> Vec<AxisRangeWarning> {
+    let cls = exp_or_class.unwrap_or(&spec.name);
+    let axes = [(&spec.axis_x, "X/F2"), (&spec.axis_y, "Y/F1")];
+    axes.into_iter()
+        .enumerate()
+        .filter_map(|(idx, (ax, fallback))| {
+            let lbl = if ax.label.is_empty() {
+                fallback
+            } else {
+                ax.label.as_str()
+            };
+            check_axis_shift_window(
+                idx,
+                2,
+                lbl,
+                &ax.label,
+                ax.min_ppm(),
+                ax.max_ppm(),
+                cls,
+                None,
+            )
+        })
+        .collect()
+}
+
+/// Check all axes of a processed [`Spectrum3D`] against expected shift windows (`exp_or_class`
+/// defaults to `spec.exp` when `None`).
+pub fn check_spectrum3d_axis_ranges(
+    spec: &Spectrum3D,
+    exp_or_class: Option<&str>,
+) -> Vec<AxisRangeWarning> {
+    let cls = exp_or_class.unwrap_or(&spec.exp);
+    let axes = [
+        (&spec.axis_x, "X/F3"),
+        (&spec.axis_y, "Y/F2"),
+        (&spec.axis_z, "Z/F1"),
+    ];
+    axes.into_iter()
+        .enumerate()
+        .filter_map(|(idx, (ax, fallback))| {
+            let lbl = if ax.label.is_empty() {
+                fallback
+            } else {
+                ax.label.as_str()
+            };
+            check_axis_shift_window(
+                idx,
+                3,
+                lbl,
+                &ax.label,
+                ax.min_ppm(),
+                ax.max_ppm(),
+                cls,
+                None,
+            )
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2070,5 +2546,192 @@ mod tests {
         assert_eq!(MAX_SPECTRUM_POINTS, MAX_SPECTRUM_POINTS_NATIVE);
         #[cfg(target_pointer_width = "32")]
         assert_eq!(MAX_SPECTRUM_POINTS, MAX_SPECTRUM_POINTS_WASM);
+    }
+
+    #[test]
+    fn test_rd9_processed_axis_range_sanity_and_sf_equals_bf_warning() {
+        // Real-data bug (`091119/10008` shape): 3D `(H)CC(CO)N` processed aliphatic 13C axis `Z/F1`
+        // left with `SF == BF1` and `OFFSET = 211.95` puts it at `132.1..211.9 ppm` instead of `-5..90 ppm`.
+        let bad_c_z = AxisPpm::from_bounds("13C", 64, 211.95, 132.05, 201.22302255);
+        let good_n_y = AxisPpm::from_bounds("15N", 128, 142.0, 106.0, 81.0886);
+        let good_co_x = AxisPpm::from_bounds("13C", 1024, 176.0, 168.0, 201.22302255);
+        let bad_cube = Spectrum3D {
+            name: "cccon_bad".to_string(),
+            exp: "CCCON".to_string(),
+            axis_x: good_co_x.clone(),
+            axis_y: good_n_y.clone(),
+            axis_z: bad_c_z,
+            data: vec![0.0; 8],
+        };
+        let warns = check_spectrum3d_axis_ranges(&bad_cube, Some("Cccon3D"));
+        assert_eq!(
+            warns.len(),
+            1,
+            "expected exactly F1 aliphatic warning: {warns:?}"
+        );
+        assert_eq!(warns[0].nucleus, "13C");
+        assert!(
+            warns[0].message.contains("SR/SF") && warns[0].message.contains("aliphatic 13C"),
+            "warning={}",
+            warns[0].message
+        );
+
+        // With `SF == BF1` flag passed explicitly from Bruker headers, mentions `SF == BF`
+        let direct_warn =
+            check_axis_shift_window(2, 3, "F1", "13C", 132.05, 211.95, "Cccon3D", Some(true))
+                .expect("should warn when SF == BF leaves 172 ppm carrier in aliphatic axis");
+        assert!(
+            direct_warn.message.contains("SF == BF"),
+            "{}",
+            direct_warn.message
+        );
+
+        // Reprocessed (`091119/8000` shape) aliphatic `3.1..83.0 ppm` passes cleanly with zero warnings
+        let ok_c_z = AxisPpm::from_bounds("13C", 64, 83.0, 3.1, 201.24897);
+        let ok_cube = Spectrum3D {
+            name: "cccon_ok".to_string(),
+            exp: "CCCON".to_string(),
+            axis_x: good_co_x,
+            axis_y: good_n_y,
+            axis_z: ok_c_z,
+            data: vec![0.0; 8],
+        };
+        assert!(check_spectrum3d_axis_ranges(&ok_cube, Some("Cccon3D")).is_empty());
+    }
+
+    #[test]
+    fn test_rd6_3rrr_reader_uses_proc_si_xdim_not_acqu_td() {
+        // Simulate a 3D NUS folder where `acqu2s TD=4096` / `acqu3s TD=1` are bogus NUS bookkeeping
+        // while `procs/proc2s/proc3s` define small `SI` and `XDIM` for `3rrr`.
+        let dir = env::temp_dir().join(format!("nmr_3rrr_si_xdim_{}", process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let pdata = dir.join("pdata").join("1");
+        fs::create_dir_all(&pdata).unwrap();
+        // Deliberately write decoy `acqu2s` / `acqu3s` in parent expno dir
+        fs::write(dir.join("acqu2s"), "##$TD= 4096\n##$NusTD= 4\n").unwrap();
+        fs::write(dir.join("acqu3s"), "##$TD= 1\n##$NusTD= 6\n").unwrap();
+
+        let (nx, ny, nz) = (6usize, 4usize, 4usize);
+        let (tx, ty, tz) = (3usize, 2usize, 2usize);
+        let mk_proc = |si: usize, xdim: usize, sw_p: f64, sf: f64, off: f64, nuc: &str| {
+            format!(
+                "##$SI= {si}\n##$XDIM= {xdim}\n##$SW_p= {sw_p}\n##$SF= {sf}\n##$OFFSET= {off}\n##$BYTORDP= 0\n##$DTYPP= 0\n##$NC_proc= 0\n##$AXNUC= <{nuc}>\n"
+            )
+        };
+        fs::write(
+            pdata.join("procs"),
+            mk_proc(nx, tx, 2000.0, 201.22, 178.0, "13C"),
+        )
+        .unwrap();
+        fs::write(
+            pdata.join("proc2s"),
+            mk_proc(ny, ty, 2800.0, 81.09, 138.0, "15N"),
+        )
+        .unwrap();
+        fs::write(
+            pdata.join("proc3s"),
+            mk_proc(nz, tz, 16000.0, 201.25, 80.0, "13C"),
+        )
+        .unwrap();
+
+        let nbx = nx / tx;
+        let nby = ny / ty;
+        let nbz = nz / tz;
+        let mut raw = Vec::with_capacity(nx * ny * nz * 4);
+        for bz in 0..nbz {
+            for by in 0..nby {
+                for bx in 0..nbx {
+                    for lz in 0..tz {
+                        let gz = bz * tz + lz;
+                        for ly in 0..ty {
+                            let gy = by * ty + ly;
+                            for lx in 0..tx {
+                                let gx = bx * tx + lx;
+                                let val = ((gz * 100 + gy * 10 + gx + 1) as i32).to_le_bytes();
+                                raw.extend_from_slice(&val);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        fs::write(pdata.join("3rrr"), &raw).unwrap();
+
+        let spec = read_bruker_pdata_3d(&dir, "CCCON").expect("read 3rrr using proc SI/XDIM");
+        assert_eq!((spec.nx(), spec.ny(), spec.nz()), (nx, ny, nz));
+        assert_eq!(spec.get(5, 3, 2), 236.0);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_rd12_rebuilds_corrupt_proc_sf_axes_from_acqu_and_emits_warning() {
+        // Exact `021320/16` (`BT_HNCACONH`, `1H, 15N, 15N`) corruption pattern:
+        // `proc2s` (`SF=0.0723`, `OFFSET=1.12e9`) and `proc3s` (`SF=0.448`, `OFFSET=4.48e8`).
+        let dir = env::temp_dir().join(format!("nmr_rd12_sf_bf_{}", process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let pdata = dir.join("pdata").join("1");
+        fs::create_dir_all(&pdata).unwrap();
+
+        fs::write(
+            dir.join("acqus"),
+            "##$PULPROG= <BT_HNCACONH>\n##$NUC1= <1H>\n##$SFO1= 800.253761\n##$BF1= 800.250000\n##$SW= 12.0154\n##$TD= 8\n##END=\n",
+        )
+        .unwrap();
+        let acqu_n = "##$NUC1= <15N>\n##$SFO1= 81.098197\n##$BF1= 81.088628\n##$SW= 36.0000\n##$TD= 4\n##END=\n";
+        fs::write(dir.join("acqu2s"), acqu_n).unwrap();
+        fs::write(dir.join("acqu3s"), acqu_n).unwrap();
+
+        let (nx, ny, nz) = (4usize, 4usize, 4usize);
+        fs::write(
+            pdata.join("procs"),
+            "##$SI= 4\n##$XDIM= 4\n##$SW_p= 9615.38\n##$SF= 800.250000\n##$OFFSET= 10.7077\n##$BYTORDP= 0\n##$DTYPP= 0\n##$NC_proc= 0\n##END=\n",
+        )
+        .unwrap();
+        fs::write(
+            pdata.join("proc2s"),
+            "##$SI= 4\n##$XDIM= 4\n##$SW_p= 2919.49\n##$SF= 0.072335989\n##$OFFSET= 1.120152e+09\n##$BYTORDP= 0\n##$DTYPP= 0\n##$NC_proc= 0\n##END=\n",
+        )
+        .unwrap();
+        fs::write(
+            pdata.join("proc3s"),
+            "##$SI= 4\n##$XDIM= 4\n##$SW_p= 2919.49\n##$SF= 0.448000\n##$OFFSET= 4.480000e+08\n##$BYTORDP= 0\n##$DTYPP= 0\n##$NC_proc= 0\n##END=\n",
+        )
+        .unwrap();
+
+        let mut raw = Vec::with_capacity(nx * ny * nz * 4);
+        for v in 1..=(nx * ny * nz) as i32 {
+            raw.extend_from_slice(&v.to_le_bytes());
+        }
+        fs::write(pdata.join("3rrr"), &raw).unwrap();
+
+        let (spec, warns) = read_bruker_pdata_3d_with_warnings(&dir, "HNN").expect("read 3rrr");
+        assert_eq!(warns.len(), 2, "expected Y and Z RD-12 warnings: {warns:?}");
+        assert!(
+            warns[0].contains("Y/F2") && warns[0].contains("BF1"),
+            "{}",
+            warns[0]
+        );
+        assert!(
+            warns[1].contains("Z/F1") && warns[1].contains("BF1"),
+            "{}",
+            warns[1]
+        );
+
+        // Rebuilt 15N indirect axes have carrier = (81.098197 - 81.088628) / 81.088628 * 1e6 ≈ 118.0067 ppm, SW = 36.0
+        for ax in [&spec.axis_y, &spec.axis_z] {
+            assert_eq!(ax.label, "15N");
+            assert!((ax.obs_mhz - 81.098197).abs() < 1e-4);
+            assert!((ax.sw_ppm() - 36.0).abs() < 1e-3);
+            let mid_ppm = ax.first_ppm - 0.5 * ax.sw_ppm();
+            assert!(
+                (mid_ppm - 118.0067).abs() < 0.05 && ax.max_ppm() <= 136.5 && ax.min_ppm() >= 99.5,
+                "corrupt proc2s/proc3s should rebuild to valid 15N window: first={}, last={}, sw={}",
+                ax.first_ppm,
+                ax.last_ppm(),
+                ax.sw_ppm()
+            );
+        }
+        assert!(check_spectrum3d_axis_ranges(&spec, Some("Hncaconh")).is_empty());
+        let _ = fs::remove_dir_all(&dir);
     }
 }
