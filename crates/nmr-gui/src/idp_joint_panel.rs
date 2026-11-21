@@ -1043,6 +1043,7 @@ pub struct IdpJointPanelState {
     pub concordance_rows: Vec<ResidueRouteConcordance>,
     pub last_qc_verdict: Option<DatasetQcVerdict>,
     pub last_qc_reasons: Vec<String>,
+    pub assignments_withheld: bool,
     pub last_trosy_calibration: Option<TrosyOffsetCalibration>,
     pub last_fusion_rms_ppm: Option<(f64, f64)>,
     pub last_fitted_offsets: Option<IdpShiftOffsets>,
@@ -1090,6 +1091,7 @@ impl IdpJointPanelState {
             concordance_rows: Vec::new(),
             last_qc_verdict: None,
             last_qc_reasons: Vec::new(),
+            assignments_withheld: false,
             last_trosy_calibration: None,
             last_fusion_rms_ppm: None,
             last_fitted_offsets: None,
@@ -1311,11 +1313,31 @@ impl IdpJointPanelState {
         cfg
     }
 
+    /// Clear live joint-solver results, bridges, anchors, concordance rows, and provisional QC
+    /// banners while preserving user regime settings and configured CAS slots (`180r2.gui:P1-5`).
+    pub fn clear_live_results(&mut self) {
+        self.proline_bridges.clear();
+        self.c_term_hints.clear();
+        self.concordance_rows.clear();
+        self.last_qc_verdict = None;
+        self.last_qc_reasons.clear();
+        self.assignments_withheld = false;
+        self.last_trosy_calibration = None;
+        self.last_fusion_rms_ppm = None;
+        self.last_fitted_offsets = None;
+        self.last_n_nodes = 0;
+        self.route_filter = None;
+        self.selected_residue = None;
+        self.synthetic_demo_loaded = false;
+    }
+
     /// Populate Proline bridges, C-terminal `COO-` anchor hints, residue route concordance, and QC
-    /// diagnostics directly from a real [`JointIdpAssignResult`] (`180.gui:P1-6`).
+    /// diagnostics directly from a real [`JointIdpAssignResult`] (`180.gui:P1-6`, `180r2.core:P1-4`).
     pub fn sync_from_joint_result(&mut self, result: &JointIdpAssignResult, seq_ids: &[i32]) {
+        let is_abstain = result.qc_verdict == DatasetQcVerdict::Abstain;
         self.last_qc_verdict = Some(result.qc_verdict);
         self.last_qc_reasons = result.qc_reasons.clone();
+        self.assignments_withheld = is_abstain;
         self.last_trosy_calibration = Some(result.trosy_calibration.clone());
         self.last_fusion_rms_ppm = Some(result.fusion_rms_ppm);
         self.last_fitted_offsets = Some(result.fitted_offsets);
@@ -1402,16 +1424,23 @@ impl IdpJointPanelState {
             .collect();
 
         let (pro_ok, pro_tot) = result.proline_bridge_recovery;
-        self.status_message = format!(
-            "Joint IDP solved: {} nodes, {} assigned ({} XVal, {} Pro/{pro_tot}, {} CON-only, {} HN-only), QC={:?}",
-            result.nodes.len(),
-            self.concordance_rows.len(),
-            result.n_cross_validated_hn_con,
-            pro_ok,
-            result.n_con_route_only,
-            result.n_hn_route_only,
-            result.qc_verdict
-        );
+        if is_abstain {
+            self.status_message = format!(
+                "PROVISIONAL - QC=ABSTAIN (Assignments Withheld): {} nodes, {pro_ok}/{pro_tot} Pro bridged; prefer idp-13c anchors or deduplicate roots.",
+                result.nodes.len()
+            );
+        } else {
+            self.status_message = format!(
+                "Joint IDP solved: {} nodes, {} assigned ({} XVal, {} Pro/{pro_tot}, {} CON-only, {} HN-only), QC={:?}",
+                result.nodes.len(),
+                self.concordance_rows.len(),
+                result.n_cross_validated_hn_con,
+                pro_ok,
+                result.n_con_route_only,
+                result.n_hn_route_only,
+                result.qc_verdict
+            );
+        }
     }
 
     /// Build a `0`-based residue index -> [`JointRouteSupport`] lookup map for the sequence ribbon
@@ -1557,9 +1586,10 @@ impl IdpJointPanelState {
         let mut c_sh = vec![174.0_f64; n_res];
         let mut ca_sh = vec![55.0_f64; n_res];
         let mut cb_sh: Vec<Option<f64>> = vec![None; n_res];
+        let golden_step = 0.5 * (1.0 + 5.0_f64.sqrt());
         for (k, sh) in preds.iter().enumerate() {
             // Deterministic slight site dispersion so peaks are distinct without any RNG dependency.
-            let spread = ((k as f64) * 1.618_033_988_7).sin();
+            let spread = ((k as f64) * golden_step).sin();
             h_sh[k] = 8.15 + 0.35 * spread;
             n_sh[k] = sh.n_ppm + 0.45 * spread;
             c_sh[k] = if k + 1 == n_res {
@@ -1913,7 +1943,54 @@ impl IdpJointPanelState {
                     );
                 });
 
-                if !self.last_qc_reasons.is_empty() {
+                if self.assignments_withheld
+                    || self.last_qc_verdict == Some(DatasetQcVerdict::Abstain)
+                {
+                    ui.add_space(6.0);
+                    let warn_bg = egui::Color32::from_rgba_unmultiplied(
+                        theme.err.r(),
+                        theme.err.g(),
+                        theme.err.b(),
+                        if paper_white { 22 } else { 32 },
+                    );
+                    egui::Frame::new()
+                        .fill(warn_bg)
+                        .stroke(egui::Stroke::new(1.5, theme.err))
+                        .corner_radius(5.0)
+                        .inner_margin(egui::Margin::symmetric(8, 6))
+                        .show(ui, |ui| {
+                            ui.label(
+                                egui::RichText::new(
+                                    "PROVISIONAL - QC=ABSTAIN (Assignments Withheld)",
+                                )
+                                .size(TYPE_BODY_PX)
+                                .strong()
+                                .color(theme.err),
+                            );
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "Diagnostics: {} nodes | {} XVal | {bridged_pro}/{} [Pro] bridges | {} CON | {} HN. Not committed to curated session or standard exports; prefer idp-13c anchors or deduplicate roots.",
+                                    self.last_n_nodes,
+                                    stats.cross_validated,
+                                    self.proline_bridges.len(),
+                                    stats.con_only,
+                                    stats.hn_only
+                                ))
+                                .size(TYPE_CAPTION_PX)
+                                .color(theme.text_primary),
+                            );
+                            if !self.last_qc_reasons.is_empty() {
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "QC Reasons: {}",
+                                        self.last_qc_reasons.join("; ")
+                                    ))
+                                    .size(TYPE_CAPTION_PX)
+                                    .color(theme.warn),
+                                );
+                            }
+                        });
+                } else if !self.last_qc_reasons.is_empty() {
                     ui.add_space(3.0);
                     let summary = compact_text(&self.last_qc_reasons.join("; "), 130);
                     ui.label(

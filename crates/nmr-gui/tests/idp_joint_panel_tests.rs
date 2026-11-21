@@ -1050,3 +1050,203 @@ fn test_source_hygiene_zero_emojis_no_duplicates_and_zero_panics_in_production_m
         }
     }
 }
+
+#[test]
+fn test_ingest_joint_hn_con_detection_requires_con2d_not_cas_or_caco_only() {
+    let make_axis = |label: &str, nuc: &str, car: f64, sw: f64| ClassifiedAxis {
+        label: label.to_string(),
+        nucleus: nuc.to_string(),
+        points: 256,
+        carrier_ppm: Some(car),
+        sw_ppm: Some(sw),
+        obs_mhz: Some(800.0),
+        quadrature: QuadratureKind::Processed,
+    };
+    let make_exp = |rel: &str,
+                    cls: PulseSequenceClass,
+                    pp: &str,
+                    axes: Vec<ClassifiedAxis>|
+     -> ClassifiedExperiment {
+        ClassifiedExperiment {
+            relative_path: rel.to_string(),
+            display_name: rel.to_string(),
+            vendor: ExperimentVendor::Bruker,
+            dimensionality: ExperimentDimensionality::Dim2D,
+            data_state: DataState::Processed,
+            spectrometer_mhz: Some(800.13),
+            axes,
+            quadrature_badge: "Processed".to_string(),
+            nus: NusSummary::default(),
+            pulse_class: cls,
+            pulse_program: Some(pp.to_string()),
+            title: Some(pp.to_string()),
+            raw_signal_bytes: 0,
+            processed_bytes: 4096,
+            selected_by_default: true,
+            notes: Vec::new(),
+        }
+    };
+
+    // 1. N15Hsqc + CasCacon2D without Con2D MUST NOT auto-trigger joint HN+CON regime (`180r2.gui:P2-9`)
+    let cas_only_inv = WorkspaceInventory {
+        root_name: "hn_plus_cas_without_con".to_string(),
+        experiments: vec![
+            make_exp(
+                "10_hsqc",
+                PulseSequenceClass::N15Hsqc,
+                "hsqcetfpf3gpsi",
+                vec![
+                    make_axis("F2", "1H", 4.7, 14.0),
+                    make_axis("F1", "15N", 118.0, 32.0),
+                ],
+            ),
+            make_exp(
+                "21_cacon_ser",
+                PulseSequenceClass::CasCacon2D,
+                "c_cacon_ser",
+                vec![
+                    make_axis("F2", "13C", 174.0, 20.0),
+                    make_axis("F1", "15N", 120.0, 40.0),
+                ],
+            ),
+        ],
+        auxiliary_files: Vec::new(),
+        problem_regime: ProblemRegime::GlobularBackbone,
+        secondary_regimes: Vec::new(),
+        missing_input_hints: Vec::new(),
+        elapsed_ms: 1.0,
+    };
+    let ingest_cas_only = IngestPanelState::from_inventory(cas_only_inv);
+    assert!(
+        !ingest_cas_only.is_joint_hn_con_study(),
+        "N15Hsqc + CasCacon2D without Con2D must return false for is_joint_hn_con_study"
+    );
+    assert!(
+        !ingest_cas_only
+            .build_execution_plan()
+            .has_joint_hn_con_suite(),
+        "N15Hsqc + CasCacon2D without Con2D must return false for has_joint_hn_con_suite"
+    );
+
+    // 2. N15Hsqc + Caco2D without Con2D MUST NOT auto-trigger joint HN+CON regime
+    let caco_only_inv = WorkspaceInventory {
+        root_name: "hn_plus_caco_without_con".to_string(),
+        experiments: vec![
+            make_exp(
+                "10_hsqc",
+                PulseSequenceClass::N15Hsqc,
+                "hsqcetfpf3gpsi",
+                vec![
+                    make_axis("F2", "1H", 4.7, 14.0),
+                    make_axis("F1", "15N", 118.0, 32.0),
+                ],
+            ),
+            make_exp(
+                "20_caco",
+                PulseSequenceClass::Caco2D,
+                "c_caco_ipap",
+                vec![
+                    make_axis("F2", "13C", 174.0, 20.0),
+                    make_axis("F1", "13C", 54.0, 30.0),
+                ],
+            ),
+        ],
+        auxiliary_files: Vec::new(),
+        problem_regime: ProblemRegime::GlobularBackbone,
+        secondary_regimes: Vec::new(),
+        missing_input_hints: Vec::new(),
+        elapsed_ms: 1.0,
+    };
+    let ingest_caco_only = IngestPanelState::from_inventory(caco_only_inv);
+    assert!(!ingest_caco_only.is_joint_hn_con_study());
+    assert!(!ingest_caco_only
+        .build_execution_plan()
+        .has_joint_hn_con_suite());
+
+    // 3. Adding Con2D makes BOTH return true
+    let joint_inv = WorkspaceInventory {
+        root_name: "hn_plus_con".to_string(),
+        experiments: vec![
+            make_exp(
+                "10_hsqc",
+                PulseSequenceClass::N15Hsqc,
+                "hsqcetfpf3gpsi",
+                vec![
+                    make_axis("F2", "1H", 4.7, 14.0),
+                    make_axis("F1", "15N", 118.0, 32.0),
+                ],
+            ),
+            make_exp(
+                "20_con",
+                PulseSequenceClass::Con2D,
+                "c_con_iasq",
+                vec![
+                    make_axis("F2", "13C", 174.0, 20.0),
+                    make_axis("F1", "15N", 120.0, 40.0),
+                ],
+            ),
+        ],
+        auxiliary_files: Vec::new(),
+        problem_regime: ProblemRegime::Idp13cDetected,
+        secondary_regimes: vec![ProblemRegime::GlobularBackbone],
+        missing_input_hints: Vec::new(),
+        elapsed_ms: 1.0,
+    };
+    let ingest_joint = IngestPanelState::from_inventory(joint_inv);
+    assert!(ingest_joint.is_joint_hn_con_study());
+    assert!(ingest_joint.build_execution_plan().has_joint_hn_con_suite());
+}
+
+#[test]
+fn test_abstain_provisional_banner_layout_font_floor_and_zero_clipping() {
+    use nmr_core::qc::DatasetQcVerdict;
+
+    let mut state = IdpJointPanelState::new();
+    let (_seq, seq_ids, _ds, mut res) = state
+        .load_synthetic_idp_demo()
+        .expect("synthetic demo succeeds");
+    res.qc_verdict = DatasetQcVerdict::Abstain;
+    res.qc_reasons = vec![
+        "severe amide crowding (>60% duplicate roots)".to_string(),
+        "low sequential link support".to_string(),
+    ];
+    state.sync_from_joint_result(&res, &seq_ids);
+    assert!(state.assignments_withheld);
+    assert_eq!(state.last_qc_verdict, Some(DatasetQcVerdict::Abstain));
+
+    let ctx = egui::Context::default();
+    for (w, h) in [(1280.0_f32, 800.0_f32), (1440.0_f32, 900.0_f32)] {
+        let viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(w, h));
+        let _ = run_panel_frame(&ctx, &mut state, w, h, true, Vec::new());
+        let (out, _) = run_panel_frame(&ctx, &mut state, w, h, true, Vec::new());
+        let audit = audit_text_layout(&out.shapes, viewport);
+        assert!(
+            audit.min_font_px >= MIN_FONT_PX - 1e-3,
+            "ABSTAIN banner violated font floor at {w}x{h}: {}",
+            audit.min_font_px
+        );
+        assert!(
+            audit.clipped.is_empty(),
+            "ABSTAIN banner clipped at {w}x{h}: {:?}",
+            audit.clipped
+        );
+        assert!(
+            audit.overlapping.is_empty(),
+            "ABSTAIN banner overlapped at {w}x{h}: {:?}",
+            audit.overlapping
+        );
+        assert!(
+            audit.texts.iter().any(|t| t
+                .text
+                .contains("PROVISIONAL - QC=ABSTAIN (Assignments Withheld)")),
+            "ABSTAIN provisional banner missing at {w}x{h}"
+        );
+    }
+
+    // clear_live_results must also reset assignments_withheld and diagnostics
+    state.clear_live_results();
+    assert!(!state.assignments_withheld);
+    assert!(state.last_qc_verdict.is_none());
+    assert!(state.last_qc_reasons.is_empty());
+    assert!(state.concordance_rows.is_empty());
+}

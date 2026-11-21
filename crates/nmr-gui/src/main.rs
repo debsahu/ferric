@@ -89,7 +89,7 @@ use nmr_core::process::{
 };
 #[cfg(not(target_arch = "wasm32"))]
 use nmr_core::process::{process_fid_dir_2d, process_fid_dir_3d};
-use nmr_core::qc::{evaluate_dataset_qc, DatasetQcReport};
+use nmr_core::qc::{evaluate_dataset_qc, DatasetQcReport, DatasetQcVerdict};
 use nmr_core::report::{generate_quality_report_html, predict_csi_dihedrals, ReportInput};
 use nmr_core::rng::Rng;
 use nmr_core::session::{
@@ -152,8 +152,8 @@ use nmr_gui::{
     dosy_panel::{render_dosy_panel, DosyPanelAction, DosyPanelState},
     dynamics_panel::{DynamicsStudioOutput, DynamicsStudioPanel, DynamicsStudioTab},
     idp_joint_panel::{
-        joint_route_color, joint_route_short_code, IdpJointAction, IdpJointPanelState,
-        IdpRegimeSelection,
+        joint_route_color, joint_route_short_code, CasDirection, CasSlotEntry, IdpJointAction,
+        IdpJointPanelState, IdpRegimeSelection,
     },
     ingest_panel::{
         ingest_dropped_payloads, install_browser_folder_drop_hook, is_bare_bruker_file_error,
@@ -1842,6 +1842,9 @@ struct NmrWorkbenchApp {
     idp_joint_panel: IdpJointPanelState,
     joint_idp_result: Option<JointIdpAssignResult>,
     joint_route_by_res: BTreeMap<usize, JointRouteSupport>,
+    /// User locks keyed strictly by joint unified-node index (`node_idx -> res_idx`), kept
+    /// separate from HN spin-system-indexed `session.state.locked_residues` (`180r2.gui:P2-14`).
+    joint_user_locks: BTreeMap<usize, usize>,
     #[cfg(not(target_arch = "wasm32"))]
     background_joint_idp: Option<mpsc::Receiver<(Result<JointIdpAssignResult, String>, f64)>>,
     about_references_modal: AboutReferencesModal,
@@ -3189,6 +3192,7 @@ impl Default for NmrWorkbenchApp {
             idp_joint_panel: IdpJointPanelState::new(),
             joint_idp_result: None,
             joint_route_by_res: BTreeMap::new(),
+            joint_user_locks: BTreeMap::new(),
             #[cfg(not(target_arch = "wasm32"))]
             background_joint_idp: None,
             about_references_modal: AboutReferencesModal::new(),
@@ -3246,6 +3250,121 @@ impl Default for NmrWorkbenchApp {
             pending_drop_outcome: Arc::new(std::sync::Mutex::new(None)),
         }
     }
+}
+
+/// Pure formatting helper for the desktop-only MCP Live Bridge status pill in the bottom footer
+/// (`#1326`). Uses zero Unicode emojis and fits cleanly at `11.0 px` monospace.
+#[cfg(not(target_arch = "wasm32"))]
+fn mcp_footer_status_label(
+    running: bool,
+    bound_addr: Option<&str>,
+    perm: nmr_gui::mcp_bridge::McpBridgePermission,
+    destructive_allowed: bool,
+) -> String {
+    if !running {
+        return "MCP Off".to_string();
+    }
+    let mode = match perm {
+        nmr_gui::mcp_bridge::McpBridgePermission::ReadOnly => "RO",
+        nmr_gui::mcp_bridge::McpBridgePermission::ReadWrite if destructive_allowed => "RW!",
+        nmr_gui::mcp_bridge::McpBridgePermission::ReadWrite => "RW",
+    };
+    let port_opt = bound_addr
+        .and_then(|addr| addr.trim().rsplit_once(':').map(|(_, p)| p.trim()))
+        .filter(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()));
+    match port_opt {
+        Some(port) => format!("MCP :{port} {mode}"),
+        None => format!("MCP {mode}"),
+    }
+}
+
+/// Strictly match a loaded 2D CAS spectrum from ingest to its corresponding `CasSlotEntry`
+/// (`180r2.gui:P2-7`).
+///
+/// Requires matching `CasDirection` (`Cacon` vs `Canco`) and a non-empty `slot.path`, and never
+/// falls back to an unrelated `!slot.loaded` slot or empty-path wildcard.
+fn match_cas_slot_for_ingest(
+    slots: &[CasSlotEntry],
+    cas_lbl: &str,
+    cas_source_path: Option<&str>,
+    cas_dir: CasDirection,
+) -> Option<usize> {
+    fn norm_path(raw: &str) -> String {
+        raw.trim()
+            .replace('\\', "/")
+            .trim_end_matches('/')
+            .to_string()
+    }
+    fn basename(norm: &str) -> Option<&str> {
+        let b = norm.rsplit('/').next().unwrap_or("");
+        (!b.is_empty()).then_some(b)
+    }
+
+    let src_norm = cas_source_path.map(norm_path).filter(|s| !s.is_empty());
+    let lbl_norm = {
+        let n = norm_path(cas_lbl);
+        (!n.is_empty()).then_some(n)
+    };
+
+    let eligible = |slot: &&CasSlotEntry| -> bool {
+        slot.direction == cas_dir && !norm_path(&slot.path).is_empty()
+    };
+
+    if let Some(ref src) = src_norm {
+        if let Some(slot) = slots
+            .iter()
+            .filter(eligible)
+            .find(|slot| !slot.loaded && norm_path(&slot.path) == *src)
+            .or_else(|| {
+                slots
+                    .iter()
+                    .filter(eligible)
+                    .find(|slot| norm_path(&slot.path) == *src)
+            })
+        {
+            return Some(slot.id);
+        }
+        if let Some(src_base) = basename(src) {
+            if let Some(slot) = slots
+                .iter()
+                .filter(eligible)
+                .find(|slot| {
+                    let sp = norm_path(&slot.path);
+                    !slot.loaded && basename(&sp) == Some(src_base)
+                })
+                .or_else(|| {
+                    slots.iter().filter(eligible).find(|slot| {
+                        let sp = norm_path(&slot.path);
+                        basename(&sp) == Some(src_base)
+                    })
+                })
+            {
+                return Some(slot.id);
+            }
+        }
+    }
+
+    if let Some(ref lbl) = lbl_norm {
+        let lbl_base = basename(lbl);
+        if let Some(slot) = slots
+            .iter()
+            .filter(eligible)
+            .find(|slot| {
+                let sp = norm_path(&slot.path);
+                !slot.loaded && (sp == *lbl || (lbl_base.is_some() && basename(&sp) == lbl_base))
+            })
+            .or_else(|| {
+                slots.iter().filter(eligible).find(|slot| {
+                    let sp = norm_path(&slot.path);
+                    sp == *lbl || (lbl_base.is_some() && basename(&sp) == lbl_base)
+                })
+            })
+        {
+            return Some(slot.id);
+        }
+    }
+
+    None
 }
 
 impl NmrWorkbenchApp {
@@ -4140,7 +4259,45 @@ impl NmrWorkbenchApp {
         }
     }
 
+    /// Clear all live joint `HN + 13C` route badges, locks, and panel diagnostic summaries
+    /// whenever sequence/spectra change, the workspace resets, or a non-joint solver runs
+    /// (`180r2.gui:P1-5`, `180r2.gui:P2-14`).
+    fn clear_joint_route_state(&mut self) {
+        self.joint_route_by_res.clear();
+        self.joint_idp_result = None;
+        self.joint_user_locks.clear();
+        self.sidechain_ribbon_state.joint_route_by_res.clear();
+        self.strip_tiler.clear_joint_route_support();
+        self.idp_joint_panel.clear_live_results();
+    }
+
+    /// Execute an MCP `run_assignment` command with fail-closed GPU engine guard for `idp-joint`
+    /// (`180r2.mcp:P2-12`). Returns `true` if the solver was invoked, `false` if denied.
+    fn execute_mcp_run_assignment(&mut self, solver: &str, engine: Option<&str>) -> bool {
+        let wants_gpu = engine.is_some_and(|e| e.trim().eq_ignore_ascii_case("gpu"));
+        if self.regime_kind == GuiRegimeKind::IdpJoint && wants_gpu {
+            let msg = "MCP run_assignment denied: regime 'idp-joint' is CPU-only (--engine gpu is not supported for idp-joint; omit engine or pass engine=\"cpu\").".to_string();
+            self.idp_joint_panel.status_message = msg.clone();
+            self.status_msg = msg;
+            return false;
+        }
+        self.solver_kind = match solver.trim().to_ascii_lowercase().as_str() {
+            "standard" => GuiSolverKind::Standard,
+            "bayes-sa" | "bayes_sa" => GuiSolverKind::BayesSa,
+            _ => GuiSolverKind::EvoGraph,
+        };
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(eng) = engine {
+            self.use_gpu = eng.trim().eq_ignore_ascii_case("gpu");
+        }
+        #[cfg(target_arch = "wasm32")]
+        let _ = engine;
+        self.run_assignment();
+        true
+    }
+
     fn clear_stale_protein_demo_state(&mut self, keep_sequence: bool, keep_3d_cubes: bool) {
+        self.clear_joint_route_state();
         if !keep_sequence {
             self.sequence.clear();
             self.seq_ids.clear();
@@ -4770,6 +4927,7 @@ impl NmrWorkbenchApp {
     }
 
     fn sync_app_from_session(&mut self) {
+        self.clear_joint_route_state();
         self.sequence = self.session.state.sequence.clone();
         self.seq_ids = if self.session.state.seq_ids.len() == self.sequence.len() {
             self.session.state.seq_ids.clone()
@@ -4985,15 +5143,18 @@ impl NmrWorkbenchApp {
         {
             Ok(()) => {
                 if self.sequence.is_empty() {
-                    if let Some(ens) = self.mol3d_panel.ensemble.as_ref() {
-                        if !ens.primary_sequence.is_empty() {
-                            self.sequence = ens.primary_sequence.clone();
-                            self.seq_ids = ens.primary_seq_ids.clone();
-                            self.octet_app
-                                .set_loaded_protein_sequence(self.sequence.clone());
-                            self.session.state.sequence = self.sequence.clone();
-                            self.session.state.seq_ids = self.seq_ids.clone();
-                        }
+                    let ens_seq_pair = self.mol3d_panel.ensemble.as_ref().and_then(|ens| {
+                        (!ens.primary_sequence.is_empty())
+                            .then(|| (ens.primary_sequence.clone(), ens.primary_seq_ids.clone()))
+                    });
+                    if let Some((prim_seq, prim_ids)) = ens_seq_pair {
+                        self.clear_joint_route_state();
+                        self.sequence = prim_seq;
+                        self.seq_ids = prim_ids;
+                        self.octet_app
+                            .set_loaded_protein_sequence(self.sequence.clone());
+                        self.session.state.sequence = self.sequence.clone();
+                        self.session.state.seq_ids = self.seq_ids.clone();
                     }
                 }
                 self.loaded_pdb_text = Some(text.to_string());
@@ -5892,6 +6053,7 @@ impl NmrWorkbenchApp {
     }
 
     fn load_from_reference(&mut self, ref_data: Reference) {
+        self.clear_joint_route_state();
         let (peaks, truth) = simulate(
             &ref_data,
             &SimConfig {
@@ -6074,6 +6236,7 @@ impl NmrWorkbenchApp {
         let n_pro_tot = self.sequence.iter().filter(|r| r.as_str() == "PRO").count();
         let n_hc = conf.values().filter(|&&c| c >= 0.8).count();
 
+        self.clear_joint_route_state();
         self.sidechain_ribbon_state
             .sync_inferred_variants_from_reference(&pred);
         self.pred_ref = Some(pred);
@@ -6096,6 +6259,41 @@ impl NmrWorkbenchApp {
         self.idp_joint_panel.solver_running = false;
         self.idp_joint_panel
             .sync_from_joint_result(&result, &self.seq_ids);
+        let qc = result.qc_verdict;
+        let tag = if cfg!(target_arch = "wasm32") {
+            "IDP-Joint WASM"
+        } else {
+            "IDP-Joint CPU"
+        };
+
+        // Fail-safe provisional handling (`180r2.core:P1-4`): when dataset QC returns `ABSTAIN`,
+        // withhold placements from `session.state.assignments`, `assign_res`, `pred_ref`, and
+        // route badges so ordinary STAR/TSV/NEF exports never write provisional placements as
+        // validated assignments, while keeping diagnostics visible in `idp_joint_panel`.
+        if qc == DatasetQcVerdict::Abstain {
+            self.joint_route_by_res.clear();
+            self.sidechain_ribbon_state.joint_route_by_res.clear();
+            self.strip_tiler.clear_joint_route_support();
+            self.pred_ref = None;
+            self.pred_conf.clear();
+            self.assign_res = None;
+            self.metrics = None;
+            self.qc_report = None;
+            let reasons = if result.qc_reasons.is_empty() {
+                "dataset QC abstained".to_string()
+            } else {
+                result.qc_reasons.join("; ")
+            };
+            self.joint_idp_result = Some(result);
+            self.refresh_propensity_report();
+            self.sync_session_assignments_from_solver();
+            self.session.state.qc_verdict = Some(DatasetQcVerdict::Abstain);
+            self.status_msg = format!(
+                "[{tag}] PROVISIONAL - QC=ABSTAIN (Assignments Withheld) [{dt_ms:.0} ms]: {reasons}"
+            );
+            return;
+        }
+
         self.joint_route_by_res = self.idp_joint_panel.route_map_by_res_idx();
         self.sidechain_ribbon_state.joint_route_by_res = self.joint_route_by_res.clone();
         self.strip_tiler
@@ -6105,7 +6303,6 @@ impl NmrWorkbenchApp {
         let n_hc = conf.values().filter(|&&c| c >= 0.80).count();
         let (n_pro, n_pro_tot) = result.proline_bridge_recovery;
         let n_xval = result.n_cross_validated_hn_con;
-        let qc = result.qc_verdict;
 
         self.sidechain_ribbon_state
             .sync_inferred_variants_from_reference(&pred);
@@ -6114,14 +6311,11 @@ impl NmrWorkbenchApp {
         self.assign_res = Some(result.as_assign_result());
         self.joint_idp_result = Some(result);
         self.metrics = None;
+        self.qc_report = None;
         self.refresh_propensity_report();
         self.show_propensity_panel = true;
         self.sync_session_assignments_from_solver();
-        let tag = if cfg!(target_arch = "wasm32") {
-            "IDP-Joint WASM"
-        } else {
-            "IDP-Joint CPU"
-        };
+        self.session.state.qc_verdict = Some(qc);
         self.status_msg = format!(
             "[{tag}] Assigned {}/{} residues ({n_hc} >=0.8, {n_xval} XVal, {n_pro}/{n_pro_tot} Pro, QC={qc:?}) in {dt_ms:.0} ms",
             self.pred_conf.len(),
@@ -6145,10 +6339,10 @@ impl NmrWorkbenchApp {
         }
 
         let cas_spectra = self.idp_joint_panel.build_ready_cas_spectra();
+        // Use dedicated joint unified-node locks (`joint_user_locks`), never HN spin-system-indexed
+        // `session.state.locked_residues` (`180r2.gui:P2-14`).
         let user_locks: Vec<(usize, usize)> = self
-            .session
-            .state
-            .locked_residues
+            .joint_user_locks
             .iter()
             .map(|(&node_idx, &res_idx)| (node_idx, res_idx))
             .collect();
@@ -6547,17 +6741,19 @@ impl NmrWorkbenchApp {
             }
             IdpJointAction::ToggleProBridgeLock { pro_seq_id, locked } => {
                 if let Some(k) = self.seq_ids.iter().position(|&id| id == pro_seq_id) {
-                    if let Some(node_idx) = self.assign_res.as_ref().and_then(|res| {
-                        res.position
+                    if let Some(node_idx) = self.joint_idp_result.as_ref().and_then(|res| {
+                        res.residue_assignments
                             .iter()
-                            .enumerate()
-                            .find_map(|(s, &pos)| (pos >= 0 && pos as usize == k).then_some(s))
+                            .find(|ra| ra.seq_idx == k)
+                            .and_then(|ra| ra.node_idx)
                     }) {
                         if locked {
-                            self.session.state.locked_residues.insert(node_idx, k);
+                            self.joint_user_locks.insert(node_idx, k);
                         } else {
-                            self.session.state.locked_residues.remove(&node_idx);
+                            self.joint_user_locks.remove(&node_idx);
                         }
+                    } else if !locked {
+                        self.joint_user_locks.retain(|_, &mut res_idx| res_idx != k);
                     }
                     self.status_msg = format!(
                         "{} Proline bridge P{pro_seq_id}",
@@ -6581,6 +6777,7 @@ impl NmrWorkbenchApp {
             IdpJointAction::LoadSyntheticDemo => {
                 match self.idp_joint_panel.load_synthetic_idp_demo() {
                     Ok((seq, seq_ids, ds, res)) => {
+                        self.clear_joint_route_state();
                         self.sequence = seq;
                         self.seq_ids = seq_ids;
                         self.peaks = ds.hn_peaks;
@@ -6724,6 +6921,7 @@ impl NmrWorkbenchApp {
             }
         }
         let n_hc = conf.values().filter(|&&c| c >= 0.8).count();
+        self.clear_joint_route_state();
         self.sidechain_ribbon_state
             .sync_inferred_variants_from_reference(&pred);
         self.pred_ref = Some(pred);
@@ -7128,6 +7326,7 @@ impl NmrWorkbenchApp {
                 }
             }
         }
+        self.clear_joint_route_state();
         self.sidechain_ribbon_state
             .sync_inferred_variants_from_reference(&pred);
         self.pred_ref = Some(pred);
@@ -7374,6 +7573,7 @@ impl NmrWorkbenchApp {
                 Ok(doc) => match doc.to_reference() {
                     Ok(r) => {
                         let nef_pks = doc.to_peaks();
+                        self.clear_joint_route_state();
                         self.sequence = r.sequence.clone();
                         self.seq_ids = r.seq_ids.clone();
                         self.octet_app
@@ -7417,6 +7617,7 @@ impl NmrWorkbenchApp {
         } else {
             match read_peaks_str(trimmed) {
                 Ok(pks) => {
+                    self.clear_joint_route_state();
                     self.peaks = pks;
                     self.truth = None;
                     self.metrics = None;
@@ -7433,6 +7634,7 @@ impl NmrWorkbenchApp {
                     if let Some(ds) = parse_gui_c13_tsv_str(trimmed) {
                         let n_con = ds.con_roots.len();
                         let n_strip = ds.strip_peaks.len();
+                        self.clear_joint_route_state();
                         self.c13_picked_dataset = Some(ds);
                         self.regime_kind = GuiRegimeKind::Idp13C;
                         self.workspace_mode = WorkspaceMode::ProteinNmr;
@@ -7605,6 +7807,7 @@ impl NmrWorkbenchApp {
                         self.status_msg =
                             format!("No amino-acid sequence found in {}", p.display());
                     } else {
+                        self.clear_joint_route_state();
                         self.sequence = parsed;
                         self.seq_ids = (1..=(self.sequence.len() as i32)).collect();
                         self.octet_app
@@ -7624,6 +7827,7 @@ impl NmrWorkbenchApp {
             },
             "tsv" => match read_peaks(p) {
                 Ok(pks) => {
+                    self.clear_joint_route_state();
                     self.peaks = pks;
                     self.truth = None;
                     self.metrics = None;
@@ -7639,6 +7843,7 @@ impl NmrWorkbenchApp {
                         if let Some(ds) = parse_gui_c13_tsv_str(&raw_txt) {
                             let n_con = ds.con_roots.len();
                             let n_strip = ds.strip_peaks.len();
+                            self.clear_joint_route_state();
                             self.c13_picked_dataset = Some(ds);
                             self.regime_kind = GuiRegimeKind::Idp13C;
                             self.workspace_mode = WorkspaceMode::ProteinNmr;
@@ -14411,6 +14616,7 @@ impl NmrWorkbenchApp {
             self.peak_2d_labels.clear();
             self.water_undo_2d = None;
         } else if has_user_seq && self.sequence.is_empty() {
+            self.clear_joint_route_state();
             self.sequence = plan.sequence_three_letter.clone();
             self.seq_ids = (1..=(self.sequence.len() as i32)).collect();
             self.octet_app
@@ -14593,28 +14799,43 @@ impl NmrWorkbenchApp {
                     snr_2d: self.picker_snr.max(3.0),
                     ..C13PickerConfig::default()
                 };
-                for (cas_lbl, _, cas_sp) in &cas_2d_loaded {
-                    let picked = pick_con_2d(cas_sp, &c13_cfg);
-                    let cas_peaks: Vec<CasPeak> = picked
-                        .into_iter()
-                        .map(|pk| CasPeak {
-                            c_prime_ppm: pk.c_prev_ppm,
-                            n_ppm: pk.n_curr_ppm,
-                            height: pk.height,
-                            volume: pk.volume,
-                        })
-                        .collect();
-                    let matching_id = self
-                        .idp_joint_panel
-                        .cas_slots
-                        .iter()
-                        .find(|slot| {
-                            slot.path.contains(cas_lbl.as_str())
-                                || cas_lbl.contains(slot.path.as_str())
-                                || !slot.loaded
-                        })
-                        .map(|slot| slot.id);
+                for (cas_lbl, cas_cls, cas_sp) in &cas_2d_loaded {
+                    let cas_dir = match *cas_cls {
+                        PulseSequenceClass::CasCacon2D => CasDirection::Cacon,
+                        PulseSequenceClass::CasCanco2D => CasDirection::Canco,
+                        _ => continue,
+                    };
+                    let cas_source_path = plan.selected_experiments.iter().find_map(|item| {
+                        if item.effective_class == *cas_cls
+                            && item.experiment.display_name == *cas_lbl
+                        {
+                            Some(
+                                item.resolved_path
+                                    .as_ref()
+                                    .map(|p| p.display().to_string())
+                                    .unwrap_or_else(|| item.experiment.relative_path.clone()),
+                            )
+                        } else {
+                            None
+                        }
+                    });
+                    let matching_id = match_cas_slot_for_ingest(
+                        &self.idp_joint_panel.cas_slots,
+                        cas_lbl,
+                        cas_source_path.as_deref(),
+                        cas_dir,
+                    );
                     if let Some(slot_id) = matching_id {
+                        let picked = pick_con_2d(cas_sp, &c13_cfg);
+                        let cas_peaks: Vec<CasPeak> = picked
+                            .into_iter()
+                            .map(|pk| CasPeak {
+                                c_prime_ppm: pk.c_prev_ppm,
+                                n_ppm: pk.n_curr_ppm,
+                                height: pk.height,
+                                volume: pk.volume,
+                            })
+                            .collect();
                         let _ = self.idp_joint_panel.load_cas_slot_from_peaks(
                             slot_id,
                             cas_peaks,
@@ -15318,6 +15539,7 @@ impl NmrWorkbenchApp {
                 }
             }
             WorkbenchAction::ResetWorkspace => {
+                self.clear_joint_route_state();
                 self.peaks.clear();
                 self.systems.clear();
                 self.sequence.clear();
@@ -17234,7 +17456,11 @@ impl NmrWorkbenchApp {
                 .weak(),
             );
 
-            // Reserve space on the right for the shortcuts hint so status_msg NEVER collides (`UI-B5`)
+            // Reserve space on the right for the shortcuts hint (and desktop-only MCP status pill)
+            // so status_msg NEVER collides (`UI-B5`, `#1326`)
+            #[cfg(not(target_arch = "wasm32"))]
+            let right_reserve = 380.0_f32;
+            #[cfg(target_arch = "wasm32")]
             let right_reserve = 228.0_f32;
             let status_max_w = (ui.available_width() - right_reserve).max(0.0);
             if status_max_w >= 80.0 && !self.status_msg.is_empty() {
@@ -17257,6 +17483,119 @@ impl NmrWorkbenchApp {
                         .monospace()
                         .weak(),
                 );
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    ui.separator();
+                    let running = self.mcp_bridge.is_running();
+                    let bound_addr = self.mcp_bridge.bound_addr_string();
+                    let perm = self.mcp_bridge.permission();
+                    let destructive = self.mcp_bridge.destructive_actions_allowed();
+                    let pill_label =
+                        mcp_footer_status_label(running, bound_addr.as_deref(), perm, destructive);
+                    let dark_mode = ui.visuals().dark_mode;
+                    let (text_col, fill_col, stroke_col, dot_col) = if !running {
+                        if dark_mode {
+                            (
+                                egui::Color32::from_rgb(172, 184, 200),
+                                egui::Color32::from_rgba_unmultiplied(40, 48, 60, 200),
+                                egui::Color32::from_rgb(76, 86, 102),
+                                egui::Color32::from_rgb(130, 140, 156),
+                            )
+                        } else {
+                            (
+                                egui::Color32::from_rgb(74, 84, 98),
+                                egui::Color32::from_rgb(232, 236, 242),
+                                egui::Color32::from_rgb(184, 192, 204),
+                                egui::Color32::from_rgb(120, 130, 144),
+                            )
+                        }
+                    } else {
+                        match perm {
+                            nmr_gui::mcp_bridge::McpBridgePermission::ReadOnly => {
+                                if dark_mode {
+                                    (
+                                        egui::Color32::from_rgb(134, 239, 172),
+                                        egui::Color32::from_rgba_unmultiplied(20, 64, 44, 210),
+                                        egui::Color32::from_rgb(52, 168, 104),
+                                        egui::Color32::from_rgb(74, 222, 128),
+                                    )
+                                } else {
+                                    (
+                                        egui::Color32::from_rgb(18, 108, 60),
+                                        egui::Color32::from_rgb(224, 246, 232),
+                                        egui::Color32::from_rgb(72, 172, 114),
+                                        egui::Color32::from_rgb(24, 148, 80),
+                                    )
+                                }
+                            }
+                            nmr_gui::mcp_bridge::McpBridgePermission::ReadWrite if destructive => {
+                                if dark_mode {
+                                    (
+                                        egui::Color32::from_rgb(254, 186, 174),
+                                        egui::Color32::from_rgba_unmultiplied(92, 34, 28, 220),
+                                        egui::Color32::from_rgb(220, 90, 74),
+                                        egui::Color32::from_rgb(248, 113, 113),
+                                    )
+                                } else {
+                                    (
+                                        egui::Color32::from_rgb(154, 34, 24),
+                                        egui::Color32::from_rgb(252, 230, 226),
+                                        egui::Color32::from_rgb(214, 96, 82),
+                                        egui::Color32::from_rgb(208, 56, 44),
+                                    )
+                                }
+                            }
+                            nmr_gui::mcp_bridge::McpBridgePermission::ReadWrite => {
+                                if dark_mode {
+                                    (
+                                        egui::Color32::from_rgb(253, 224, 130),
+                                        egui::Color32::from_rgba_unmultiplied(78, 56, 18, 215),
+                                        egui::Color32::from_rgb(214, 152, 42),
+                                        egui::Color32::from_rgb(245, 184, 56),
+                                    )
+                                } else {
+                                    (
+                                        egui::Color32::from_rgb(138, 88, 10),
+                                        egui::Color32::from_rgb(252, 242, 214),
+                                        egui::Color32::from_rgb(204, 148, 38),
+                                        egui::Color32::from_rgb(198, 128, 18),
+                                    )
+                                }
+                            }
+                        }
+                    };
+                    let pill_resp = ui.add(
+                        egui::Button::new(
+                            egui::RichText::new(format!("  {pill_label}"))
+                                .size(11.0)
+                                .monospace()
+                                .color(text_col),
+                        )
+                        .fill(fill_col)
+                        .stroke(egui::Stroke::new(1.0, stroke_col))
+                        .corner_radius(egui::CornerRadius::same(8))
+                        .min_size(egui::vec2(0.0, 18.0)),
+                    );
+                    let dot_center =
+                        egui::pos2(pill_resp.rect.left() + 8.0, pill_resp.rect.center().y);
+                    ui.painter().circle_filled(dot_center, 2.8, dot_col);
+                    if pill_resp.clicked() {
+                        self.show_mcp_bridge_window = !self.show_mcp_bridge_window;
+                    }
+                    let perm_desc = match perm {
+                        nmr_gui::mcp_bridge::McpBridgePermission::ReadOnly => "Read-Only",
+                        nmr_gui::mcp_bridge::McpBridgePermission::ReadWrite => "Read-Write",
+                    };
+                    let destructive_desc = if destructive {
+                        "destructive actions enabled"
+                    } else {
+                        "destructive actions blocked"
+                    };
+                    let endpoint = self.mcp_bridge.endpoint_url();
+                    pill_resp.on_hover_text(format!(
+                        "MCP Live Bridge: {endpoint}\nMode: {perm_desc} ({destructive_desc})\nClick to open MCP Live Bridge panel"
+                    ));
+                }
             });
         });
     }
@@ -18404,6 +18743,7 @@ impl NmrWorkbenchApp {
                         self.status_msg =
                             "MCP set_sequence parsed 0 valid amino-acid residues".to_string();
                     } else {
+                        self.clear_joint_route_state();
                         self.sequence = parsed;
                         self.seq_ids = (1..=(self.sequence.len() as i32)).collect();
                         self.session.state.sequence = self.sequence.clone();
@@ -18446,18 +18786,7 @@ impl NmrWorkbenchApp {
                     self.pick_all_2d_and_3d_spectra(snr);
                 }
                 McpUiCommand::RunAssignment { solver, engine } => {
-                    self.solver_kind = match solver.trim().to_ascii_lowercase().as_str() {
-                        "standard" => GuiSolverKind::Standard,
-                        "bayes-sa" | "bayes_sa" => GuiSolverKind::BayesSa,
-                        _ => GuiSolverKind::EvoGraph,
-                    };
-                    #[cfg(not(target_arch = "wasm32"))]
-                    if let Some(eng) = engine {
-                        self.use_gpu = eng.trim().eq_ignore_ascii_case("gpu");
-                    }
-                    #[cfg(target_arch = "wasm32")]
-                    let _ = engine;
-                    self.run_assignment();
+                    self.execute_mcp_run_assignment(&solver, engine.as_deref());
                 }
                 McpUiCommand::SelectWorkbookPage {
                     page_index,
@@ -19771,6 +20100,7 @@ impl NmrWorkbenchApp {
                                 .to_string()
                             })
                             .collect();
+                        self.clear_joint_route_state();
                         self.seq_ids = (1..=res_names.len() as i32).collect();
                         self.sequence = res_names;
                         self.octet_app
@@ -20052,11 +20382,15 @@ impl NmrWorkbenchApp {
                 | IntegrativeAfAction::HighlightDomainPair { .. }
                 | IntegrativeAfAction::SyncStructureAndConcordance => {
                     if self.sequence.is_empty() {
-                        if let Some(ens) = self.mol3d_panel.ensemble.as_ref() {
-                            if !ens.primary_sequence.is_empty() {
-                                self.sequence = ens.primary_sequence.clone();
-                                self.seq_ids = ens.primary_seq_ids.clone();
-                            }
+                        let ens_seq_pair = self.mol3d_panel.ensemble.as_ref().and_then(|ens| {
+                            (!ens.primary_sequence.is_empty()).then(|| {
+                                (ens.primary_sequence.clone(), ens.primary_seq_ids.clone())
+                            })
+                        });
+                        if let Some((prim_seq, prim_ids)) = ens_seq_pair {
+                            self.clear_joint_route_state();
+                            self.sequence = prim_seq;
+                            self.seq_ids = prim_ids;
                         }
                     }
                     self.structure_show_pae_view = false;
@@ -26051,5 +26385,430 @@ CBCACON\t175.41\t122.09\t30.40\t1\t520.0
         assert_eq!(app.crosshair.c_ppm, Some(179.35));
 
         app.handle_idp_joint_action(IdpJointAction::RemoveCasSlot(slot_id), None);
+    }
+
+    #[test]
+    fn test_v180_r3_abstain_withholds_session_assignments_and_renders_provisional_banner() {
+        use eframe::egui;
+        use nmr_core::qc::DatasetQcVerdict;
+        use nmr_gui::idp_joint_panel::IdpJointAction;
+        use nmr_gui::workbench_mode::{apply_type_scale, audit_text_layout, MIN_FONT_PX};
+
+        let mut app = make_headless_test_app();
+        app.idp_joint_panel.open = true;
+        app.handle_idp_joint_action(IdpJointAction::LoadSyntheticDemo, None);
+        assert!(!app.session.state.assignments.is_empty());
+
+        let mut abstain_res = app
+            .joint_idp_result
+            .clone()
+            .expect("synthetic demo produces JointIdpAssignResult");
+        abstain_res.qc_verdict = DatasetQcVerdict::Abstain;
+        abstain_res.qc_reasons = vec![
+            "severe amide peak crowding (68% duplicate HN roots)".to_string(),
+            "insufficient sequential connectivity for reliable assignment".to_string(),
+        ];
+
+        app.apply_joint_idp_result(abstain_res, 14.0);
+        assert!(app.idp_joint_panel.assignments_withheld);
+        assert!(
+            app.session.state.assignments.is_empty(),
+            "QC=ABSTAIN must withhold placements from session.state.assignments"
+        );
+        assert_eq!(
+            app.session.state.qc_verdict,
+            Some(DatasetQcVerdict::Abstain)
+        );
+        assert!(app.assign_res.is_none());
+        assert!(app.pred_ref.is_none());
+        assert!(app.pred_conf.is_empty());
+        assert!(app.joint_route_by_res.is_empty());
+        assert!(app.sidechain_ribbon_state.joint_route_by_res.is_empty());
+        assert!(app.strip_tiler.joint_route_by_res.is_empty());
+        assert!(app
+            .status_msg
+            .contains("PROVISIONAL - QC=ABSTAIN (Assignments Withheld)"));
+
+        let ctx = egui::Context::default();
+        let viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1440.0, 900.0));
+        let mut last_audit = None;
+        for _ in 0..2 {
+            let mut out = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(viewport),
+                    ..Default::default()
+                },
+                |ui| {
+                    apply_type_scale(ui.ctx());
+                    app.draw_v0171_windows_and_bridges(ui.ctx());
+                },
+            );
+            out.textures_delta.clear();
+            last_audit = Some(audit_text_layout(&out.shapes, viewport));
+        }
+        let audit = last_audit.expect("headless audit");
+        assert!(audit.min_font_px >= MIN_FONT_PX - 1e-3);
+        assert!(
+            audit.texts.iter().any(|t| t
+                .text
+                .contains("PROVISIONAL - QC=ABSTAIN (Assignments Withheld)")),
+            "QC=ABSTAIN banner must be rendered prominently in IDP Joint panel"
+        );
+        assert!(
+            audit
+                .texts
+                .iter()
+                .any(|t| t.text.contains("severe amide peak crowding")),
+            "QC=ABSTAIN reasons must be surfaced in IDP Joint panel"
+        );
+    }
+
+    #[test]
+    fn test_v180_r3_stale_joint_badges_cleared_on_sequence_reset_and_non_joint_solve() {
+        use crate::WorkbenchAction;
+        use eframe::egui;
+        use nmr_gui::idp_joint_panel::IdpJointAction;
+
+        let mut app = make_headless_test_app();
+        app.mcp_bridge
+            .set_permission(nmr_gui::mcp_bridge::McpBridgePermission::ReadWrite);
+        app.mcp_bridge.set_destructive_actions_allowed(true);
+        let ctx = egui::Context::default();
+
+        // (a) Sequence replacement via MCP SetSequence clears all joint route state
+        app.handle_idp_joint_action(IdpJointAction::LoadSyntheticDemo, None);
+        assert!(!app.joint_route_by_res.is_empty());
+        assert!(!app.sidechain_ribbon_state.joint_route_by_res.is_empty());
+        assert!(!app.strip_tiler.joint_route_by_res.is_empty());
+        assert!(app.joint_idp_result.is_some());
+
+        app.handle_idp_joint_action(
+            IdpJointAction::ToggleProBridgeLock {
+                pro_seq_id: 4,
+                locked: true,
+            },
+            None,
+        );
+        assert!(!app.joint_user_locks.is_empty());
+
+        let set_seq_req = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 91,
+            "method": "tools/call",
+            "params": {
+                "name": "run_workbench_workflow",
+                "arguments": {
+                    "action": "set_sequence",
+                    "sequence": "GAVLIS",
+                    "confirm": true
+                }
+            }
+        });
+        let _ = app
+            .mcp_bridge
+            .handle_jsonrpc_bytes(set_seq_req.to_string().as_bytes());
+        app.apply_pending_mcp_bridge_commands();
+        assert_eq!(app.sequence.len(), 6);
+        assert!(app.joint_route_by_res.is_empty());
+        assert!(app.sidechain_ribbon_state.joint_route_by_res.is_empty());
+        assert!(app.strip_tiler.joint_route_by_res.is_empty());
+        assert!(app.joint_idp_result.is_none());
+        assert!(app.joint_user_locks.is_empty());
+        assert!(app.idp_joint_panel.concordance_rows.is_empty());
+        assert!(app.idp_joint_panel.proline_bridges.is_empty());
+
+        // (b) ResetWorkspace clears all joint route state
+        app.handle_idp_joint_action(IdpJointAction::LoadSyntheticDemo, None);
+        assert!(!app.joint_route_by_res.is_empty());
+        app.dispatch_workbench_action(&ctx, WorkbenchAction::ResetWorkspace);
+        assert!(app.joint_route_by_res.is_empty());
+        assert!(app.sidechain_ribbon_state.joint_route_by_res.is_empty());
+        assert!(app.strip_tiler.joint_route_by_res.is_empty());
+        assert!(app.joint_idp_result.is_none());
+        assert!(app.joint_user_locks.is_empty());
+        assert!(app.idp_joint_panel.concordance_rows.is_empty());
+
+        // (c) Non-joint Globular solve clears stale joint badges
+        app.handle_idp_joint_action(IdpJointAction::LoadSyntheticDemo, None);
+        assert!(!app.joint_route_by_res.is_empty());
+        app.regime_kind = GuiRegimeKind::Globular;
+        app.solver_kind = GuiSolverKind::Standard;
+        app.run_assignment();
+        assert!(
+            app.joint_route_by_res.is_empty(),
+            "non-joint globular solve must clear stale joint_route_by_res"
+        );
+        assert!(
+            app.sidechain_ribbon_state.joint_route_by_res.is_empty(),
+            "non-joint globular solve must clear stale sidechain ribbon joint badges"
+        );
+        assert!(
+            app.strip_tiler.joint_route_by_res.is_empty(),
+            "non-joint globular solve must clear stale strip tiler joint badges"
+        );
+        assert!(app.joint_idp_result.is_none());
+    }
+
+    #[test]
+    fn test_v180_r3_cas_slot_matching_strict_path_and_direction_no_wildcard() {
+        use crate::match_cas_slot_for_ingest;
+        use nmr_gui::idp_joint_panel::{CasDirection, CasResidueType, CasSlotEntry};
+
+        let slots = vec![
+            CasSlotEntry::new(1, CasResidueType::Ala, CasDirection::Cacon, ""),
+            CasSlotEntry::new(
+                2,
+                CasResidueType::Ser,
+                CasDirection::Canco,
+                "/study/12/cacon_ser.ucsf",
+            ),
+            CasSlotEntry::new(
+                3,
+                CasResidueType::Gly,
+                CasDirection::Cacon,
+                "/study/14/cacon_gly.ucsf",
+            ),
+            CasSlotEntry::new(
+                4,
+                CasResidueType::Ser,
+                CasDirection::Cacon,
+                "/study/12/cacon_ser.ucsf",
+            ),
+        ];
+
+        assert_eq!(
+            match_cas_slot_for_ingest(
+                &slots,
+                "12 (cacon_ser)",
+                Some("/study/12/cacon_ser.ucsf"),
+                CasDirection::Cacon,
+            ),
+            Some(4),
+            "must match exact path + matching CasDirection"
+        );
+        assert_eq!(
+            match_cas_slot_for_ingest(
+                &slots,
+                "99 (cacon_ala)",
+                Some("/study/99/cacon_ala.ucsf"),
+                CasDirection::Cacon,
+            ),
+            None,
+            "unmatched spectrum must NOT fall back to empty-path or unrelated unloaded slots"
+        );
+        assert_eq!(
+            match_cas_slot_for_ingest(
+                &slots,
+                "14 (cacon_gly)",
+                Some("/study/14/cacon_gly.ucsf"),
+                CasDirection::Canco,
+            ),
+            None,
+            "mismatched CasDirection must NOT match"
+        );
+    }
+
+    #[test]
+    fn test_v180_r3_mcp_run_assignment_gpu_denied_for_idp_joint() {
+        use nmr_gui::idp_joint_panel::IdpJointAction;
+
+        let mut app = make_headless_test_app();
+        app.handle_idp_joint_action(IdpJointAction::LoadSyntheticDemo, None);
+        assert_eq!(app.regime_kind, GuiRegimeKind::IdpJoint);
+        app.joint_idp_result = None;
+
+        let ran_gpu = app.execute_mcp_run_assignment("evo-graph", Some("gpu"));
+        assert!(
+            !ran_gpu,
+            "MCP run_assignment with engine=gpu under idp-joint must fail closed"
+        );
+        assert!(app.joint_idp_result.is_none());
+        assert!(app.status_msg.contains("denied"));
+        assert!(app.status_msg.contains("idp-joint"));
+
+        let ran_cpu = app.execute_mcp_run_assignment("evo-graph", Some("cpu"));
+        assert!(
+            ran_cpu,
+            "MCP run_assignment with engine=cpu under idp-joint must succeed"
+        );
+        assert!(app.joint_idp_result.is_some());
+    }
+
+    #[test]
+    fn test_v180_r3_joint_user_locks_isolated_from_hn_session_locks() {
+        use nmr_gui::idp_joint_panel::IdpJointAction;
+
+        let mut app = make_headless_test_app();
+        app.handle_idp_joint_action(IdpJointAction::LoadSyntheticDemo, None);
+        app.session.state.locked_residues.insert(999, 0);
+
+        app.handle_idp_joint_action(
+            IdpJointAction::ToggleProBridgeLock {
+                pro_seq_id: 4,
+                locked: true,
+            },
+            None,
+        );
+        assert_eq!(
+            app.joint_user_locks.len(),
+            1,
+            "ToggleProBridgeLock must store unified-node lock in joint_user_locks"
+        );
+        assert!(
+            !app.joint_user_locks.contains_key(&999),
+            "HN spin-system locks must never leak into joint_user_locks"
+        );
+        assert_eq!(app.session.state.locked_residues.get(&999), Some(&0));
+
+        // Running joint assignment must succeed cleanly with isolated joint_user_locks
+        app.handle_idp_joint_action(IdpJointAction::RunJointAssignment, None);
+        assert!(app.joint_idp_result.is_some());
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn test_v180_r3_desktop_mcp_footer_status_pill_labels_and_toggle() {
+        use crate::{mcp_footer_status_label, NmrWorkbenchApp};
+        use eframe::egui;
+        use nmr_gui::mcp_bridge::McpBridgePermission;
+        use nmr_gui::workbench_mode::{apply_type_scale, audit_text_layout, MIN_FONT_PX};
+
+        // 1. Pure label formatter covers Off / RO / RW / RW! (with & without port)
+        assert_eq!(
+            mcp_footer_status_label(
+                false,
+                Some("127.0.0.1:47921"),
+                McpBridgePermission::ReadOnly,
+                false
+            ),
+            "MCP Off"
+        );
+        assert_eq!(
+            mcp_footer_status_label(
+                true,
+                Some("127.0.0.1:47921"),
+                McpBridgePermission::ReadOnly,
+                false
+            ),
+            "MCP :47921 RO"
+        );
+        assert_eq!(
+            mcp_footer_status_label(true, None, McpBridgePermission::ReadOnly, false),
+            "MCP RO"
+        );
+        assert_eq!(
+            mcp_footer_status_label(
+                true,
+                Some("127.0.0.1:47921"),
+                McpBridgePermission::ReadWrite,
+                false
+            ),
+            "MCP :47921 RW"
+        );
+        assert_eq!(
+            mcp_footer_status_label(
+                true,
+                Some("127.0.0.1:47921"),
+                McpBridgePermission::ReadWrite,
+                true
+            ),
+            "MCP :47921 RW!"
+        );
+
+        // 2. Headless render at 1280x800 with long status_msg: zero clipping/overlap, >=11px, click toggles window
+        let mut app = make_headless_test_app();
+        app.status_msg = "Loaded 76-residue study with long diagnostic status message that must truncate cleanly before the MCP footer pill and shortcut hint".to_string();
+        assert!(!app.show_mcp_bridge_window);
+
+        let ctx = egui::Context::default();
+        let viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 800.0));
+        let render_footer = |app: &mut NmrWorkbenchApp, events: Vec<egui::Event>| {
+            let mut out = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(viewport),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    apply_type_scale(ui.ctx());
+                    egui::Panel::bottom("test_mcp_footer_bar")
+                        .exact_size(24.0)
+                        .show(ui, |ui| {
+                            app.draw_bottom_status_bar(ui, 0);
+                        });
+                },
+            );
+            out.textures_delta.clear();
+            audit_text_layout(&out.shapes, viewport)
+        };
+
+        let _ = render_footer(&mut app, Vec::new());
+        let audit = render_footer(&mut app, Vec::new());
+        assert!(audit.min_font_px >= MIN_FONT_PX - 1e-3);
+        assert!(
+            audit.clipped.is_empty(),
+            "clipped footer texts: {:?}",
+            audit.clipped
+        );
+        assert!(
+            audit.overlapping.is_empty(),
+            "overlapping footer texts: {:?}",
+            audit.overlapping
+        );
+        let pill_rect = audit
+            .texts
+            .iter()
+            .find(|t| t.text.contains("MCP Off"))
+            .expect("desktop bottom footer must render MCP Off pill")
+            .rect;
+
+        // Click pill to open MCP Live Bridge window
+        let click_pos = pill_rect.center();
+        let _ = render_footer(
+            &mut app,
+            vec![
+                egui::Event::PointerMoved(click_pos),
+                egui::Event::PointerButton {
+                    pos: click_pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                egui::Event::PointerButton {
+                    pos: click_pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        assert!(
+            app.show_mcp_bridge_window,
+            "clicking desktop MCP footer pill must toggle show_mcp_bridge_window on"
+        );
+
+        // Click pill again to close MCP Live Bridge window
+        let _ = render_footer(
+            &mut app,
+            vec![
+                egui::Event::PointerMoved(click_pos),
+                egui::Event::PointerButton {
+                    pos: click_pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                egui::Event::PointerButton {
+                    pos: click_pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        assert!(
+            !app.show_mcp_bridge_window,
+            "clicking desktop MCP footer pill a second time must toggle show_mcp_bridge_window off"
+        );
     }
 }

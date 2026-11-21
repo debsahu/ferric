@@ -753,20 +753,6 @@ fn is_hn_backbone_class(cls: PulseSequenceClass) -> bool {
     )
 }
 
-fn is_c13_idp_class(cls: PulseSequenceClass) -> bool {
-    matches!(
-        cls,
-        PulseSequenceClass::Con2D
-            | PulseSequenceClass::Caco2D
-            | PulseSequenceClass::Canco3D
-            | PulseSequenceClass::Cbcaco3D
-            | PulseSequenceClass::Cccon3D
-            | PulseSequenceClass::Hncacon3D
-            | PulseSequenceClass::CasCacon2D
-            | PulseSequenceClass::CasCanco2D
-    )
-}
-
 fn cas_slot_from_classified(
     id: usize,
     exp: &ClassifiedExperiment,
@@ -812,19 +798,21 @@ fn cas_slot_from_classified(
 }
 
 impl IngestExecutionPlan {
-    /// True when the execution plan contains BOTH `1H`-amide backbone experiments (`HSQC`/`HNCO`/
-    /// `HNCACB`/...) AND `13C`-detected IDP experiments (`2D CON`/`CAS`/`CANCO`/`(H)N(CA)CON`/...),
-    /// recommending the unified `idp-joint` regime (`180.gui:P1-5`).
+    /// True when the execution plan contains BOTH `1H`-amide backbone experiments (`N15Hsqc`/`HNCO`/
+    /// `HNCACB`/...) AND a `2D CON` (`PulseSequenceClass::Con2D`) root spectrum, matching the CLI
+    /// `assign`/`pipeline` auto-selection rule for `idp-joint` (`180.gui:P1-5`, `180r2.gui:P2-9`).
+    ///
+    /// CAS-only, CACO-only, or HNCACON-only suites without `Con2D` do NOT trigger `idp-joint`.
     pub fn has_joint_hn_con_suite(&self) -> bool {
         let has_hn = self
             .selected_experiments
             .iter()
             .any(|s| is_hn_backbone_class(s.effective_class));
-        let has_c13 = self
+        let has_con = self
             .selected_experiments
             .iter()
-            .any(|s| is_c13_idp_class(s.effective_class));
-        has_hn && has_c13
+            .any(|s| s.effective_class == PulseSequenceClass::Con2D);
+        has_hn && has_con
     }
 
     /// Extract [`CasSlotEntry`] definitions (capped at [`MAX_CAS_SLOTS`]) for every selected
@@ -1175,21 +1163,21 @@ impl IngestPanelState {
     }
 
     /// True when the current selected matrix rows contain BOTH `1H`-amide backbone spectra
-    /// (`HSQC`/`HNCO`/`HNCACB`/...) AND `13C`-detected IDP spectra (`2D CON`/`CAS`/`CANCO`/
-    /// `(H)N(CA)CON`/...), qualifying for unified `idp-joint` assignment (`180.gui:P1-5`).
+    /// (`N15Hsqc`/`HNCO`/`HNCACB`/...) AND a `2D CON` (`PulseSequenceClass::Con2D`) spectrum,
+    /// matching CLI `assign`/`pipeline` auto-select for `idp-joint` (`180.gui:P1-5`, `180r2.gui:P2-9`).
     pub fn is_joint_hn_con_study(&self) -> bool {
         let mut has_hn = false;
-        let mut has_c13 = false;
+        let mut has_con = false;
         for (idx, &sel) in self.selected.iter().enumerate() {
             if !sel {
                 continue;
             }
             if let Some(&cls) = self.effective_classes.get(idx) {
                 has_hn |= is_hn_backbone_class(cls);
-                has_c13 |= is_c13_idp_class(cls);
+                has_con |= cls == PulseSequenceClass::Con2D;
             }
         }
-        has_hn && has_c13
+        has_hn && has_con
     }
 
     /// Extract [`CasSlotEntry`] definitions for every selected `CasCacon2D`/`CasCanco2D` row in
