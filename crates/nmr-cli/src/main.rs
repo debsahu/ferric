@@ -4394,7 +4394,7 @@ fn cmd_process(args: &[String]) -> Result<(), String> {
         RawFid::Dim3(fid3) => {
             let exp = exp_arg
                 .or_else(|| real_benchmark::infer_single_fid_experiment(&in_p))
-                .unwrap_or_else(|| "HNCA".to_string());
+                .unwrap_or_else(|| nmr_core::process::infer_3d_experiment_label(&fid3));
             let mut recipe = build_recipe_for_fid_3d(&fid3, &opts)?;
             let mut spec = process_fid_3d_mut(&fid3, &exp, &mut recipe)?;
             if let Some(ref w) = recipe.truncated_fid_warning {
@@ -4416,7 +4416,8 @@ fn cmd_process(args: &[String]) -> Result<(), String> {
                 recipe.axis_rescue_audit = audit;
                 if dh.abs() > 1e-6 || dn.abs() > 1e-6 {
                     eprintln!(
-                        "[register] aligned 3D {exp} to HSQC: dH={dh:+.4} ppm, dN={dn:+.3} ppm"
+                        "[register] aligned 3D {} to HSQC: dH={dh:+.4} ppm, dN={dn:+.3} ppm",
+                        spec.exp
                     );
                 }
             }
@@ -4455,7 +4456,7 @@ fn cmd_process(args: &[String]) -> Result<(), String> {
             recipe.write_json(&recipe_out)?;
             println!(
                 "Processed 3D {} FID ({:?}{}) -> {} [{}x{}x{}, {:.2}s] (recipe: {})",
-                exp,
+                spec.exp,
                 fid3.vendor,
                 if fid3.nus_mask.is_some() { ", NUS" } else { "" },
                 out_p.display(),
@@ -4913,7 +4914,7 @@ fn cmd_pick(args: &[String]) -> Result<(), String> {
             Ok(RawFid::Dim3(fid3)) => {
                 let exp = exp_arg
                     .or_else(|| real_benchmark::infer_single_fid_experiment(fp))
-                    .unwrap_or_else(|| "HNCA".to_string());
+                    .unwrap_or_else(|| nmr_core::process::infer_3d_experiment_label(&fid3));
                 let mut recipe = build_recipe_for_fid_3d(&fid3, &fid_opts)?;
                 let spec3 = process_fid_3d_mut(&fid3, &exp, &mut recipe)?;
                 let opt_hsqc = if let Some(hp) = &hsqc_path {
@@ -4921,9 +4922,10 @@ fn cmd_pick(args: &[String]) -> Result<(), String> {
                 } else {
                     None
                 };
+                let resolved_exp = spec3.exp.clone();
                 let (r, all, lbl, _) = pick_in_memory_spectra_with_audit(
                     opt_hsqc.as_ref(),
-                    &mut [(exp, spec3)],
+                    &mut [(resolved_exp, spec3)],
                     &method,
                     engine,
                     snr,
