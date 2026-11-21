@@ -889,14 +889,28 @@ pub fn evaluate_idp_auto_reference_safety(
         }
     }
 
+    // Atomic 13C refusal: if ANY carbon channel is refused, zero all 13C offsets (dC', dCA, dCB)
+    // regardless of spread so carbon channels are never left inconsistently referenced.
+    if refused_nuclei
+        .iter()
+        .any(|n| matches!(n.as_str(), "13CA" | "13CB" | "13C'"))
+    {
+        safe.d_c = 0.0;
+        safe.d_ca = 0.0;
+        safe.d_cb = 0.0;
+    }
+
+    // Only genuinely significant/fitted carbon channels (`|d| >= 0.015 ppm`) participate in
+    // carbon spread; `NotSignificant` (`0.0`) channels are excluded so they cannot inflate spread
+    // against a uniform TMS shift or raise false polarity warnings.
     let mut obs_c_offsets: Vec<(&str, f64)> = Vec::new();
-    if n_c >= 5 {
+    if n_c >= 5 && raw.d_c.abs() >= 0.015 {
         obs_c_offsets.push(("C'", raw.d_c));
     }
-    if n_ca >= 5 {
+    if n_ca >= 5 && raw.d_ca.abs() >= 0.015 {
         obs_c_offsets.push(("CA", raw.d_ca));
     }
-    if n_cb >= 5 {
+    if n_cb >= 5 && raw.d_cb.abs() >= 0.015 {
         obs_c_offsets.push(("CB", raw.d_cb));
     }
     let any_c_shifted = obs_c_offsets.iter().any(|x| x.1.abs() > 0.1);
@@ -923,14 +937,6 @@ pub fn evaluate_idp_auto_reference_safety(
             );
             warnings.push(msg.clone());
             polarity_swap_warning = Some(msg);
-            if refused_nuclei
-                .iter()
-                .any(|n| matches!(n.as_str(), "13CA" | "13CB" | "13C'"))
-            {
-                safe.d_c = 0.0;
-                safe.d_ca = 0.0;
-                safe.d_cb = 0.0;
-            }
         }
     }
 
@@ -2500,17 +2506,31 @@ pub fn idp_pair_matrix(systems: &[ConDipeptideSystem], cfg: &IdpSolverConfig) ->
             // (H)N(CA)CON sequential N-N linking (`RD-13`): `t`'s strip shows `s.n_curr` (`N(i)`)
             let sc_nn = if !systems[t].nn_prev_cands.is_empty() {
                 let sn = systems[s].n_curr;
+                let tn = systems[t].n_curr;
                 let mut best_nn: Option<f32> = None;
                 for &(cand_n, snr) in &systems[t].nn_prev_cands {
                     let dn = (cand_n - sn).abs();
                     if dn < 0.25 {
-                        let bonus = 2.0 + (snr.clamp(3.0, 12.0) / 4.0) * (1.0 - dn / 0.35);
+                        // Smoothly down-weight near-diagonal (0.0..=0.35 ppm) candidates that may
+                        // overlap the autopeak while retaining genuine N(i-1)≈N(i) repeat links.
+                        let d_diag = (cand_n - tn).abs();
+                        let diag_weight = if d_diag <= 0.35 {
+                            0.35 + 0.65 * (d_diag / 0.35)
+                        } else {
+                            1.0
+                        };
+                        let bonus =
+                            diag_weight * (2.0 + (snr.clamp(3.0, 12.0) / 4.0) * (1.0 - dn / 0.35));
                         if best_nn.is_none_or(|b| (bonus as f32) > b) {
                             best_nn = Some(bonus as f32);
                         }
                     }
                 }
-                best_nn.unwrap_or(-0.6)
+                let has_resolved_off_diag = systems[t]
+                    .nn_prev_cands
+                    .iter()
+                    .any(|&(cn, _)| (cn - tn).abs() > 0.35);
+                best_nn.unwrap_or(if has_resolved_off_diag { -0.6 } else { 0.0 })
             } else {
                 0.0
             };
@@ -4328,16 +4348,15 @@ pub fn try_assign_idp_13c_cpu(
         cfg,
     );
     if let Some(ref sf) = ref_safety {
+        // Always surface auto-reference safety warnings (including 1.0..1.8 ppm spread) in QC notes.
+        for w in &sf.warnings {
+            if !res.qc_reasons.contains(w) {
+                res.qc_reasons.push(w.clone());
+            }
+        }
         let severe_ref_fail = !sf.refused_nuclei.is_empty() || sf.c13_spread_ppm > 1.80;
-        if severe_ref_fail && !sf.warnings.is_empty() {
-            for w in &sf.warnings {
-                if !res.qc_reasons.contains(w) {
-                    res.qc_reasons.push(w.clone());
-                }
-            }
-            if res.qc_verdict == DatasetQcVerdict::Pass {
-                res.qc_verdict = DatasetQcVerdict::Warn;
-            }
+        if severe_ref_fail && !sf.warnings.is_empty() && res.qc_verdict == DatasetQcVerdict::Pass {
+            res.qc_verdict = DatasetQcVerdict::Warn;
         }
         if let Some(ref hint) = sf.tms_reference_hint {
             if !res.qc_reasons.contains(hint) {
@@ -4540,6 +4559,11 @@ pub fn attach_hnco_hncacb_to_con_systems(
         .iter()
         .filter(|p| p.exp == "HNCACB" && p.c.is_some())
         .collect();
+    // Optional i-1-only CBCACONH / HN(CO)CACB peaks carried in the same peak list for cross-check
+    let cbcaconh: Vec<&Peak> = norm_peaks
+        .iter()
+        .filter(|p| (p.exp == "CBCACONH" || p.exp == "HNCOCACB") && p.c.is_some())
+        .collect();
     if hncacb.is_empty() {
         return IdpHncoHncacbLinkStats {
             n_con_roots_matched_hnco: 0,
@@ -4582,25 +4606,43 @@ pub fn attach_hnco_hncacb_to_con_systems(
         (0.0, 0.0)
     };
 
-    let mut matched_hnco = 0usize;
-    let mut attached_curr = 0usize;
-    for sys in systems.iter_mut() {
-        // Match best HNCO root for this CON root
-        let mut best_hp: Option<(&Peak, f64)> = None;
-        for hp in &hnco {
+    // Global distance-sorted 1-to-1 CON <-> HNCO matching so crowded CON roots do not share an HNCO peak
+    let mut pair_cands: Vec<(f64, usize, usize)> = Vec::new();
+    for (s_idx, sys) in systems.iter().enumerate() {
+        for (h_idx, hp) in hnco.iter().enumerate() {
             let dc = ((hp.c.unwrap_or(0.0) - sh_c) - sys.c_prev).abs();
             let dn = ((hp.n - sh_n) - sys.n_curr).abs();
             if dc <= 0.09 && dn <= 0.35 {
                 let d2 = (dc / 0.06).powi(2) + (dn / 0.22).powi(2);
-                if best_hp.is_none_or(|b| d2 < b.1) {
-                    best_hp = Some((hp, d2));
-                }
+                pair_cands.push((d2, s_idx, h_idx));
             }
         }
-        let Some((hp, _)) = best_hp else {
+    }
+    pair_cands.sort_by(|a, b| {
+        a.0.total_cmp(&b.0)
+            .then_with(|| a.1.cmp(&b.1))
+            .then_with(|| a.2.cmp(&b.2))
+    });
+    let mut used_sys = vec![false; systems.len()];
+    let mut used_hnco = vec![false; hnco.len()];
+    let mut matched_hnco_for_sys: Vec<Option<usize>> = vec![None; systems.len()];
+    let mut matched_hnco = 0usize;
+    for (_, s_idx, h_idx) in pair_cands {
+        if used_sys[s_idx] || used_hnco[h_idx] {
+            continue;
+        }
+        used_sys[s_idx] = true;
+        used_hnco[h_idx] = true;
+        matched_hnco_for_sys[s_idx] = Some(h_idx);
+        matched_hnco += 1;
+    }
+
+    let mut attached_curr = 0usize;
+    for (s_idx, sys) in systems.iter_mut().enumerate() {
+        let Some(h_idx) = matched_hnco_for_sys[s_idx] else {
             continue;
         };
-        matched_hnco += 1;
+        let hp = hnco[h_idx];
 
         let mut ca_hits: Vec<(f64, f64)> = Vec::new();
         let mut cb_hits: Vec<(f64, f64)> = Vec::new();
@@ -4624,24 +4666,73 @@ pub fn attach_hnco_hncacb_to_con_systems(
         ca_hits.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.total_cmp(&b.0)));
         cb_hits.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.total_cmp(&b.0)));
 
-        // Exclude i-1 shifts already corroborated by H(CC)CON / CBCACON when a distinct i peak exists
-        let filt_ca: Vec<f64> = ca_hits
-            .iter()
-            .map(|&(v, _)| v)
-            .filter(|&v| !sys.ca_prev.iter().any(|&p| (p - v).abs() <= 0.16))
-            .collect();
-        let filt_cb: Vec<f64> = cb_hits
-            .iter()
-            .map(|&(v, _)| v)
-            .filter(|&v| !sys.cb_prev.iter().any(|&p| (p - v).abs() <= 0.20))
-            .collect();
+        // Collect optional i-1 HN(CO)CACB / CBCACONH shifts at the same (H_N(i), N(i)) strip
+        let mut hncocacb_c: Vec<f64> = Vec::new();
+        for bp in &cbcaconh {
+            let dh = (bp.h - hp.h).abs();
+            let dn = (bp.n - hp.n).abs();
+            let d_hn = (dh / 0.045).hypot(dn / 0.45);
+            if d_hn <= 1.0 {
+                if let Some(c_val) = bp.c {
+                    hncocacb_c.push(c_val);
+                }
+            }
+        }
+
+        let is_known_prev = |v: f64, prev_list: &[f64], tol_p: f64| -> bool {
+            prev_list.iter().any(|&p| (p - v).abs() <= tol_p)
+                || hncocacb_c.iter().any(|&p| (p - v).abs() <= tol_p)
+        };
+
+        // Separate intraresidue (i) from sequential (i-1) peaks using:
+        // 1) Explicit (i-1) corroboration from H(CC)CON/CBCACON or HN(CO)CACB;
+        // 2) Relative intensity (1J intra is stronger than 2J sequential) when no i-1 ref filtered peaks.
+        let select_intra_and_backfill_prev =
+            |hits: &[(f64, f64)], prev_list: &mut Vec<f64>, tol_p: f64| -> Vec<f64> {
+                if hits.is_empty() {
+                    return Vec::new();
+                }
+                let mut filt: Vec<(f64, f64)> = Vec::new();
+                let mut matched_prev_any = false;
+                for &(v, sc) in hits {
+                    if is_known_prev(v, prev_list, tol_p) {
+                        matched_prev_any = true;
+                        // Backfill sys.*_prev from HN(CO)CACB cross-check when empty
+                        if prev_list.is_empty() {
+                            prev_list.push(v);
+                        }
+                    } else {
+                        filt.push((v, sc));
+                    }
+                }
+                if matched_prev_any {
+                    if !filt.is_empty() {
+                        if filt.len() >= 2 && filt[0].1 >= 1.35 * filt[1].1 {
+                            return vec![filt[0].0];
+                        }
+                        return filt.into_iter().take(2).map(|(v, _)| v).collect();
+                    }
+                    // All HNCACB peaks coincided with i-1 (degenerate i == i-1): keep strongest peak only
+                    return vec![hits[0].0];
+                }
+                // No i-1 reference available: distinguish stronger 1J intra peak from weaker 2J i-1 peak
+                if hits.len() >= 2 && (hits[0].0 - hits[1].0).abs() > 0.25 {
+                    if hits[0].1 >= 1.35 * hits[1].1 {
+                        if prev_list.is_empty() {
+                            prev_list.push(hits[1].0);
+                        }
+                        return vec![hits[0].0];
+                    }
+                    // Ambiguous equal-height doublet with no i-1 ref: retain at most top 2 ordered by intensity
+                    return vec![hits[0].0, hits[1].0];
+                }
+                hits.iter().take(1).map(|&(v, _)| v).collect()
+            };
+
+        let ca_src = select_intra_and_backfill_prev(&ca_hits, &mut sys.ca_prev, 0.18);
+        let cb_src = select_intra_and_backfill_prev(&cb_hits, &mut sys.cb_prev, 0.22);
 
         let mut any_added = false;
-        let ca_src: Vec<f64> = if !filt_ca.is_empty() {
-            filt_ca
-        } else {
-            ca_hits.iter().map(|&(v, _)| v).collect()
-        };
         for v in ca_src {
             if sys.ca_curr.len() < MAX_IDP_CANDS
                 && !sys.ca_curr.iter().any(|&x| (x - v).abs() <= 0.08)
@@ -4650,11 +4741,6 @@ pub fn attach_hnco_hncacb_to_con_systems(
                 any_added = true;
             }
         }
-        let cb_src: Vec<f64> = if !filt_cb.is_empty() {
-            filt_cb
-        } else {
-            cb_hits.iter().map(|&(v, _)| v).collect()
-        };
         for v in cb_src {
             if sys.cb_curr.len() < MAX_IDP_CANDS
                 && !sys.cb_curr.iter().any(|&x| (x - v).abs() <= 0.12)
@@ -4874,12 +4960,23 @@ pub fn pick_hncacon_nn_coadded(
         for v in sg.iter_mut() {
             *v *= inv_sqrt;
         }
-        let mut peaks_r: Vec<(f64, f64)> = Vec::new();
+        let mut off_diag: Vec<(f64, f64)> = Vec::new();
+        let mut near_diag: Vec<(f64, f64)> = Vec::new();
+        let near_diag_partner_tol = partner_n_tol.min(0.25);
         for gi in 1..(GRID_LEN - 1) {
             let s = sg[gi];
             if s > thr && s >= sg[gi - 1] && s > sg[gi + 1] {
                 let cand_n = GRID_LO + (gi as f64) * GRID_STEP;
-                if (cand_n - root.n_curr_ppm).abs() <= 0.35 {
+                let d_diag = (cand_n - root.n_curr_ppm).abs();
+                if d_diag <= 0.35 {
+                    // Allow 0.0..=0.35 ppm near-diagonal links ONLY when another distinct CON root
+                    // coincides with `cand_n` (e.g., Ser-repeat N(i-1) ≈ N(i)); weighted downstream
+                    // in `idp_pair_matrix` so diagonals never crowd out resolved cross-peaks.
+                    if con_roots.iter().enumerate().any(|(j, cr)| {
+                        j != r_idx && (cand_n - cr.n_curr_ppm).abs() <= near_diag_partner_tol
+                    }) {
+                        near_diag.push((cand_n, s));
+                    }
                     continue;
                 }
                 // Retain partner N candidates coinciding with at least one real CON N coordinate
@@ -4888,13 +4985,16 @@ pub fn pick_hncacon_nn_coadded(
                     .enumerate()
                     .any(|(j, cr)| j != r_idx && (cand_n - cr.n_curr_ppm).abs() <= partner_n_tol)
                 {
-                    peaks_r.push((cand_n, s));
+                    off_diag.push((cand_n, s));
                 }
             }
         }
-        peaks_r.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.total_cmp(&b.0)));
-        peaks_r.truncate(3);
-        out[r_idx] = peaks_r;
+        off_diag.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.total_cmp(&b.0)));
+        off_diag.truncate(3);
+        near_diag.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.total_cmp(&b.0)));
+        near_diag.truncate(1);
+        off_diag.extend(near_diag);
+        out[r_idx] = off_diag;
     }
 
     out
@@ -4985,6 +5085,37 @@ pub fn extract_reciprocal_hncaconh_pairs(
         (i, d)
     };
 
+    // First determine which 15N dimension (A or B) is the detected amide N(i) coupled to H(i)
+    // by comparing strip energy along the two orientations across amide_roots. Scanning the
+    // non-detected axis at root's own H(i) would fix the partner axis at N(i) and yield spurious peaks.
+    let mut energy_a_fixed = 0.0f64;
+    let mut energy_b_fixed = 0.0f64;
+    for &(rh, rn) in amide_roots.iter().take(80) {
+        let (ih, dh) = nearest_idx(ax_h, rh);
+        if dh > 0.03 {
+            continue;
+        }
+        let (ia, dna) = nearest_idx(ax_a, rn);
+        if dna <= 0.45 {
+            for jb in 0..ax_b.size {
+                let s = get_voxel(ih, ia, jb) / noise - 2.5;
+                if s > 0.0 {
+                    energy_a_fixed += s;
+                }
+            }
+        }
+        let (ib, dnb) = nearest_idx(ax_b, rn);
+        if dnb <= 0.45 {
+            for ja in 0..ax_a.size {
+                let s = get_voxel(ih, ja, ib) / noise - 2.5;
+                if s > 0.0 {
+                    energy_b_fixed += s;
+                }
+            }
+        }
+    }
+    let detected_is_a = energy_a_fixed >= energy_b_fixed;
+
     let mut raw: Vec<(f64, f64)> = Vec::new();
     let thr = snr_threshold.max(3.5) * noise;
     for &(rh, rn) in amide_roots {
@@ -4997,71 +5128,71 @@ pub fn extract_reciprocal_hncaconh_pairs(
             (ih + 1).min(ax_h.size.saturating_sub(1)),
         );
 
-        // Direction 1: fix A at root N, scan B
-        let (ia, dna) = nearest_idx(ax_a, rn);
-        if dna <= 0.45 && ax_b.size >= 3 {
-            let (ia_lo, ia_hi) = (
-                ia.saturating_sub(1),
-                (ia + 1).min(ax_a.size.saturating_sub(1)),
-            );
-            let line: Vec<f64> = (0..ax_b.size)
-                .map(|jb| {
-                    let mut mx = f64::NEG_INFINITY;
-                    for ih_i in ih_lo..=ih_hi {
-                        for ia_i in ia_lo..=ia_hi {
-                            mx = mx.max(get_voxel(ih_i, ia_i, jb));
+        if detected_is_a {
+            let (ia, dna) = nearest_idx(ax_a, rn);
+            if dna <= 0.45 && ax_b.size >= 3 {
+                let (ia_lo, ia_hi) = (
+                    ia.saturating_sub(1),
+                    (ia + 1).min(ax_a.size.saturating_sub(1)),
+                );
+                let line: Vec<f64> = (0..ax_b.size)
+                    .map(|jb| {
+                        let mut mx = f64::NEG_INFINITY;
+                        for ih_i in ih_lo..=ih_hi {
+                            for ia_i in ia_lo..=ia_hi {
+                                mx = mx.max(get_voxel(ih_i, ia_i, jb));
+                            }
                         }
-                    }
-                    mx
-                })
-                .collect();
-            let mut cands: Vec<(f64, f64)> = (1..(line.len() - 1))
-                .filter_map(|j| {
-                    let n_other = ax_b.index_to_ppm(j as f64);
-                    (line[j] > thr
-                        && line[j] >= line[j - 1]
-                        && line[j] >= line[j + 1]
-                        && (n_other - rn).abs() > 0.5)
-                        .then_some((line[j], n_other))
-                })
-                .collect();
-            cands.sort_by(|x, y| y.0.total_cmp(&x.0));
-            for (_, v) in cands.into_iter().take(2) {
-                raw.push((rn, v));
+                        mx
+                    })
+                    .collect();
+                let mut cands: Vec<(f64, f64)> = (1..(line.len() - 1))
+                    .filter_map(|j| {
+                        let n_other = ax_b.index_to_ppm(j as f64);
+                        (line[j] > thr
+                            && line[j] >= line[j - 1]
+                            && line[j] >= line[j + 1]
+                            && (n_other - rn).abs() > 0.5)
+                            .then_some((line[j], n_other))
+                    })
+                    .collect();
+                cands.sort_by(|x, y| y.0.total_cmp(&x.0));
+                for (_, v) in cands.into_iter().take(2) {
+                    raw.push((rn, v));
+                }
             }
-        }
-
-        // Direction 2: fix B at root N, scan A
-        let (ib, dnb) = nearest_idx(ax_b, rn);
-        if dnb <= 0.45 && ax_a.size >= 3 {
-            let (ib_lo, ib_hi) = (
-                ib.saturating_sub(1),
-                (ib + 1).min(ax_b.size.saturating_sub(1)),
-            );
-            let line: Vec<f64> = (0..ax_a.size)
-                .map(|ja| {
-                    let mut mx = f64::NEG_INFINITY;
-                    for ih_i in ih_lo..=ih_hi {
-                        for ib_i in ib_lo..=ib_hi {
-                            mx = mx.max(get_voxel(ih_i, ja, ib_i));
+        } else {
+            let (ib, dnb) = nearest_idx(ax_b, rn);
+            if dnb <= 0.45 && ax_a.size >= 3 {
+                let (ib_lo, ib_hi) = (
+                    ib.saturating_sub(1),
+                    (ib + 1).min(ax_b.size.saturating_sub(1)),
+                );
+                let line: Vec<f64> = (0..ax_a.size)
+                    .map(|ja| {
+                        let mut mx = f64::NEG_INFINITY;
+                        for ih_i in ih_lo..=ih_hi {
+                            for ib_i in ib_lo..=ib_hi {
+                                mx = mx.max(get_voxel(ih_i, ja, ib_i));
+                            }
                         }
-                    }
-                    mx
-                })
-                .collect();
-            let mut cands: Vec<(f64, f64)> = (1..(line.len() - 1))
-                .filter_map(|j| {
-                    let n_other = ax_a.index_to_ppm(j as f64);
-                    (line[j] > thr
-                        && line[j] >= line[j - 1]
-                        && line[j] >= line[j + 1]
-                        && (n_other - rn).abs() > 0.5)
-                        .then_some((line[j], n_other))
-                })
-                .collect();
-            cands.sort_by(|x, y| y.0.total_cmp(&x.0));
-            for (_, v) in cands.into_iter().take(2) {
-                raw.push((rn, v));
+                        mx
+                    })
+                    .collect();
+                let mut cands: Vec<(f64, f64)> = (1..(line.len() - 1))
+                    .filter_map(|j| {
+                        let n_other = ax_a.index_to_ppm(j as f64);
+                        (line[j] > thr
+                            && line[j] >= line[j - 1]
+                            && line[j] >= line[j + 1]
+                            && (n_other - rn).abs() > 0.5)
+                            .then_some((line[j], n_other))
+                    })
+                    .collect();
+                cands.sort_by(|x, y| y.0.total_cmp(&x.0));
+                for (_, v) in cands.into_iter().take(2) {
+                    raw.push((rn, v));
+                }
             }
         }
     }
@@ -5156,11 +5287,8 @@ pub fn summarize_idp_cas_residue_typing(
                 }
                 for (cas, hits) in cas_spectra.iter().zip(hits_per_cas.iter()) {
                     if cas.mode == CasMode::Cacon && hits[s_idx] {
-                        sc += if cas.matches_residue(aa) {
-                            cfg.cas_match_llr
-                        } else {
-                            -cfg.cas_match_llr
-                        };
+                        let n_hits = hits.iter().filter(|&&h| h).count();
+                        sc += cas_llr_adjustment(cas, true, aa, cfg.cas_match_llr, 0, n_hits);
                     }
                 }
                 if sc > best_sc {
@@ -5212,11 +5340,8 @@ pub fn summarize_idp_cas_residue_typing(
                 }
                 for (cas, hits) in cas_spectra.iter().zip(hits_per_cas.iter()) {
                     if cas.mode == CasMode::Canco && hits[s_idx] {
-                        sc += if cas.matches_residue(aa) {
-                            cfg.cas_match_llr
-                        } else {
-                            -cfg.cas_match_llr
-                        };
+                        let n_hits = hits.iter().filter(|&&h| h).count();
+                        sc += cas_llr_adjustment(cas, true, aa, cfg.cas_match_llr, 0, n_hits);
                     }
                 }
                 if sc > best_sc {
@@ -5521,6 +5646,497 @@ mod tests {
             res.position,
             vec![1, 2, 3, 4, 5],
             "expected continuous chain through X-Pro via HNCACON N-N links"
+        );
+    }
+
+    #[test]
+    fn test_p2_idp_auto_ref_atomic_refusal_ns_spread_and_qc_notes() {
+        let mut systems = Vec::new();
+        for i in 0..10 {
+            let mut s =
+                ConDipeptideSystem::new(i, 174.0 + 0.3 * (i as f64), 120.0 + (i as f64), 100.0);
+            s.ca_prev.push(55.0);
+            s.cb_prev.push(30.0);
+            systems.push(s);
+        }
+
+        // 1. Atomic carbon refusal even when spread <= 1.0 ppm (CA refused at -3.8 -> C'/CB also zeroed)
+        let partial_refuse = IdpShiftOffsets {
+            d_n: -0.3,
+            d_c: -3.2,
+            d_ca: -3.8,
+            d_cb: -3.1,
+        };
+        let sf_atomic = evaluate_idp_auto_reference_safety(&systems, &partial_refuse);
+        assert!(sf_atomic.refused_nuclei.contains(&"13CA".to_string()));
+        assert_eq!(sf_atomic.safe_offsets.d_c, 0.0);
+        assert_eq!(sf_atomic.safe_offsets.d_ca, 0.0);
+        assert_eq!(sf_atomic.safe_offsets.d_cb, 0.0);
+        assert_eq!(sf_atomic.safe_offsets.d_n, -0.3);
+
+        // 2. NotSignificant (0.0) carbon channel excluded from spread -> TMS hint preserved, no false polarity warning
+        let tms_ns_cb = IdpShiftOffsets {
+            d_n: 0.0,
+            d_c: -2.62,
+            d_ca: -2.58,
+            d_cb: 0.0,
+        };
+        let sf_ns = evaluate_idp_auto_reference_safety(&systems, &tms_ns_cb);
+        assert!(
+            sf_ns.c13_spread_ppm < 0.1,
+            "NotSignificant CB=0.0 must not inflate carbon spread: {sf_ns:?}"
+        );
+        assert!(sf_ns.polarity_swap_warning.is_none());
+        assert!(
+            sf_ns
+                .tms_reference_hint
+                .as_deref()
+                .is_some_and(|h| h.contains("TMS")),
+            "expected TMS hint when CB=0.0 is excluded: {sf_ns:?}"
+        );
+
+        // 3. Moderate spread in 1.0..1.8 ppm emits warning
+        let mid_spread = IdpShiftOffsets {
+            d_n: 0.0,
+            d_c: -1.60,
+            d_ca: -0.20,
+            d_cb: -0.25,
+        };
+        let sf_mid = evaluate_idp_auto_reference_safety(&systems, &mid_spread);
+        assert!(
+            (1.0..=1.8).contains(&sf_mid.c13_spread_ppm),
+            "expected 1.0..1.8 spread, got {}",
+            sf_mid.c13_spread_ppm
+        );
+        assert!(sf_mid.polarity_swap_warning.is_some());
+        assert!(!sf_mid.warnings.is_empty());
+    }
+
+    #[test]
+    fn test_p2_hnco_hncacb_intensity_and_hncocacb_prevents_im1_leak() {
+        // Two CON roots whose ca_prev/cb_prev are EMPTY:
+        // - Root 0: HNCACB has strong 1J CA(i)/CB(i) and weaker 2J CA(i-1)/CB(i-1) -> intensity separates them!
+        // - Root 1: HNCACB has equal-height CA/CB doublets + HN(CO)CACB corroborates i-1 -> HN(CO)CACB separates them!
+        // - Root 2: nearly coincides with Root 0's HNCO (1-to-1 matching prevents stealing Root 0's HNCO!)
+        let mut systems = vec![
+            ConDipeptideSystem::new(0, 175.00, 121.00, 100.0),
+            ConDipeptideSystem::new(1, 176.20, 118.40, 100.0),
+            ConDipeptideSystem::new(2, 175.05, 121.12, 90.0),
+        ];
+
+        let hnco_pks = vec![
+            Peak::triple("HNCO", 8.25, 121.00, 175.00, 1).with_intensity(100.0, None),
+            Peak::triple("HNCO", 8.42, 118.40, 176.20, 1).with_intensity(100.0, None),
+        ];
+        let hncacb_pks = vec![
+            // Root 0: strong intra CA=58.2 / CB=64.0 (height 100/95), weaker i-1 CA=52.1 / CB=19.0 (height 45/40)
+            Peak::triple("HNCACB", 8.25, 121.00, 58.2, 1).with_intensity(100.0, None),
+            Peak::triple("HNCACB", 8.25, 121.00, 52.1, 1).with_intensity(45.0, None),
+            Peak::triple("HNCACB", 8.25, 121.00, 64.0, -1).with_intensity(95.0, None),
+            Peak::triple("HNCACB", 8.25, 121.00, 19.0, -1).with_intensity(40.0, None),
+            // Root 1: equal-height doublet, disambiguated by HN(CO)CACB i-1 peaks at 56.4 / 30.2
+            Peak::triple("HNCACB", 8.42, 118.40, 61.5, 1).with_intensity(80.0, None),
+            Peak::triple("HNCACB", 8.42, 118.40, 56.4, 1).with_intensity(82.0, None),
+            Peak::triple("HNCACB", 8.42, 118.40, 69.2, -1).with_intensity(80.0, None),
+            Peak::triple("HNCACB", 8.42, 118.40, 30.2, -1).with_intensity(81.0, None),
+            Peak::triple("HNCOCACB", 8.42, 118.40, 56.42, 1).with_intensity(90.0, None),
+            Peak::triple("HNCOCACB", 8.42, 118.40, 30.18, 1).with_intensity(88.0, None),
+        ];
+
+        let stats = attach_hnco_hncacb_to_con_systems(
+            &mut systems,
+            &hnco_pks,
+            &hncacb_pks,
+            HncacbPolarity::CbNegative,
+        );
+        // 1-to-1 matching: only 2 HNCO peaks exist so at most 2 CON roots match
+        assert_eq!(stats.n_con_roots_matched_hnco, 2);
+        assert!(systems[2].ca_curr.is_empty() && systems[2].cb_curr.is_empty());
+
+        // Root 0: only strong intra CA=58.2 / CB=64.0 enter ca_curr/cb_curr; weaker i-1 goes to prev
+        assert_eq!(systems[0].ca_curr, vec![58.2]);
+        assert_eq!(systems[0].cb_curr, vec![64.0]);
+        assert_eq!(systems[0].ca_prev, vec![52.1]);
+        assert_eq!(systems[0].cb_prev, vec![19.0]);
+
+        // Root 1: HN(CO)CACB blocks 56.4 / 30.2 from leaking into ca_curr/cb_curr
+        assert_eq!(systems[1].ca_curr, vec![61.5]);
+        assert_eq!(systems[1].cb_curr, vec![69.2]);
+        assert_eq!(systems[1].ca_prev, vec![56.4]);
+        assert_eq!(systems[1].cb_prev, vec![30.2]);
+    }
+
+    #[test]
+    fn test_p2_hncacon_near_diagonal_and_hncaconh_detected_axis() {
+        // 1. Near-diagonal (H)N(CA)CON Ser-repeat link (`|N(i-1) - N(i)| = 0.20 ppm <= 0.35 ppm`)
+        let con_roots = vec![
+            Con2DPeak {
+                c_prev_ppm: 174.2,
+                n_curr_ppm: 116.20,
+                height: 100.0,
+                volume: 100.0,
+                is_proline_imino_region: false,
+                deconvolved_from_cluster: false,
+            },
+            Con2DPeak {
+                c_prev_ppm: 175.4,
+                n_curr_ppm: 116.40, // 0.20 ppm from root 0 -> Ser-Ser near-diagonal!
+                height: 100.0,
+                volume: 100.0,
+                is_proline_imino_region: false,
+                deconvolved_from_cluster: false,
+            },
+            Con2DPeak {
+                c_prev_ppm: 176.5,
+                n_curr_ppm: 124.80, // isolated N -> autopeak must NOT become a fake link
+                height: 100.0,
+                volume: 100.0,
+                is_proline_imino_region: false,
+                deconvolved_from_cluster: false,
+            },
+        ];
+
+        let nx = 24usize;
+        let ny = 80usize;
+        let nz = 80usize;
+        let ax_c = AxisPpm::from_bounds("13C", nx, 179.0, 171.0, 150.0);
+        let ax_n2 = AxisPpm::from_bounds("15N", ny, 128.0, 112.0, 60.8);
+        let ax_n1 = AxisPpm::from_bounds("15N", nz, 128.0, 112.0, 60.8);
+        let mut cube = Spectrum3D {
+            name: "HNCACON".to_string(),
+            exp: "HNCACON".to_string(),
+            axis_x: ax_c.clone(),
+            axis_y: ax_n2.clone(),
+            axis_z: ax_n1.clone(),
+            data: vec![0.0f32; nx * ny * nz],
+        };
+        let mut rng = Rng::new(42);
+        for v in &mut cube.data {
+            *v = rng.normal(0.0, 1.0) as f32;
+        }
+        // Populate autopeaks for all 3 roots plus near-diagonal cross-peak at root 1 -> 116.20
+        for r in &con_roots {
+            let ic = (ax_c.ppm_to_index(r.c_prev_ppm).round() as usize).min(nx - 1);
+            let in_c = (ax_n2.ppm_to_index(r.n_curr_ppm).round() as usize).min(ny - 1);
+            let diag_z = (ax_n1.ppm_to_index(r.n_curr_ppm).round() as usize).min(nz - 1);
+            cube.data[(diag_z * ny + in_c) * nx + ic] = 9.0;
+        }
+        let ic1 = (ax_c.ppm_to_index(con_roots[1].c_prev_ppm).round() as usize).min(nx - 1);
+        let in1 = (ax_n2.ppm_to_index(con_roots[1].n_curr_ppm).round() as usize).min(ny - 1);
+        let part0 = (ax_n1.ppm_to_index(con_roots[0].n_curr_ppm).round() as usize).min(nz - 1);
+        cube.data[(part0 * ny + in1) * nx + ic1] = 8.5;
+
+        let links = pick_hncacon_nn_coadded(&[&cube], &con_roots, 3.5);
+        assert!(
+            links[1].iter().any(|&(n, _)| (n - 116.20).abs() <= 0.25),
+            "near-diagonal 0.20 ppm Ser-repeat link must be retained: {:?}",
+            links[1]
+        );
+        assert!(
+            links[2].is_empty(),
+            "isolated root autopeak with no nearby CON partner must stay empty: {:?}",
+            links[2]
+        );
+
+        // 2. HN(CA)CONH detected-axis orientation: axis_y is detected N(i), axis_z is partner N(i±1).
+        // Inject true reciprocal pair (118.0 <-> 122.0) on (H_0, N_y=118, N_z=122) & (H_1, N_y=122, N_z=118),
+        // PLUS a spurious peak at (H_0, N_y=126, N_z=118) that only broken Direction 2 would pick up at H_0!
+        let ax_h = AxisPpm::from_bounds("1H", 40, 9.2, 7.2, 600.0);
+        let ax_na = AxisPpm::from_bounds("15N", 60, 130.0, 112.0, 60.8);
+        let ax_nb = AxisPpm::from_bounds("15N", 60, 130.0, 112.0, 60.8);
+        let mut hncaconh = Spectrum3D {
+            name: "HNCACONH".to_string(),
+            exp: "HNCACONH".to_string(),
+            axis_x: ax_h.clone(),
+            axis_y: ax_na.clone(),
+            axis_z: ax_nb.clone(),
+            data: vec![0.0f32; 40 * 60 * 60],
+        };
+        for v in &mut hncaconh.data {
+            *v = rng.normal(0.0, 0.5) as f32;
+        }
+        let put = |sp: &mut Spectrum3D, h: f64, na: f64, nb: f64, val: f32| {
+            let ix = (sp.axis_x.ppm_to_index(h).round() as usize).min(sp.axis_x.size - 1);
+            let iy = (sp.axis_y.ppm_to_index(na).round() as usize).min(sp.axis_y.size - 1);
+            let iz = (sp.axis_z.ppm_to_index(nb).round() as usize).min(sp.axis_z.size - 1);
+            sp.data[(iz * sp.axis_y.size + iy) * sp.axis_x.size + ix] = val;
+        };
+        let roots = vec![(8.20, 118.0), (8.55, 122.0), (7.80, 126.0)];
+        // Diagonal + true reciprocal cross-peaks on detected axis_y -> partner axis_z
+        put(&mut hncaconh, 8.20, 118.0, 118.0, 12.0);
+        put(&mut hncaconh, 8.55, 122.0, 122.0, 12.0);
+        put(&mut hncaconh, 7.80, 126.0, 126.0, 12.0);
+        put(&mut hncaconh, 8.20, 118.0, 122.0, 9.0);
+        put(&mut hncaconh, 8.55, 122.0, 118.0, 9.0);
+        // Spurious noise/bleed at (H_0, N_y=126.0, N_z=118.0) and (H_2, N_y=118.0, N_z=126.0):
+        // wrong H for detected axis_y, so a fixed Direction-2 scanner MUST NOT emit (118.0, 126.0).
+        put(&mut hncaconh, 8.20, 126.0, 118.0, 9.0);
+        put(&mut hncaconh, 7.80, 118.0, 126.0, 9.0);
+
+        let pairs = extract_reciprocal_hncaconh_pairs(&hncaconh, &roots, 4.0);
+        assert!(
+            pairs
+                .iter()
+                .any(|&(a, b)| (a - 118.0).abs() < 0.4 && (b - 122.0).abs() < 0.4),
+            "true reciprocal (118, 122) pair must be recovered: {pairs:?}"
+        );
+        assert!(
+            !pairs.iter().any(
+                |&(a, b)| ((a - 118.0).abs() < 0.4 && (b - 126.0).abs() < 0.4)
+                    || ((a - 126.0).abs() < 0.4 && (b - 118.0).abs() < 0.4)
+            ),
+            "spurious wrong-H Direction-2 pair (118, 126) must NOT be extracted: {pairs:?}"
+        );
+    }
+
+    #[test]
+    fn test_p2_noisy_overlapped_cas_and_im1_hncacb_idp_benchmark() {
+        // Realistic stress test with:
+        // - coordinate jitter on CAS peaks + 20% breakthrough/false-positive CAS peaks on non-target roots
+        // - genuine i-1 HNCACB peaks alongside stronger intra i peaks (and inverted polarity!)
+        // - overlapping IDP shifts
+        let seq: Vec<String> = [
+            "MET", "SER", "ALA", "GLU", "LEU", "PRO", "THR", "VAL", "ASP", "GLY", "SER", "GLN",
+            "PHE", "ALA", "LYS", "ARG", "THR", "ILE", "PRO", "ASN", "HIS", "GLY", "GLU", "TYR",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let base_cfg = IdpSolverConfig::default();
+        let mut preds = predict_ncidp_shifts(&seq, &base_cfg);
+        let mut rng = Rng::new(2026);
+
+        // Create genuine IDP shift overlap so baseline without CAS/HNCO->HNCACB is ambiguous
+        let ave_c_ser = 0.5 * (preds[1].c_ppm + preds[10].c_ppm);
+        preds[1].c_ppm = ave_c_ser + 0.012;
+        preds[10].c_ppm = ave_c_ser - 0.012;
+        preds[2].n_ppm = 123.40;
+        preds[11].n_ppm = 123.44;
+        let ave_c_glu = 0.5 * (preds[3].c_ppm + preds[22].c_ppm);
+        preds[3].c_ppm = ave_c_glu - 0.015;
+        preds[22].c_ppm = ave_c_glu + 0.015;
+        preds[4].n_ppm = 121.80;
+        preds[23].n_ppm = 121.84;
+
+        let mut systems = Vec::new();
+        let mut cacon_ser_pks = Vec::new();
+        let mut cacon_ala_pks = Vec::new();
+        let mut canco_ser_pks = Vec::new();
+        let mut hnco_pks = Vec::new();
+        let mut hncacb_pks = Vec::new();
+
+        for k in 1..seq.len() {
+            let prv = &preds[k - 1];
+            let cur = &preds[k];
+            let c_prev = prv.c_ppm + rng.normal(0.0, 0.015);
+            let n_curr = cur.n_ppm + rng.normal(0.0, 0.05);
+            let mut s = ConDipeptideSystem::new(k - 1, c_prev, n_curr, 100.0);
+            // Leave ca_prev/cb_prev sparse (~50%) so HNCACB i-1 filtering must rely on intensity too
+            if k % 2 == 0 {
+                s.ca_prev.push(prv.ca_ppm);
+                if let Some(cb) = prv.cb_ppm {
+                    s.cb_prev.push(cb);
+                }
+            }
+            s.has_cbcacon_evidence = true;
+            systems.push(s);
+
+            if seq[k] != "PRO" {
+                let h_i = 8.05 + 0.05 * ((k % 11) as f64);
+                hnco_pks
+                    .push(Peak::triple("HNCO", h_i, n_curr, c_prev, 1).with_intensity(90.0, None));
+                // Inverted HNCACB with BOTH strong intra (i) AND weaker sequential (i-1) peaks
+                hncacb_pks.push(
+                    Peak::triple("HNCACB", h_i, n_curr, cur.ca_ppm, -1).with_intensity(100.0, None),
+                );
+                hncacb_pks.push(
+                    Peak::triple("HNCACB", h_i, n_curr, prv.ca_ppm, -1).with_intensity(45.0, None),
+                );
+                if let Some(cb) = cur.cb_ppm {
+                    hncacb_pks.push(
+                        Peak::triple("HNCACB", h_i, n_curr, cb, 1).with_intensity(90.0, None),
+                    );
+                }
+                if let Some(cb_p) = prv.cb_ppm {
+                    hncacb_pks.push(
+                        Peak::triple("HNCACB", h_i, n_curr, cb_p, 1).with_intensity(40.0, None),
+                    );
+                }
+            }
+
+            let jittered = CasPeak {
+                c_prime_ppm: c_prev + rng.normal(0.0, 0.015),
+                n_ppm: n_curr + rng.normal(0.0, 0.05),
+                height: 85.0,
+                volume: 85.0,
+            };
+            if seq[k - 1] == "SER" || k == 4 || k == 14 {
+                // True Ser(i-1) PLUS 2 breakthrough/accidental-overlap false positives at k=4,14!
+                cacon_ser_pks.push(jittered.clone());
+            }
+            if seq[k - 1] == "ALA" || k == 9 {
+                cacon_ala_pks.push(jittered.clone());
+            }
+            if seq[k] == "SER" || k == 19 {
+                canco_ser_pks.push(jittered);
+            }
+        }
+
+        let cas = vec![
+            CasSpectrum {
+                name: "cacon_ser".to_string(),
+                mode: CasMode::Cacon,
+                residues: vec!["SER".to_string()],
+                peaks: cacon_ser_pks,
+            },
+            CasSpectrum {
+                name: "cacon_ala".to_string(),
+                mode: CasMode::Cacon,
+                residues: vec!["ALA".to_string()],
+                peaks: cacon_ala_pks,
+            },
+            CasSpectrum {
+                name: "canco_ser".to_string(),
+                mode: CasMode::Canco,
+                residues: vec!["SER".to_string()],
+                peaks: canco_ser_pks,
+            },
+        ];
+
+        let mut sys_guided = systems.clone();
+        let stats = attach_hnco_hncacb_to_con_systems(
+            &mut sys_guided,
+            &hnco_pks,
+            &hncacb_pks,
+            HncacbPolarity::Auto,
+        );
+        assert!(stats.n_roots_with_hncacb_curr >= 18);
+        // Verify intensity separation prevented weaker i-1 CA from leaking into ca_curr on sparse roots
+        for (idx, s) in sys_guided.iter().enumerate() {
+            if seq[idx + 1] != "PRO" && !s.ca_curr.is_empty() {
+                assert!(
+                    s.ca_curr.len() <= 2,
+                    "root {idx} leaked extra CA peaks into ca_curr: {:?}",
+                    s.ca_curr
+                );
+            }
+        }
+
+        let mut cfg_guided = base_cfg.clone();
+        cfg_guided.cas_spectra = cas;
+        let res_base = assign_idp_13c_cpu(&systems, &seq, &base_cfg);
+        let res_guided = assign_idp_13c_cpu(&sys_guided, &seq, &cfg_guided);
+        let acc_base = (0..systems.len())
+            .filter(|&i| res_base.position[i] == ((i + 1) as i32))
+            .count();
+        let acc_guided = (0..sys_guided.len())
+            .filter(|&i| res_guided.position[i] == ((i + 1) as i32))
+            .count();
+        let hc_base = res_base.confidence.iter().filter(|&&c| c >= 0.80).count();
+        let hc_guided = res_guided.confidence.iter().filter(|&&c| c >= 0.80).count();
+        assert!(
+            acc_guided >= acc_base && acc_guided >= 20 && hc_guided >= hc_base,
+            "noisy/overlapped CAS + i/i-1 HNCACB must remain robust without brittle mis-assignments: base=({acc_base}, hc={hc_base}) guided=({acc_guided}, hc={hc_guided})"
+        );
+    }
+
+    #[test]
+    fn test_p2_clec16a_real_con_cas_regression() {
+        let Ok(data_dir) = std::env::var("NMR_REAL_DATA_DIR") else {
+            return;
+        };
+        let clec_root = std::path::PathBuf::from(data_dir).join("private/clec16a");
+        let exp_dir = clec_root.join("13C15N_Clec16aIDPR2_MG_091119");
+        let con_dir = exp_dir.join("10007/pdata/1");
+        let fasta_path = clec_root.join("clec16a_mouse_892-1050.fasta");
+        if !con_dir.exists() || !fasta_path.exists() {
+            return;
+        }
+
+        let fasta_txt = std::fs::read_to_string(&fasta_path).expect("read Clec16a fasta");
+        let seq: Vec<String> = fasta_txt
+            .lines()
+            .filter(|l| !l.trim_start().starts_with('>'))
+            .flat_map(|l| l.trim().chars())
+            .filter(|c| c.is_ascii_alphabetic())
+            .map(|c| crate::priors::one_to_three(c).to_string())
+            .filter(|r| r != "UNK")
+            .collect();
+        assert!(seq.len() >= 150, "expected ~159aa Clec16a IDPR2 sequence");
+
+        let con_spec = crate::spectrum::read_bruker_pdata_2d(&con_dir).expect("read CON 10007");
+        let pcfg = crate::c13_detected::C13PickerConfig::default();
+        let con_roots = crate::c13_detected::pick_con_2d(&con_spec, &pcfg);
+        assert!(
+            con_roots.len() >= 120,
+            "expected >= 120 picked CON roots on Clec16a 10007, got {}",
+            con_roots.len()
+        );
+
+        let mut cas_spectra = Vec::new();
+        for (sub, name, mode, res) in [
+            ("10013/pdata/1", "cacon_ala", CasMode::Cacon, "ALA"),
+            ("10014/pdata/1", "canco_ala", CasMode::Canco, "ALA"),
+            ("10015/pdata/1", "cacon_gly", CasMode::Cacon, "GLY"),
+        ] {
+            let p = exp_dir.join(sub);
+            if p.exists() {
+                let sp = crate::spectrum::read_bruker_pdata_2d(&p).expect("read CAS 2D");
+                let pks = crate::c13_detected::pick_con_2d(&sp, &pcfg)
+                    .into_iter()
+                    .map(|pk| CasPeak {
+                        c_prime_ppm: pk.c_prev_ppm,
+                        n_ppm: pk.n_curr_ppm,
+                        height: pk.height,
+                        volume: pk.volume,
+                    })
+                    .collect();
+                cas_spectra.push(CasSpectrum {
+                    name: name.to_string(),
+                    mode,
+                    residues: vec![res.to_string()],
+                    peaks: pks,
+                });
+            }
+        }
+        assert_eq!(cas_spectra.len(), 3);
+
+        let ds = C13PickedDataset {
+            con_roots,
+            caco_peaks: Vec::new(),
+            strip_peaks: Vec::new(),
+        };
+        let systems = register_and_build_con_dipeptide_systems(&ds);
+        let cfg = IdpSolverConfig {
+            cas_spectra: cas_spectra.clone(),
+            replicas: 8,
+            steps_per_system: 400,
+            seed: 0,
+            ..IdpSolverConfig::default()
+        };
+        let raw_off = estimate_idp_reference_offsets(&systems, &seq, &cfg);
+        let safety = evaluate_idp_auto_reference_safety(&systems, &raw_off);
+        assert!(
+            safety.safe_offsets.d_c < -1.5 && safety.safe_offsets.d_c > -3.5,
+            "expected Clec16a TMS-referenced 13C' offset in -3.5..-1.5 ppm, got {:?}",
+            safety.safe_offsets
+        );
+        let typing =
+            summarize_idp_cas_residue_typing(&systems, &cas_spectra, &cfg, &safety.safe_offsets);
+        assert!(
+            typing
+                .cacon_hit_counts
+                .get("cacon_ala")
+                .copied()
+                .unwrap_or(0)
+                >= 5,
+            "expected >= 5 cacon_ala hits on real Clec16a CON+CAS: {typing:?}"
+        );
+        let res = assign_idp_13c_cpu(&systems, &seq, &cfg);
+        let n_placed = res.position.iter().filter(|&&p| p >= 0).count();
+        assert!(
+            n_placed >= 100,
+            "expected >= 100 placed residues on real Clec16a CON+CAS, got {n_placed}"
         );
     }
 }

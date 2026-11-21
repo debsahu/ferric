@@ -357,6 +357,9 @@ pub struct SpectrumPolarityReport {
     pub non_gly_med_pos: Option<f64>,
     pub non_gly_med_neg: Option<f64>,
     pub summary: String,
+    /// Optional guard/ambiguity warning emitted when auto-detection falls back conservatively.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
 }
 
 /// Polarity diagnostics across `HNCACB` and `CBCACONH`/`HN(CO)CACB` (`RD-1`).
@@ -468,6 +471,10 @@ fn detect_ca_cb_spectrum_polarity(
 
     let n_pos = pos_c.len();
     let n_neg = neg_c.len();
+    let total = n_pos + n_neg;
+    // Strictly pure CB diagnostic windows (`173.pol:P1-6`):
+    // Ala CB (14.5..=22.5 ppm) and Thr CB (65.5..=72.5 ppm).
+    // Deliberately excludes 60.0..65.0 ppm to prevent Val/Ile/Thr CA bleed into CB votes.
     let ala_cb_pos = pos_c
         .iter()
         .filter(|&&c| (14.5..=22.5).contains(&c))
@@ -484,85 +491,19 @@ fn detect_ca_cb_spectrum_polarity(
         .iter()
         .filter(|&&c| (65.5..=72.5).contains(&c))
         .count();
-    let st_cb_pos = pos_c
-        .iter()
-        .filter(|&&c| (60.0..=72.5).contains(&c))
-        .count();
-    let st_cb_neg = neg_c
-        .iter()
-        .filter(|&&c| (60.0..=72.5).contains(&c))
-        .count();
+    let cb_band_pos = ala_cb_pos + thr_cb_pos;
+    let cb_band_neg = ala_cb_neg + thr_cb_neg;
     let non_gly_med_pos = non_gly_median(&pos_c);
     let non_gly_med_neg = non_gly_median(&neg_c);
 
-    if only_when_opposite_signs {
-        let min_cnt = n_pos.min(n_neg);
-        let max_cnt = n_pos.max(n_neg);
-        if min_cnt < 2 || min_cnt * 6 < max_cnt {
-            return Some(SpectrumPolarityReport {
-                experiment: exp_label.to_string(),
-                detected: DetectedPolarity::SingleSign,
-                signs_inverted: false,
-                n_pos,
-                n_neg,
-                ala_cb_pos,
-                ala_cb_neg,
-                thr_cb_pos,
-                thr_cb_neg,
-                non_gly_med_pos,
-                non_gly_med_neg,
-                summary: format!(
-                    "{exp_label}: single-sign ({n_pos} pos, {n_neg} neg); signs unchanged"
-                ),
-            });
-        }
-    }
-
-    if let Some(mode) = override_mode {
-        match mode {
-            HncacbPolarity::CbPositive => {
-                return Some(SpectrumPolarityReport {
-                    experiment: exp_label.to_string(),
-                    detected: DetectedPolarity::CbPositive,
-                    signs_inverted: true,
-                    n_pos,
-                    n_neg,
-                    ala_cb_pos,
-                    ala_cb_neg,
-                    thr_cb_pos,
-                    thr_cb_neg,
-                    non_gly_med_pos,
-                    non_gly_med_neg,
-                    summary: format!(
-                        "{exp_label}: override cb-positive -> signs inverted to CA>=0/CB<0"
-                    ),
-                });
-            }
-            HncacbPolarity::CbNegative => {
-                return Some(SpectrumPolarityReport {
-                    experiment: exp_label.to_string(),
-                    detected: DetectedPolarity::CbNegative,
-                    signs_inverted: false,
-                    n_pos,
-                    n_neg,
-                    ala_cb_pos,
-                    ala_cb_neg,
-                    thr_cb_pos,
-                    thr_cb_neg,
-                    non_gly_med_pos,
-                    non_gly_med_neg,
-                    summary: format!("{exp_label}: override cb-negative -> signs kept as-is"),
-                });
-            }
-            HncacbPolarity::Auto => {}
-        }
-    }
-
-    if n_pos == 0 || n_neg == 0 {
-        return Some(SpectrumPolarityReport {
+    let make_report = |detected: DetectedPolarity,
+                       signs_inverted: bool,
+                       summary: String,
+                       warning: Option<String>| {
+        SpectrumPolarityReport {
             experiment: exp_label.to_string(),
-            detected: DetectedPolarity::SingleSign,
-            signs_inverted: false,
+            detected,
+            signs_inverted,
             n_pos,
             n_neg,
             ala_cb_pos,
@@ -571,40 +512,147 @@ fn detect_ca_cb_spectrum_polarity(
             thr_cb_neg,
             non_gly_med_pos,
             non_gly_med_neg,
-            summary: format!(
-                "{exp_label}: single-sign ({n_pos} pos, {n_neg} neg); auto-detection skipped"
-            ),
-        });
+            summary,
+            warning,
+        }
+    };
+
+    if let Some(mode) = override_mode {
+        match mode {
+            HncacbPolarity::CbPositive => {
+                return Some(make_report(
+                    DetectedPolarity::CbPositive,
+                    true,
+                    format!("{exp_label}: override cb-positive -> signs inverted to CA>=0/CB<0"),
+                    None,
+                ));
+            }
+            HncacbPolarity::CbNegative => {
+                return Some(make_report(
+                    DetectedPolarity::CbNegative,
+                    false,
+                    format!("{exp_label}: override cb-negative -> signs kept as-is"),
+                    None,
+                ));
+            }
+            HncacbPolarity::Auto => {}
+        }
     }
 
-    let mut cb_pos_votes =
-        2.5 * (ala_cb_pos as f64) + 1.5 * (thr_cb_pos as f64) + 0.20 * (st_cb_pos as f64);
-    let mut cb_neg_votes =
-        2.5 * (ala_cb_neg as f64) + 1.5 * (thr_cb_neg as f64) + 0.20 * (st_cb_neg as f64);
-    let mut signs_inverted = cb_pos_votes > cb_neg_votes + 0.5;
+    let min_cnt = n_pos.min(n_neg);
+    if only_when_opposite_signs {
+        // CBCA(CO)NH / HN(CO)CACB opposite-sign guard (`173.pol:P1-7`):
+        // require minority sign >= 25% (`min_cnt * 4 >= total`) and >= 5 minority peaks.
+        if min_cnt < 5 || min_cnt * 4 < total {
+            return Some(make_report(
+                DetectedPolarity::SingleSign,
+                false,
+                format!("{exp_label}: single-sign ({n_pos} pos, {n_neg} neg); signs unchanged"),
+                None,
+            ));
+        }
+    } else {
+        // HNCACB guard (`173.pol:P1-6`): require both signs with sufficient minority support
+        // (`>= 3` peaks and `>= 25%` minority fraction); on failure keep `cb-negative` and warn.
+        if n_pos == 0 || n_neg == 0 {
+            let warn = format!(
+                "{exp_label}: single-sign ({n_pos} pos, {n_neg} neg); polarity auto-detection skipped (keeping cb-negative convention)"
+            );
+            return Some(make_report(
+                DetectedPolarity::SingleSign,
+                false,
+                warn.clone(),
+                Some(warn),
+            ));
+        }
+        if min_cnt < 3 || min_cnt * 4 < total {
+            let minority_pct = 100.0 * (min_cnt as f64) / (total.max(1) as f64);
+            let warn = format!(
+                "{exp_label}: sparse minority sign ({n_pos} pos, {n_neg} neg; minority {minority_pct:.1}% < 25% or < 3 peaks); keeping cb-negative convention"
+            );
+            return Some(make_report(
+                DetectedPolarity::CbNegative,
+                false,
+                warn.clone(),
+                Some(warn),
+            ));
+        }
+    }
+
+    let mut cb_pos_votes = 2.5 * (ala_cb_pos as f64) + 1.5 * (thr_cb_pos as f64);
+    let mut cb_neg_votes = 2.5 * (ala_cb_neg as f64) + 1.5 * (thr_cb_neg as f64);
+    let mut decisive_median_cb_pos = false;
+    let mut decisive_median_cb_neg = false;
     if let (Some(mp), Some(mn)) = (non_gly_med_pos, non_gly_med_neg) {
         if mn - mp >= 3.0 {
             cb_pos_votes += ((mn - mp) / 2.5).clamp(1.0, 10.0);
         } else if mp - mn >= 3.0 {
             cb_neg_votes += ((mp - mn) / 2.5).clamp(1.0, 10.0);
         }
-        signs_inverted = cb_pos_votes > cb_neg_votes + 0.5;
-        // Decisive physical override: when both signs have >= 3 non-Gly shifts with one median
-        // in the CB range (<= 44.5 ppm) and the other in the CA range (>= 49.0 ppm), the low-ppm
-        // median is unambiguously CB even under 13..23 / 65..74 ppm baseline-roll noise spurs.
+        // Decisive non-Gly median separation (CA >= 49.0 ppm vs CB <= 44.5 ppm), still subject
+        // to the Ala/Thr CB-band count guards below.
         if n_pos >= 3
             && n_neg >= 3
             && (mp - mn).abs() >= 6.0
             && mp.min(mn) <= 44.5
             && mp.max(mn) >= 49.0
         {
-            signs_inverted = mn > mp;
+            decisive_median_cb_pos = mn > mp;
+            decisive_median_cb_neg = mp > mn;
         }
     }
+
+    let min_cb_band = if only_when_opposite_signs { 5 } else { 3 };
+    let vote_margin = 2.5;
+    let strong_cb_pos = cb_band_pos >= min_cb_band
+        && ((cb_pos_votes >= cb_neg_votes + vote_margin && cb_band_pos > cb_band_neg)
+            || (decisive_median_cb_pos && cb_band_pos >= cb_band_neg));
+    let strong_cb_neg = cb_band_neg >= min_cb_band
+        && ((cb_neg_votes >= cb_pos_votes + vote_margin && cb_band_neg > cb_band_pos)
+            || (decisive_median_cb_neg && cb_band_neg >= cb_band_pos));
+
+    if only_when_opposite_signs {
+        // CBCA(CO)NH must show >= 5 Ala/Thr CB-band peaks of the chosen CB sign + clear margin;
+        // otherwise keep `SingleSign` so unmatched peaks are not force-typed by sign (`173.pol:P1-7`).
+        let (detected, signs_inverted) = if strong_cb_pos {
+            (DetectedPolarity::CbPositive, true)
+        } else if strong_cb_neg {
+            (DetectedPolarity::CbNegative, false)
+        } else {
+            return Some(make_report(
+                DetectedPolarity::SingleSign,
+                false,
+                format!(
+                    "{exp_label}: single-sign fallback ({n_pos} pos [Ala+ThrCB={cb_band_pos}], {n_neg} neg [Ala+ThrCB={cb_band_neg}] < {min_cb_band} or weak margin); signs unchanged"
+                ),
+                None,
+            ));
+        };
+        let med_p_s = non_gly_med_pos
+            .map(|v| format!("{v:.1}"))
+            .unwrap_or_else(|| "NA".to_string());
+        let med_n_s = non_gly_med_neg
+            .map(|v| format!("{v:.1}"))
+            .unwrap_or_else(|| "NA".to_string());
+        let summary = format!(
+            "{exp_label}: {detected} (pos={n_pos} [AlaCB={ala_cb_pos}, ThrCB={thr_cb_pos}, med={med_p_s}], neg={n_neg} [AlaCB={ala_cb_neg}, ThrCB={thr_cb_neg}, med={med_n_s}], score +CB={cb_pos_votes:.2} vs -CB={cb_neg_votes:.2}{})",
+            if signs_inverted { "; signs normalized" } else { "" }
+        );
+        return Some(make_report(detected, signs_inverted, summary, None));
+    }
+
+    let signs_inverted = strong_cb_pos;
     let detected = if signs_inverted {
         DetectedPolarity::CbPositive
     } else {
         DetectedPolarity::CbNegative
+    };
+    let warning = if !signs_inverted && cb_pos_votes > cb_neg_votes {
+        Some(format!(
+            "{exp_label}: ambiguous CB-positive polarity vote (+CB={cb_pos_votes:.2} vs -CB={cb_neg_votes:.2}, Ala+ThrCB pos={cb_band_pos} < {min_cb_band} or margin < {vote_margin:.1}); keeping cb-negative convention"
+        ))
+    } else {
+        None
     };
     let med_p_s = non_gly_med_pos
         .map(|v| format!("{v:.1}"))
@@ -617,20 +665,7 @@ fn detect_ca_cb_spectrum_polarity(
         if signs_inverted { "; signs normalized" } else { "" }
     );
 
-    Some(SpectrumPolarityReport {
-        experiment: exp_label.to_string(),
-        detected,
-        signs_inverted,
-        n_pos,
-        n_neg,
-        ala_cb_pos,
-        ala_cb_neg,
-        thr_cb_pos,
-        thr_cb_neg,
-        non_gly_med_pos,
-        non_gly_med_neg,
-        summary,
-    })
+    Some(make_report(detected, signs_inverted, summary, warning))
 }
 
 /// Detect and normalize inverted `CB`-positive `HNCACB` (and opposite-sign `CBCACONH`/`HNCOCACB`)
@@ -687,9 +722,11 @@ fn root_has_intra_ca_support(peaks: &[Peak], root: &Peak, tol: &Tolerances) -> b
     })
 }
 
-/// Merge paired sidechain `Asn`/`Gln` `NH2` doublets (`15N` in `108–115 ppm`, `|dN| <= 0.15 ppm`,
-/// `|dH|` around `~0.7 ppm` `[0.35, 1.10] ppm`) when both prongs lack intra-residue `CA(i)`
-/// support (`RD-5`). Returns `(merged_peaks, n_pairs_merged, merged_nh2_root_coords)`.
+/// Merge paired sidechain `Asn`/`Gln` `NH2` doublets (`15N` in `107.5–115.5 ppm`, both `1H` in
+/// `6.4–7.9 ppm`, `|dN| <= 0.15 ppm`, `|dH|` around `~0.7 ppm` `[0.35, 1.10] ppm`) when both
+/// prongs lack intra-residue `CA(i)` support (`RD-5`). When `HNCO` peaks are present on either
+/// prong, also require a shared `HNCO` `C'` shift within `tol.carbon_tol("C").max(0.35)` ppm so
+/// backbone `Gly` amides cannot merge. Returns `(merged_peaks, n_pairs_merged, merged_nh2_root_coords)`.
 pub fn merge_nh2_root_pairs(
     peaks: &[Peak],
     tol: &Tolerances,
@@ -712,13 +749,32 @@ pub fn merge_nh2_root_pairs(
         .map(|&idx| !has_ca_3d || !root_has_intra_ca_support(peaks, &peaks[idx], tol))
         .collect();
 
+    let hnco_peaks: Vec<&Peak> = peaks
+        .iter()
+        .filter(|p| p.exp == "HNCO" && p.c.is_some())
+        .collect();
+    let root_hnco_c: Vec<Vec<f64>> = hsqc_indices
+        .iter()
+        .map(|&idx| {
+            let r = &peaks[idx];
+            hnco_peaks
+                .iter()
+                .filter_map(|p| {
+                    let d = ((p.h - r.h) / tol.h).hypot((p.n - r.n) / tol.n);
+                    (d <= 1.25).then_some(p.c?).filter(|c| c.is_finite())
+                })
+                .collect()
+        })
+        .collect();
+    let hnco_c_tol = tol.carbon_tol("C").max(0.35);
+
     let mut cand_pairs: Vec<(f64, usize, usize)> = Vec::new();
     for a in 0..hsqc_indices.len() {
         if !lacks_ca[a] {
             continue;
         }
         let pa = &peaks[hsqc_indices[a]];
-        if !(107.5..=115.5).contains(&pa.n) {
+        if !(107.5..=115.5).contains(&pa.n) || !(6.4..=7.9).contains(&pa.h) {
             continue;
         }
         for b in (a + 1)..hsqc_indices.len() {
@@ -726,12 +782,23 @@ pub fn merge_nh2_root_pairs(
                 continue;
             }
             let pb = &peaks[hsqc_indices[b]];
-            if !(107.5..=115.5).contains(&pb.n) {
+            if !(107.5..=115.5).contains(&pb.n) || !(6.4..=7.9).contains(&pb.h) {
                 continue;
             }
             let dn = (pa.n - pb.n).abs();
             let dh = (pa.h - pb.h).abs();
             if dn <= 0.15 && (0.35..=1.10).contains(&dh) {
+                // If HNCO is present on either prong, require a shared sidechain C' shift
+                let ha_c = &root_hnco_c[a];
+                let hb_c = &root_hnco_c[b];
+                if !ha_c.is_empty() || !hb_c.is_empty() {
+                    let shared_c = ha_c
+                        .iter()
+                        .any(|&ca| hb_c.iter().any(|&cb| (ca - cb).abs() <= hnco_c_tol));
+                    if !shared_c {
+                        continue;
+                    }
+                }
                 let score = ((dh - 0.70).abs() / 0.25).hypot(dn / 0.08);
                 cand_pairs.push((score, a, b));
             }
@@ -1744,15 +1811,25 @@ mod tests {
     fn test_rd1_opposite_sign_cbcaconh_auto_detection_and_overrides() {
         let mut peaks = vec![
             Peak::hsqc(8.10, 121.0),
+            Peak::hsqc(8.20, 122.0),
             Peak::hsqc(8.30, 123.0),
+            Peak::hsqc(8.40, 119.0),
             Peak::hsqc(8.50, 118.0),
+            Peak::hsqc(8.60, 120.0),
             // Opposite-sign CBCACONH with inverted polarity (CB positive, CA negative)
+            // >= 5 Ala/Thr CB peaks with >= 25% minority sign (`173.pol:P1-7`).
             Peak::triple("CBCACONH", 8.10, 121.0, 52.5, -1).with_intensity(100.0, None),
             Peak::triple("CBCACONH", 8.10, 121.0, 19.0, 1).with_intensity(90.0, None),
+            Peak::triple("CBCACONH", 8.20, 122.0, 53.0, -1).with_intensity(100.0, None),
+            Peak::triple("CBCACONH", 8.20, 122.0, 18.2, 1).with_intensity(90.0, None),
             Peak::triple("CBCACONH", 8.30, 123.0, 61.8, -1).with_intensity(100.0, None),
             Peak::triple("CBCACONH", 8.30, 123.0, 69.5, 1).with_intensity(85.0, None),
-            Peak::triple("CBCACONH", 8.50, 118.0, 56.0, -1).with_intensity(100.0, None),
-            Peak::triple("CBCACONH", 8.50, 118.0, 29.5, 1).with_intensity(85.0, None),
+            Peak::triple("CBCACONH", 8.40, 119.0, 62.2, -1).with_intensity(100.0, None),
+            Peak::triple("CBCACONH", 8.40, 119.0, 68.8, 1).with_intensity(85.0, None),
+            Peak::triple("CBCACONH", 8.50, 118.0, 52.8, -1).with_intensity(100.0, None),
+            Peak::triple("CBCACONH", 8.50, 118.0, 17.5, 1).with_intensity(85.0, None),
+            Peak::triple("CBCACONH", 8.60, 120.0, 56.0, -1).with_intensity(100.0, None),
+            Peak::triple("CBCACONH", 8.60, 120.0, 29.5, 1).with_intensity(85.0, None),
         ];
 
         let (norm, rep) = normalize_hncacb_and_cbcaconh_polarity(&peaks, HncacbPolarity::Auto);
@@ -1782,6 +1859,136 @@ mod tests {
         assert!(ovr_kept
             .iter()
             .any(|p| p.exp == "HNCACB" && p.c == Some(19.0) && p.sign > 0));
+    }
+
+    #[test]
+    fn test_p1_6_hncacb_weak_cb_counterexample_stays_cb_negative() {
+        // Exact counterexample from 173.pol:P1-6:
+        // 111 positive CA peaks (including 21 Val/Ile/Thr CA in 60.0..65.0 ppm)
+        // + 2 negative artifacts at 61.0 and 62.5 ppm MUST stay cb-negative and emit a warning.
+        let mut peaks = vec![Peak::hsqc(8.20, 120.0)];
+        for i in 0..90 {
+            let ca = 50.0 + (i % 10) as f64 * 0.9;
+            peaks.push(Peak::triple("HNCACB", 8.20, 120.0, ca, 1).with_intensity(100.0, None));
+        }
+        for i in 0..21 {
+            let vit_ca = 60.2 + (i % 9) as f64 * 0.45;
+            peaks.push(Peak::triple("HNCACB", 8.20, 120.0, vit_ca, 1).with_intensity(100.0, None));
+        }
+        peaks.push(Peak::triple("HNCACB", 8.20, 120.0, 61.0, -1).with_intensity(25.0, None));
+        peaks.push(Peak::triple("HNCACB", 8.20, 120.0, 62.5, -1).with_intensity(25.0, None));
+
+        let (norm, rep) = normalize_hncacb_and_cbcaconh_polarity(&peaks, HncacbPolarity::Auto);
+        let h = rep.hncacb.as_ref().expect("hncacb polarity report");
+        assert_eq!(h.detected, DetectedPolarity::CbNegative);
+        assert!(!h.signs_inverted);
+        assert!(
+            h.warning.is_some(),
+            "sparse minority HNCACB must emit a fallback warning"
+        );
+        assert_eq!(
+            norm.iter()
+                .filter(|p| p.exp == "HNCACB" && p.sign > 0)
+                .count(),
+            111
+        );
+
+        // Even with >= 25% negative peaks in 60..65 ppm (Val/Ile/Thr CA bleed) and 0 Ala/Thr CB peaks,
+        // dropping 60..65 ppm and requiring >= 3 Ala/Thr CB-band peaks keeps cb-negative.
+        let mut peaks_bleed = vec![Peak::hsqc(8.20, 120.0)];
+        for i in 0..25 {
+            let ca = 52.0 + (i % 6) as f64 * 0.5;
+            peaks_bleed.push(Peak::triple("HNCACB", 8.20, 120.0, ca, 1));
+        }
+        for i in 0..15 {
+            let vit = 60.2 + (i % 8) as f64 * 0.5;
+            peaks_bleed.push(Peak::triple("HNCACB", 8.20, 120.0, vit, 1));
+        }
+        for i in 0..15 {
+            let neg_art = 60.5 + (i % 7) as f64 * 0.5;
+            peaks_bleed.push(Peak::triple("HNCACB", 8.20, 120.0, neg_art, -1));
+        }
+        let (_, rep_bleed) =
+            normalize_hncacb_and_cbcaconh_polarity(&peaks_bleed, HncacbPolarity::Auto);
+        let hb = rep_bleed.hncacb.as_ref().expect("hncacb bleed report");
+        assert_eq!(hb.detected, DetectedPolarity::CbNegative);
+        assert!(!hb.signs_inverted);
+    }
+
+    #[test]
+    fn test_p1_7_cbcaconh_noise_counterexample_stays_single_sign() {
+        // Exact counterexample from 173.pol:P1-7:
+        // 30 positive peaks (same-sign CBCA(CO)NH) + 6 negative noise peaks -> SingleSign, not flipped.
+        let mut peaks = Vec::new();
+        for i in 0..15 {
+            let h = 7.8 + (i as f64) * 0.08;
+            let n = 116.0 + (i as f64) * 0.9;
+            peaks.push(Peak::hsqc(h, n));
+            // Same-sign positive CA and CB peaks
+            peaks.push(Peak::triple("CBCACONH", h, n, 54.0 + (i % 5) as f64, 1));
+            peaks.push(Peak::triple(
+                "CBCACONH",
+                h,
+                n,
+                if i < 6 { 18.5 } else { 31.0 + (i % 4) as f64 },
+                1,
+            ));
+        }
+        // 6 negative noise spikes (16.7% minority < 25%)
+        for i in 0..6 {
+            let h = 7.8 + (i as f64) * 0.08;
+            let n = 116.0 + (i as f64) * 0.9;
+            peaks.push(Peak::triple("CBCACONH", h, n, 58.0 + (i as f64) * 0.5, -1));
+        }
+
+        let (norm, rep) = normalize_hncacb_and_cbcaconh_polarity(&peaks, HncacbPolarity::Auto);
+        let c = rep.cbcaconh.as_ref().expect("cbcaconh polarity report");
+        assert_eq!(c.detected, DetectedPolarity::SingleSign);
+        assert!(!c.signs_inverted);
+        assert_eq!(
+            norm.iter()
+                .filter(|p| p.exp == "CBCACONH" && p.sign > 0)
+                .count(),
+            30
+        );
+
+        // Verify build_spin_systems does NOT force positive Ala CB (18.5 ppm) into CA(i-1)
+        let built = build_spin_systems(&peaks, &Tolerances::default(), 3, false).unwrap();
+        let leaked_cb_into_ca = built.iter().any(|ss| {
+            ss.cands
+                .get(&("CA".to_string(), -1))
+                .is_some_and(|v| v.iter().any(|&(x, _)| (x - 18.5).abs() < 0.2))
+        });
+        assert!(
+            !leaked_cb_into_ca,
+            "same-sign CBCA(CO)NH CB(i-1)=18.5 ppm must NOT be forced to CA"
+        );
+    }
+
+    #[test]
+    fn test_p2_nh2_merging_blocks_gly_amides_and_mismatched_hnco() {
+        let tol = Tolerances::default();
+        let peaks = vec![
+            // Two Gly amides in 107.5..115.5 ppm with |dH| = 0.70 ppm but 1H outside 6.4..7.9 -> MUST NOT merge
+            Peak::hsqc(8.05, 110.20).with_intensity(90.0, None),
+            Peak::hsqc(8.75, 110.22).with_intensity(85.0, None),
+            // Two peaks inside 6.4..7.9 ppm and 107.5..115.5 ppm but DIFFERENT HNCO C' -> MUST NOT merge
+            Peak::hsqc(6.95, 113.40).with_intensity(80.0, None),
+            Peak::hsqc(7.65, 113.42).with_intensity(78.0, None),
+            Peak::triple("HNCO", 6.95, 113.40, 173.1, 1).with_intensity(70.0, None),
+            Peak::triple("HNCO", 7.65, 113.42, 176.9, 1).with_intensity(70.0, None),
+            // Genuine Asn/Gln NH2 doublet in 6.4..7.9 ppm with shared HNCO C' -> MUST merge
+            Peak::hsqc(6.82, 112.10).with_intensity(85.0, None),
+            Peak::hsqc(7.52, 112.12).with_intensity(82.0, None),
+            Peak::triple("HNCO", 6.82, 112.10, 176.4, 1).with_intensity(75.0, None),
+            Peak::triple("HNCO", 7.52, 112.12, 176.45, 1).with_intensity(72.0, None),
+        ];
+
+        let (merged, n_pairs, coords) = merge_nh2_root_pairs(&peaks, &tol);
+        assert_eq!(n_pairs, 1);
+        assert_eq!(coords.len(), 1);
+        assert!((coords[0].1 - 112.11).abs() < 0.05);
+        assert_eq!(merged.iter().filter(|p| p.exp == "HSQC").count(), 5);
     }
 
     #[test]

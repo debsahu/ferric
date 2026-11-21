@@ -3031,7 +3031,16 @@ pub fn parse_cas_peaks_str(
         return Err(format!("no valid (C', N) CAS peaks parsed from {loc}"));
     }
 
-    Ok((inferred_mode.unwrap_or(CasMode::Cacon), peaks))
+    let mode = inferred_mode.ok_or_else(|| {
+        let loc = path_hint
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "<memory>".to_string());
+        format!(
+            "cannot infer CAS direction (cacon = i-1 vs canco = i) for {loc}; specify cacon_<res>=<path> or canco_<res>=<path> explicitly"
+        )
+    })?;
+
+    Ok((mode, peaks))
 }
 
 /// Match CAS `(C'(i-1), N(i))` peaks to `(c_prev, n_curr)` roots within the `(c_tol, n_tol)` ellipse
@@ -3114,6 +3123,10 @@ pub fn match_cas_peaks_to_roots(
 
 /// Evaluate the per-residue log-likelihood evidence (nats) contributed by one `CAS` subspectrum
 /// at a root `(matched = true|false)` for candidate residue `target_res` (`RD-4`).
+///
+/// Uses a calibrated overlap/breakthrough likelihood model `(p_tp, p_fp)` rather than a brittle
+/// hard mismatch cliff so crowded IDP `CON` overlaps and pulse-program breakthrough never
+/// catastrophically override strong `CA`/`CB` or sequential evidence.
 #[inline]
 pub fn cas_llr_adjustment(
     cas: &CasSpectrum,
@@ -3123,16 +3136,32 @@ pub fn cas_llr_adjustment(
     seq_type_count: usize,
     n_root_hits: usize,
 ) -> f64 {
+    let scale = (match_llr / CAS_LOG_LIKELIHOOD_NATS).clamp(0.0, 2.0);
+    if scale <= 0.0 {
+        return 0.0;
+    }
     let in_type = cas.matches_residue(target_res);
+    let p_tp = 0.82f64;
+    let excess_fp = if seq_type_count > 0 && n_root_hits > seq_type_count {
+        (((n_root_hits - seq_type_count) as f64) / (n_root_hits as f64)) * 0.45
+    } else {
+        0.0
+    };
+    let p_fp = (0.12 + excess_fp).clamp(0.10, 0.52);
+
     if matched {
         if in_type {
-            match_llr
+            (p_tp / p_fp).ln().clamp(0.40, 2.10) * scale
         } else {
-            -match_llr
+            // Calibrated overlap/breakthrough mismatch penalty: bounded (~ -0.74 clean, ~ -0.20 crowded)
+            ((p_fp / (1.0 - p_fp)).ln().clamp(-1.35, -0.20) * 0.55) * scale
         }
     } else if in_type && seq_type_count > 0 && n_root_hits > 0 {
         let cov = ((n_root_hits as f64) / (seq_type_count as f64)).clamp(0.05, 0.90);
-        ((1.0 - 0.65 * cov) / 0.95).ln().clamp(-1.0, 0.0)
+        ((1.0 - p_tp * cov) / (1.0 - p_fp * cov))
+            .ln()
+            .clamp(-0.85, 0.0)
+            * scale
     } else {
         0.0
     }
@@ -3178,6 +3207,27 @@ mod tests {
                 CAS_MATCH_TOL_N15_PPM
             ),
             vec![true, false]
+        );
+
+        // Missing direction must error instead of silently defaulting to Cacon
+        let ambig_tsv = "c_prime\tn15\theight\n175.40\t116.20\t5000\n";
+        let err = parse_cas_peaks_str(ambig_tsv, Some(Path::new("peaks_ser.tsv")), None)
+            .expect_err("ambiguous CAS direction must return Err");
+        assert!(err.contains("cacon") && err.contains("canco"), "got: {err}");
+
+        // Calibrated overlap/breakthrough CAS LLR: no -3 nats cliff and softens under excess hits
+        let clean_pos = cas_llr_adjustment(&cas, true, "SER", CAS_LOG_LIKELIHOOD_NATS, 10, 10);
+        let clean_neg = cas_llr_adjustment(&cas, true, "ALA", CAS_LOG_LIKELIHOOD_NATS, 10, 10);
+        let crowded_pos = cas_llr_adjustment(&cas, true, "SER", CAS_LOG_LIKELIHOOD_NATS, 10, 35);
+        let crowded_neg = cas_llr_adjustment(&cas, true, "ALA", CAS_LOG_LIKELIHOOD_NATS, 10, 35);
+        assert!(clean_pos > 1.2 && clean_pos < 2.2, "clean_pos={clean_pos}");
+        assert!(
+            clean_neg < -0.3 && clean_neg > -1.2,
+            "clean_neg must avoid brittle -3 nats cliff: {clean_neg}"
+        );
+        assert!(
+            crowded_pos < clean_pos && crowded_neg > clean_neg,
+            "crowded/overlapped excess hits must soften CAS evidence: clean=({clean_pos},{clean_neg}) crowded=({crowded_pos},{crowded_neg})"
         );
     }
 }

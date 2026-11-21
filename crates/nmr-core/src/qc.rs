@@ -2119,6 +2119,13 @@ pub fn evaluate_dataset_qc_with_gate(
     if let Some(ref pol_warn) = ref_safety.polarity_swap_warning {
         reference_hints.push(pol_warn.clone());
     }
+    if let Some(ref pol_rep) = polarity_report {
+        if let Some(hw) = pol_rep.hncacb.as_ref().and_then(|h| h.warning.as_ref()) {
+            if !reference_hints.contains(hw) {
+                reference_hints.push(hw.clone());
+            }
+        }
+    }
 
     // Sequential `(i, i-1)` link coverage (`P >= 1.0`, corroborated `P >= 3.5`, and contiguous
     // `>= 4.min(seg_len)` chain corroboration `13.1:P1-7b`)
@@ -2485,8 +2492,18 @@ pub fn evaluate_dataset_qc_with_gate(
             hsqc_3d_rms_dh_ppm, hsqc_3d_rms_dn_ppm
         ));
     }
+    let c13_refused = ref_safety
+        .refused_nuclei
+        .iter()
+        .any(|n| matches!(n.as_str(), "13CA" | "13CB" | "13C'"));
+    let ca_cb_refused_vs_c = ref_safety
+        .refused_nuclei
+        .iter()
+        .any(|n| matches!(n.as_str(), "13CA" | "13CB"))
+        && !ref_safety.refused_nuclei.iter().any(|n| n == "13C'")
+        && ref_safety.polarity_swap_warning.is_some();
     let qc_offset_polarity_fail =
-        !ref_safety.refused_nuclei.is_empty() && ref_safety.c13_spread_ppm > 2.0;
+        (c13_refused && ref_safety.c13_spread_ppm > 2.0) || ca_cb_refused_vs_c;
     let has_any_offset_warn =
         !offset_consistency_ok || weak_offset_issue.is_some() || qc_offset_polarity_fail;
     if has_any_offset_warn {
