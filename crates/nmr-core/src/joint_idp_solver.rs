@@ -6623,14 +6623,22 @@ pub fn assign_joint_idp(
     };
 
     // Map honest raw posteriors through dedicated unbiased `JOINT_IDP_CALIBRATION_KNOTS`.
-    // Under `predictor_mismatch.triggered` (`180r3.core:P1-1(a)`), strictly cap calibrated
-    // confidence below `cfg.hc_threshold` via a strictly-monotone compression (preserving full
-    // AUROC rank ordering while eliminating false HC calls under out-of-distribution bias!).
+    // Under recoverable `predictor_mismatch.triggered` with preserved sequential-walk consensus
+    // (`B0..B5`), `node_pred_scale` + unbiased knots remain calibrated without capping `~97%`-accurate
+    // placements below `0.79` (which would bloat ECE via artificial under-confidence). Whenever
+    // `compound_noise_warn` OR `pred_mismatch_triggered` accompanies ambiguity/consensus degradation
+    // (`ambig_high` or `mismatch_severity >= 2.0 && mean_ens_agreement < 0.85`), apply strictly-monotone
+    // `hc_cap` compression below `cfg.hc_threshold` (`180r3.core:P1-1(a)`); severe mismatch
+    // (`mismatch_severity >= 2.6 && mean_ens_agreement < 0.55`) escalates to `QC=ABSTAIN` above.
     let hc_cap = (cfg.hc_threshold - 0.01).clamp(0.10, 0.79);
     let top_knot_y = JOINT_IDP_CALIBRATION_KNOTS
         .last()
         .map_or(0.95, |k| k.1)
         .max(hc_cap + 0.01);
+    let degraded_mismatch_cap = pred_mismatch_triggered
+        && (ambig_high
+            || (final_diag.predictor_mismatch.mismatch_severity >= 2.0
+                && final_diag.mean_ens_agreement < 0.85));
     let confidence: Vec<f64> = final_diag
         .raw_post
         .iter()
@@ -6651,9 +6659,10 @@ pub fn assign_joint_idp(
                         }
                     }
                     DatasetQcVerdict::Warn => {
-                        if compound_noise_warn {
+                        if compound_noise_warn || degraded_mismatch_cap {
                             // Strictly-monotone compression below `hc_cap` under compound noise/decoy
-                            // degradation (preserves AUROC while eliminating false HC calls)
+                            // or ambiguity-degraded predictor mismatch (preserves AUROC while
+                            // eliminating false HC calls)
                             cal = (cal * (hc_cap / top_knot_y)).min(hc_cap);
                         }
                     }

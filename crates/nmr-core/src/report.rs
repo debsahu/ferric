@@ -852,7 +852,9 @@ pub fn generate_quality_report_html(input: &ReportInput) -> String {
 
     // 4. Secondary Chemical Shift & CSI Bar Chart
     html.push_str("<section class=\"panel\" id=\"section-csi\">\n");
-    html.push_str("<h2>3. Secondary Chemical Shifts (&Delta;&delta;<sub>CA</sub> &minus; &Delta;&delta;<sub>CB</sub>) &amp; Chemical Shift Index (CSI)</h2>\n");
+    html.push_str(&format!(
+        "<h2>3. Secondary Chemical Shifts (&Delta;&delta;<sub>CA</sub> &minus; &Delta;&delta;<sub>CB</sub>) &amp; Chemical Shift Index (CSI){prov_tag}</h2>\n"
+    ));
     html.push_str("<p class=\"panel-caption\">Sequence-corrected deviations from Wishart random-coil shifts. Sustained positive values (&gt; +1.4 ppm, blue) indicate &alpha;-helices; negative values (&lt; &minus;1.4 ppm, orange) indicate &beta;-strands.</p>\n");
     html.push_str("<div class=\"svg-wrap\">");
     html.push_str(&svg_csi);

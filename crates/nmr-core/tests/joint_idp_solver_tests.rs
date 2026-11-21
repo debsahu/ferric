@@ -1618,10 +1618,23 @@ fn test_v180_r4_heldout_ood_bias_suite_b0_to_b5() {
             0,
             false,
         ),
+        (
+            "B7_B3_noCAS_drop20",
+            [41, 83],
+            IdpStressSpec {
+                predictor_bias_n: 2.0,
+                predictor_bias_c: 0.80,
+                include_cas: false,
+                random_drop_frac: 0.20,
+                ..base_22x
+            },
+            0,
+            false,
+        ),
     ];
 
     println!(
-        "\n=== Round-4 Held-Out 100%-OOD Bias Suite (B0a-B5, 8 runs each; true TMS dC=-2.70) ==="
+        "\n=== Round-4 Held-Out 100%-OOD Bias Suite (B0a-B7, 8 runs each; true TMS dC=-2.70) ==="
     );
     println!(
         "| Scenario | Acc% | #HC | HC_Prec% | MismatchTrig | QC(P/W/A) | Mean dC | ECE | AUROC |"
