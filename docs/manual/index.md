@@ -82,26 +82,34 @@ Launch the **[Interactive Showcase Cinema Gallery](tours/index.html)** (`60 fps`
 
 ### Prebuilt Packages (NMR Workstations, macOS & Windows)
 
-#### RHEL 9 / AlmaLinux 9 / Rocky 9 (Bruker & Varian Workstations with NVIDIA GPU)
+#### RHEL 9 / AlmaLinux 9 / Rocky 9 / Fedora (Bruker & Varian Workstations with NVIDIA GPU)
 
-FERRIC's `linux-x86_64` release binaries are compiled inside AlmaLinux 9 (`glibc <= 2.34`) specifically for spectrometer acquisition and processing workstations:
+FERRIC's `linux-x86_64` release binaries are compiled inside AlmaLinux 9 (`glibc <= 2.34`) specifically for spectrometer acquisition and processing workstations, and distributed through the official GPG-signed DNF/YUM RPM repository ([debsahu.github.io/ferric-rpm](https://debsahu.github.io/ferric-rpm/), plus 32-bit `i386`/`i686` static CLI RPMs):
 
 ```bash
-# System-wide RPM install (requires sudo)
-VER=0.17.2
-TMP="$(mktemp -d)" && (
-  cd "$TMP"
-  curl -fsSLO "https://github.com/debsahu/ferric/releases/download/v${VER}/ferric-v${VER}-linux-x86_64.rpm"
-  curl -fsSLO "https://github.com/debsahu/ferric/releases/download/v${VER}/SHA256SUMS.txt"
-  grep "ferric-v${VER}-linux-x86_64.rpm" SHA256SUMS.txt | sha256sum -c -
-  sudo dnf install -y "./ferric-v${VER}-linux-x86_64.rpm"
-)
-rm -rf "$TMP"
+# Signed DNF/YUM RPM repository install & future upgrades
+sudo curl -fsSL https://debsahu.github.io/ferric-rpm/ferric.repo -o /etc/yum.repos.d/ferric.repo
+sudo dnf install -y ferric
+sudo dnf upgrade ferric    # subsequent releases
 
 # Verify CLI and hardware Vulkan GPU compute
 ferric --version
 ferric-gui
 ```
+
+- **GPG Verification (`gpgcheck=1` + `repo_gpgcheck=1`)**: Packages and `repomd.xml` metadata are signed with [`RPM-GPG-KEY-ferric`](https://debsahu.github.io/ferric-rpm/RPM-GPG-KEY-ferric) (RSA-4096 / SHA-256 fingerprint `A484 B4E4 D0D7 6A41 91DD 6228 8E1B 8E3E EAF5 655B`).
+- **Air-gapped / direct `.rpm` install** (for spectrometer hosts without outbound HTTPS):
+  ```bash
+  VER=0.17.2
+  TMP="$(mktemp -d)" && (
+    cd "$TMP"
+    curl -fsSLO "https://github.com/debsahu/ferric/releases/download/v${VER}/ferric-v${VER}-linux-x86_64.rpm"
+    curl -fsSLO "https://github.com/debsahu/ferric/releases/download/v${VER}/SHA256SUMS.txt"
+    grep "ferric-v${VER}-linux-x86_64.rpm" SHA256SUMS.txt | sha256sum -c -
+    sudo dnf install -y "./ferric-v${VER}-linux-x86_64.rpm"
+  )
+  rm -rf "$TMP"
+  ```
 
 - **NVIDIA Vulkan GPU**: Proprietary NVIDIA Vulkan drivers are selected automatically by `wgpu` for both `ferric-gui` and `ferric ... --engine gpu` (verified on RHEL 9.8 + NVIDIA Quadro P400). You can confirm hardware GPU execution from a source checkout or with any `.str` file via:
   ```bash

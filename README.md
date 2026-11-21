@@ -36,26 +36,20 @@ Requires a stable Rust toolchain (`rustup`, Rust 1.80+) and a Vulkan, Metal, or 
 
 ### 1. Interactive Desktop Workbench (`ferric-gui`) & Prebuilt Packages
 
-**RHEL 9 / AlmaLinux 9 / Rocky 9 NMR Workstations (Bruker & Varian + NVIDIA GPU):**
+**RHEL 9 / AlmaLinux 9 / Rocky 9 / Fedora NMR Workstations (Bruker & Varian + NVIDIA GPU):**
 
 ```bash
-# System-wide RPM install (built on AlmaLinux 9, glibc <= 2.34; uses NVIDIA Vulkan GPU automatically)
-VER=0.17.2
-TMP="$(mktemp -d)" && (
-  cd "$TMP"
-  curl -fsSLO "https://github.com/debsahu/ferric/releases/download/v${VER}/ferric-v${VER}-linux-x86_64.rpm"
-  curl -fsSLO "https://github.com/debsahu/ferric/releases/download/v${VER}/SHA256SUMS.txt"
-  grep "ferric-v${VER}-linux-x86_64.rpm" SHA256SUMS.txt | sha256sum -c -
-  sudo dnf install -y "./ferric-v${VER}-linux-x86_64.rpm"
-)
-rm -rf "$TMP"
+# Official GPG-signed DNF/YUM RPM repository (x86_64 Desktop + CLI, glibc <= 2.34; plus 32-bit i386/i686 static CLI)
+sudo curl -fsSL https://debsahu.github.io/ferric-rpm/ferric.repo -o /etc/yum.repos.d/ferric.repo
+sudo dnf install -y ferric
 ferric --version
 ferric-gui
 ```
 
+- **Automatic updates & GPG verification:** Upgrade anytime with `sudo dnf upgrade ferric`. Both packages (`gpgcheck=1`) and repo metadata (`repo_gpgcheck=1`) are signed with [`RPM-GPG-KEY-ferric`](https://debsahu.github.io/ferric-rpm/RPM-GPG-KEY-ferric) (RSA-4096 / SHA-256 fingerprint `A484 B4E4 D0D7 6A41 91DD 6228 8E1B 8E3E EAF5 655B`); browse indexed packages at [**debsahu.github.io/ferric-rpm**](https://debsahu.github.io/ferric-rpm/).
 - Verified on RHEL 9.8 with NVIDIA proprietary Vulkan drivers (`wgpu` automatically selects the discrete NVIDIA GPU for `ferric-gui` and `--engine gpu`).
 - On minimal or headless RHEL 9 installs without desktop X11/Vulkan libraries, install GUI runtime dependencies with: `sudo dnf install -y libxkbcommon libX11 vulkan-loader mesa-vulkan-drivers`.
-- **No-`sudo` user-local fallback:** extract [`ferric-v0.17.2-linux-x86_64.tar.gz`](https://github.com/debsahu/ferric/releases) in a private `mktemp -d` directory and run `./install-desktop.sh --prefix "$HOME/.local"` (see the [User Manual](https://debsahu.github.io/ferric/)).
+- **Air-gapped / no-`sudo` fallbacks:** For offline workstations, download [`ferric-v0.17.2-linux-x86_64.rpm`](https://github.com/debsahu/ferric/releases) + `SHA256SUMS.txt` directly; without `sudo`, extract `ferric-v0.17.2-linux-x86_64.tar.gz` and run `./install-desktop.sh --prefix "$HOME/.local"` (see the [User Manual](https://debsahu.github.io/ferric/)).
 
 Install via **Homebrew** (macOS Apple Silicon / Intel & Linux `x86_64`):
 

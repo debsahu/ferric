@@ -52,4 +52,4 @@ The maintainer (an NMR scientist) owns `docs/specs/03-assignment.md` sections 3 
 - Every release `vX.Y.Z` MUST:
   1. Bump `[workspace.package] version` in `Cargo.toml` (+ `Cargo.lock`) and add a `## [X.Y.Z] — YYYY-MM-DD` section to `CHANGELOG.md`.
   2. Update pinned release versions and package filenames (`VER=X.Y.Z`, `--tag vX.Y.Z`, `.deb`/`.zip`/`i686` filenames) in `README.md` and `docs/manual/index.md`.
-  3. Create and push annotated tag `vX.Y.Z` after 4/4 green CI, and once the Release workflow publishes `SHA256SUMS.txt`, update `debsahu/homebrew-tap` (`Formula/ferric.rb` & `Casks/ferric.rb`) with the new version and verified SHA256 hashes.
+  3. Create and push annotated tag `vX.Y.Z` after 4/4 green CI, and once the Release workflow publishes `SHA256SUMS.txt`, update `debsahu/homebrew-tap` (`Formula/ferric.rb` & `Casks/ferric.rb`) with the new version and verified SHA256 hashes, and trigger `gh workflow run publish-rpm-repo.yml -R debsahu/ferric-rpm` so the signed RPM repository publishes `vX.Y.Z`.
