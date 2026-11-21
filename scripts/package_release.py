@@ -110,7 +110,7 @@ GUI_DEB_DEPENDS: Tuple[str, ...] = (
     "libxi6",
     "libwayland-client0",
 )
-GUI_DEB_RECOMMENDS: Tuple[str, ...] = ("mesa-vulkan-drivers",)
+GUI_DEB_RECOMMENDS: Tuple[str, ...] = ("mesa-vulkan-drivers", "libegl1", "libwayland-egl1")
 GUI_RPM_REQUIRES: Tuple[str, ...] = (
     "vulkan-loader",
     "libxkbcommon",
@@ -122,7 +122,7 @@ GUI_RPM_REQUIRES: Tuple[str, ...] = (
     "libXi",
     "libwayland-client",
 )
-GUI_RPM_RECOMMENDS: Tuple[str, ...] = ("mesa-vulkan-drivers",)
+GUI_RPM_RECOMMENDS: Tuple[str, ...] = ("mesa-vulkan-drivers", "mesa-libEGL")
 
 
 def _write_text_lf(path: Path, text: str) -> None:
@@ -2143,7 +2143,8 @@ class PackageReleaseUnitTests(unittest.TestCase):
         recs = _parse_rpm_header_list(spec, "Recommends:")
         for pkg in GUI_RPM_REQUIRES:
             self.assertIn(pkg, reqs)
-        self.assertIn("mesa-vulkan-drivers", recs)
+        for pkg in GUI_RPM_RECOMMENDS:
+            self.assertIn(pkg, recs)
         self.assertIn(f"%license /usr/share/doc/{APP_SLUG}/LICENSE", spec)
         self.assertIn(f"%license /usr/share/doc/{APP_SLUG}/THIRD_PARTY.md", spec)
         with self.assertRaises(ValueError):
@@ -2175,7 +2176,7 @@ class PackageReleaseUnitTests(unittest.TestCase):
         validate_deb_control(ctrl, expected_arch="amd64", expect_glibc_dep=True)
         for pkg in GUI_DEB_DEPENDS:
             self.assertIn(pkg, ctrl)
-        self.assertIn("Recommends: mesa-vulkan-drivers", ctrl)
+        self.assertIn(f"Recommends: {', '.join(GUI_DEB_RECOMMENDS)}", ctrl)
         with self.assertRaises(ValueError):
             validate_deb_control(ctrl.replace(", libxkbcommon0", ""), expected_arch="amd64", expect_glibc_dep=True)
         with self.assertRaises(ValueError):
