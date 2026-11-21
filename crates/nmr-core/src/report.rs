@@ -106,6 +106,10 @@ pub struct ReportInput {
     pub af_concordance_report: Option<crate::af_concordance::AfConcordanceReport>,
     /// Optional 3D `{sign, fold}` indirect-axis likelihood verification provenance records (`13.3:P1-1`).
     pub axis_rescue_records: Vec<crate::process::AxisRescueAuditRecord>,
+    /// Optional unlabelled dataset QC verdict (`PASS`/`WARN`/`ABSTAIN`, `180r3.cli:P1-3`).
+    pub qc_verdict: Option<crate::qc::DatasetQcVerdict>,
+    /// Optional human-readable unlabelled QC diagnostics & warning reasons (`180r3.cli:P1-3`).
+    pub qc_reasons: Vec<String>,
 }
 
 impl ReportInput {
@@ -134,7 +138,19 @@ impl ReportInput {
             rdc_report: None,
             af_concordance_report: None,
             axis_rescue_records: Vec::new(),
+            qc_verdict: None,
+            qc_reasons: Vec::new(),
         }
+    }
+
+    pub fn with_qc_status(
+        mut self,
+        verdict: crate::qc::DatasetQcVerdict,
+        reasons: Vec<String>,
+    ) -> Self {
+        self.qc_verdict = Some(verdict);
+        self.qc_reasons = reasons;
+        self
     }
 
     pub fn with_propensity_report(
@@ -570,8 +586,10 @@ pub fn generate_quality_report_html(input: &ReportInput) -> String {
         Vec::new()
     };
 
+    let is_abstain = input.qc_verdict == Some(crate::qc::DatasetQcVerdict::Abstain);
+
     let auto_propensity;
-    let embedded_propensity = if input.propensity_report.is_none() {
+    let embedded_propensity = if input.propensity_report.is_none() && !is_abstain {
         auto_propensity = crate::idp_propensity::compute_idp_propensity(
             ref_data,
             &crate::idp_propensity::PropensityConfig::default(),
@@ -629,6 +647,44 @@ pub fn generate_quality_report_html(input: &ReportInput) -> String {
         sub_parts.join(" &nbsp;&bull;&nbsp; ")
     ));
     html.push_str("</div>\n</header>\n");
+
+    if let Some(verdict) = input.qc_verdict {
+        let (border, bg, fg, headline) = match verdict {
+            crate::qc::DatasetQcVerdict::Abstain => (
+                "#dc2626",
+                "#fef2f2",
+                "#991b1b",
+                "PROVISIONAL_OUTPUT: QC=ABSTAIN — Do not treat these assignments, secondary-structure propensities, or dihedrals as validated",
+            ),
+            crate::qc::DatasetQcVerdict::Warn => (
+                "#d97706",
+                "#fffbeb",
+                "#92400e",
+                "QC=WARN — Unlabelled dataset diagnostics flagged caution; review warnings before relying on assignments",
+            ),
+            crate::qc::DatasetQcVerdict::Pass => (
+                "#16a34a",
+                "#f0fdf4",
+                "#166534",
+                "QC=PASS — Unlabelled dataset quality checks passed",
+            ),
+        };
+        html.push_str(&format!(
+            "<section id=\"qc-status-banner\" style=\"margin: 0 0 18px 0; padding: 14px 18px; border-left: 5px solid {border}; background: {bg}; color: {fg}; border-radius: 6px; font-size: 13.5px;\">\n"
+        ));
+        html.push_str(&format!(
+            "<strong style=\"display:block;font-size:14.5px;\">{}</strong>\n",
+            escape_xml(headline)
+        ));
+        if !input.qc_reasons.is_empty() {
+            html.push_str("<ul style=\"margin: 6px 0 0 18px; padding: 0;\">\n");
+            for r in &input.qc_reasons {
+                html.push_str(&format!("<li>{}</li>\n", escape_xml(r)));
+            }
+            html.push_str("</ul>\n");
+        }
+        html.push_str("</section>\n");
+    }
 
     if !input.axis_rescue_records.is_empty() {
         let any_applied = input
@@ -773,7 +829,14 @@ pub fn generate_quality_report_html(input: &ReportInput) -> String {
     html.push_str("</div>\n</section>\n");
 
     html.push_str("<section class=\"panel\" id=\"section-ramachandran\">\n");
-    html.push_str("<h2>5. Ramachandran (&phi;, &psi;) Basin Plot</h2>\n");
+    let prov_tag = if is_abstain {
+        " [PROVISIONAL &mdash; QC=ABSTAIN]"
+    } else {
+        ""
+    };
+    html.push_str(&format!(
+        "<h2>5. Ramachandran (&phi;, &psi;) Basin Plot{prov_tag}</h2>\n"
+    ));
     if dihedrals.is_empty() {
         html.push_str("<p class=\"panel-caption\">Shaded favored and allowed &alpha;<sub>R</sub>, &beta;, and &alpha;<sub>L</sub> torsion basins (no dihedral predictions or coordinates supplied).</p>\n");
     } else {
@@ -798,7 +861,9 @@ pub fn generate_quality_report_html(input: &ReportInput) -> String {
     if let Some(ref prop_rep) = input.propensity_report {
         let svg_prop = render_idp_propensity_svg(prop_rep);
         html.push_str("<section class=\"panel\" id=\"section-idp-propensity\">\n");
-        html.push_str("<h2>3b. Ensemble Secondary Structure Propensity (SSP) &amp; 4-State &delta;2D Populations</h2>\n");
+        html.push_str(&format!(
+            "<h2>3b. Ensemble Secondary Structure Propensity (SSP) &amp; 4-State &delta;2D Populations{prov_tag}</h2>\n"
+        ));
         html.push_str("<p class=\"panel-caption\">Stacked per-residue conformational populations (&alpha;-helix, &beta;-strand, PPII, coil; Camilloni et al. 2012) and 5-residue weighted SSP score (Marsh et al. 2006).</p>\n");
         html.push_str("<div class=\"svg-wrap\">");
         html.push_str(&svg_prop);

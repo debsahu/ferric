@@ -33,12 +33,11 @@ use crate::c13_detected::{
     Con2DPeak, CAS_LOG_LIKELIHOOD_NATS, CAS_MATCH_TOL_C_PRIME_PPM, CAS_MATCH_TOL_N15_PPM,
 };
 use crate::idp_solver::{
-    check_idp_matrix_bounds, evaluate_idp_auto_reference_safety, fit_1d_unlabelled_marginal_offset,
-    predict_ncidp_shifts, register_and_build_con_dipeptide_systems,
-    select_hncacb_intra_and_backfill_prev, sequence_complexity_metrics, ConDipeptideSystem,
-    IdpAutoRefSafetyReport, IdpShiftOffsets, IdpSolverConfig, NcIdpResiduePrediction,
-    IDP_BG_CA_MUS, IDP_BG_CB_MUS, IDP_BG_C_MUS, IDP_BG_N_MUS, IDP_BG_SC_MUS, MAX_IDP_CANDS,
-    MAX_IDP_CB_CANDS, MAX_IDP_SC_CANDS,
+    check_idp_matrix_bounds, evaluate_idp_auto_reference_safety, predict_ncidp_shifts,
+    register_and_build_con_dipeptide_systems, select_hncacb_intra_and_backfill_prev,
+    sequence_complexity_metrics, ConDipeptideSystem, IdpAutoRefSafetyReport, IdpShiftOffsets,
+    IdpSolverConfig, NcIdpResiduePrediction, IDP_BG_CA_MUS, IDP_BG_CB_MUS, IDP_BG_C_MUS,
+    IDP_BG_N_MUS, IDP_BG_SC_MUS, MAX_IDP_CANDS, MAX_IDP_CB_CANDS, MAX_IDP_SC_CANDS,
 };
 use crate::nmrstar::Reference;
 use crate::peaks::Peak;
@@ -117,28 +116,29 @@ pub const MAX_JOINT_SC_CANDS: usize = MAX_IDP_SC_CANDS;
 const WILKS_HALF_CHI2_1_95: f64 = 1.920_729_410_347_062;
 
 /// Dedicated monotone isotonic calibration knots `(raw_posterior, calibrated_confidence)`
-/// empirically fitted via non-circular PASS/WARN calibration (`7,811` assignments across `4`
+/// empirically fitted strictly on **unbiased** PASS/WARN datasets (`5,851` assignments across `4`
 /// disjoint sequences `cal_seq_a`/`cal_seq_b`/`rand_cal_9001`/`rand_cal_9002`, seeds `1001..1002`,
-/// with systematic per-AA predictor bias `N ±1.0`, `C'/CA/CB ±0.4 ppm`, realistic `1.8x–2.2x`
-/// random-coil dispersion, jitter, and peak dropouts; strictly EXCLUDING `QC=ABSTAIN` runs so
-/// PASS/WARN knots are never double-discounted by ABSTAIN decoy storms — `180r2.core:P1-3`, `P2-3`).
+/// spanning clean `1.0x`, moderate `1.0x`, realistic `2.2x` random-coil dispersion, mid/high jitter,
+/// and `20%` peak dropouts; ZERO `predictor_bias_*`, ZERO `helix_amp`, ZERO `neighbor_bias_*`,
+/// keeping every bias family `B0..B5` 100% out-of-distribution — `180r3.core:P1-1`, `P2-4`).
 ///
-/// Candid calibration note: under realistic IDP shift dispersion, dropouts, and predictor bias,
-/// high-confidence (`>= 0.80`) precision on moderate/realistic IDPs sits near `~91–94%` (with the
-/// top `[0.9, 1.0]` bin outperforming `[0.8, 0.9)`), slightly below the `95%` folded globular
-/// target; the top knot (`0.932`) reflects this empirical ceiling rather than over-claiming `>= 95%`.
+/// Fitted via sharp-kernel (`bw = 0.045`) weighted Pool-Adjacent-Violators (PAV) with a weak
+/// identity prior (`n_prior = 30` along `y = x` on `x < 0.55`) so sparse low-posterior bins are
+/// never extrapolated high (`P2-4`). Per-knot nearest-bin empirical sample counts (`n_bin`):
+/// `0.00 (0), 0.15 (20), 0.30 (95), 0.45 (282), 0.60 (363), 0.72 (408), 0.82 (322), 0.88 (288),
+/// 0.94 (271), 0.98 (438), 1.00 (3364)`.
 pub const JOINT_IDP_CALIBRATION_KNOTS: &[(f64, f64)] = &[
-    (0.00, 0.000),
-    (0.10, 0.480),
-    (0.20, 0.620),
-    (0.35, 0.745),
-    (0.50, 0.785),
-    (0.65, 0.818),
-    (0.78, 0.848),
-    (0.88, 0.872),
-    (0.93, 0.895),
-    (0.97, 0.922),
-    (1.00, 0.932),
+    (0.00, 0.000), // n_bin = 0 (pinned)
+    (0.15, 0.116), // n_bin = 20
+    (0.30, 0.324), // n_bin = 95
+    (0.45, 0.782), // n_bin = 282
+    (0.60, 0.891), // n_bin = 363
+    (0.72, 0.961), // n_bin = 408
+    (0.82, 0.961), // n_bin = 322
+    (0.88, 0.971), // n_bin = 288
+    (0.94, 0.989), // n_bin = 271
+    (0.98, 0.994), // n_bin = 438
+    (1.00, 0.995), // n_bin = 3364
 ];
 
 /// Compute the canonical TROSY `46 Hz (1/2 1J_NH)`, field-scaled to ppm shift `(dH_ppm, dN_ppm)`
@@ -624,6 +624,8 @@ pub struct JointIdpAssignResult {
     pub emp_rms_seq_c: f64,
     /// Empirical `HN ↔ CON` fusion RMS `(C', N)` in ppm.
     pub fusion_rms_ppm: (f64, f64),
+    /// Noise-scale-invariant unlabelled predictor-mismatch diagnostic (`180r3.core:P1-2`).
+    pub predictor_mismatch: PredictorMismatchReport,
     /// Unlabelled dataset QC verdict.
     pub qc_verdict: DatasetQcVerdict,
     /// Human-readable QC diagnostics and warnings.
@@ -1393,9 +1395,220 @@ pub fn build_calibrated_cas_tables(
 // Unlabelled Reference Offset Estimation (Delegated to `idp_solver`, P2-3)
 // ============================================================================
 
+/// Tukey biweight redescending weight `w(u) = (1 - u^2)^2` for `|u| < 1`, else `0.0`.
+#[inline]
+fn tukey_biweight(u: f64) -> f64 {
+    let a = u.abs();
+    if a >= 1.0 || !a.is_finite() {
+        0.0
+    } else {
+        let t = 1.0 - a * a;
+        t * t
+    }
+}
+
+/// Robust Half-Sample Mode (Robertson & Cryer 1974; Bickel & Fruehwirth 2006):
+/// recursively narrows a sorted slice to its shortest contiguous sub-interval containing
+/// `ceil(n / 2)` points until `<= 2` points remain, giving a 50%-breakdown modal center
+/// completely immune to a 25–35% one-sided transient secondary-structure shoulder.
+fn half_sample_mode(vals: &[f64]) -> f64 {
+    let mut s: Vec<f64> = vals.iter().copied().filter(|v| v.is_finite()).collect();
+    if s.is_empty() {
+        return 0.0;
+    }
+    s.sort_by(|a, b| a.total_cmp(b));
+    let mut lo = 0usize;
+    let mut hi = s.len(); // exclusive
+    while hi - lo > 3 {
+        let len = hi - lo;
+        let half = len.div_ceil(2);
+        let mut best_start = lo;
+        let mut best_width = f64::INFINITY;
+        for start in lo..=(hi - half) {
+            let w = s[start + half - 1] - s[start];
+            if w < best_width {
+                best_width = w;
+                best_start = start;
+            }
+        }
+        lo = best_start;
+        hi = best_start + half;
+    }
+    match hi - lo {
+        0 => 0.0,
+        1 => s[lo],
+        2 => 0.5 * (s[lo] + s[lo + 1]),
+        _ => {
+            let d1 = s[lo + 1] - s[lo];
+            let d2 = s[lo + 2] - s[lo + 1];
+            if d1 < d2 {
+                0.5 * (s[lo] + s[lo + 1])
+            } else if d2 < d1 {
+                0.5 * (s[lo + 1] + s[lo + 2])
+            } else {
+                s[lo + 1]
+            }
+        }
+    }
+}
+
+/// Segmental-robust 1D unlabelled marginal offset estimator (`180r3.core:P1-1(b)`):
+/// replaces Gaussian mixture tails with a heavy-tailed redescending Student-t (`nu = 3`)
+/// kernel + Godambe-adjusted Wilks/look-elsewhere zero-offset gate + Tukey biweight polish
+/// so a 25–35% transient helix/sheet shoulder cannot pull the global reference offset away
+/// from the disordered coil majority mode.
+pub(crate) fn fit_1d_unlabelled_marginal_offset_robust(
+    obs_sorted: &[f64],
+    model_sorted: &[(f64, f64)],
+    range_ppm: f64,
+    max_abs_offset: f64,
+    grid_step: f64,
+) -> f64 {
+    if obs_sorted.len() < 5 || model_sorted.is_empty() {
+        return 0.0;
+    }
+    let inv_m = 1.0 / (model_sorted.len() as f64);
+    let bg = 0.06 / range_ppm.max(4.0);
+    let fg = 0.94;
+    // Exact Student-t (`nu = 3`) normalizing constant `2 / (pi * sqrt(3))`
+    const T3_NORM: f64 = 0.367_552_596_947_861_4;
+
+    let inv_s_sum: f64 = model_sorted
+        .iter()
+        .map(|&(_, sd)| 1.0 / (sd * 1.10).max(0.28))
+        .sum();
+    let s_harm = (model_sorted.len() as f64) / inv_s_sum.max(1e-12);
+    let corr_step = (std::f64::consts::SQRT_2 * s_harm).max(0.25);
+    let n_grid_eff = ((2.0 * max_abs_offset) / corr_step).ceil().max(6.0);
+
+    let eval_one_t3 = |v: f64, d: f64| -> f64 {
+        let mut density = 0.0f64;
+        for &(mu, sd) in model_sorted {
+            let s_eff = (sd * 1.10).max(0.28);
+            let z = (v - (mu + d)) / s_eff;
+            if z.abs() < 12.0 {
+                let u = 1.0 + (z * z) / 3.0;
+                density += inv_m * T3_NORM / (s_eff * u * u);
+            }
+        }
+        (fg * density + bg).max(1e-30).ln()
+    };
+
+    let godambe_lambda = |d_ref: f64| -> f64 {
+        let h_eps = 0.025f64;
+        let inv_h2 = 1.0 / (h_eps * h_eps);
+        let mut h_sum = 0.0f64;
+        for &v in obs_sorted {
+            let lp = eval_one_t3(v, d_ref + h_eps);
+            let l0 = eval_one_t3(v, d_ref);
+            let lm = eval_one_t3(v, d_ref - h_eps);
+            let hi = (-(lp - 2.0 * l0 + lm) * inv_h2).max(0.0);
+            h_sum += hi;
+        }
+        let bar_h = h_sum / (obs_sorted.len() as f64);
+        (s_harm * s_harm * bar_h).clamp(0.12, 1.0)
+    };
+    let ll_crit = godambe_lambda(0.0) * (n_grid_eff.ln() + WILKS_HALF_CHI2_1_95);
+
+    let eval_ll = |d: f64| -> f64 {
+        let mut ll = -0.02 * d * d;
+        for &v in obs_sorted {
+            ll += eval_one_t3(v, d);
+        }
+        ll
+    };
+
+    // 1. Coarse grid scan (0.08 ppm step) across `[-max_abs_offset, +max_abs_offset]`
+    let coarse_step = (grid_step * 6.0).clamp(0.05, 0.12);
+    let n_coarse = ((2.0 * max_abs_offset) / coarse_step).round() as i32;
+    let mut best_d = 0.0f64;
+    let mut best_ll = eval_ll(0.0);
+    let ll_zero = best_ll;
+    for gi in 0..=n_coarse {
+        let d = -max_abs_offset + (gi as f64) * coarse_step;
+        let ll = eval_ll(d);
+        if ll > best_ll {
+            best_ll = ll;
+            best_d = d;
+        }
+    }
+
+    // 2. Fine grid polish around coarse mode
+    let fine_lo = (best_d - coarse_step).max(-max_abs_offset);
+    let fine_hi = (best_d + coarse_step).min(max_abs_offset);
+    let n_fine = ((fine_hi - fine_lo) / grid_step.max(0.005)).ceil() as i32;
+    for fi in 0..=n_fine {
+        let d = fine_lo + (fi as f64) * grid_step.max(0.005);
+        let ll = eval_ll(d);
+        if ll > best_ll {
+            best_ll = ll;
+            best_d = d;
+        }
+    }
+
+    // 3. Redescending Tukey biweight polish (2 steps) weighting each `v` by its posterior nearest
+    //    model component so a coherent shifted helix tail gets near-zero weight.
+    let mut d_pol = best_d;
+    let c_tukey = 3.6_f64;
+    for _ in 0..2 {
+        let mut w_num = 0.0f64;
+        let mut w_den = 0.0f64;
+        for &v in obs_sorted {
+            let mut best_r = f64::INFINITY;
+            let mut best_s = s_harm.max(0.30);
+            for &(mu, sd) in model_sorted {
+                let s_eff = (sd * 1.10).max(0.28);
+                let r = v - (mu + d_pol);
+                if (r / s_eff).abs() < (best_r / best_s).abs() {
+                    best_r = r;
+                    best_s = s_eff;
+                }
+            }
+            let w = tukey_biweight(best_r / (c_tukey * best_s));
+            if w > 0.0 {
+                w_num += w * best_r;
+                w_den += w;
+            }
+        }
+        if w_den > 1e-6 {
+            let cand = (d_pol + w_num / w_den).clamp(-max_abs_offset, max_abs_offset);
+            if (cand - d_pol).abs() <= 0.35 {
+                d_pol = cand;
+            }
+        }
+    }
+    let ll_pol = eval_ll(d_pol);
+    if ll_pol >= best_ll - 0.15 * (obs_sorted.len() as f64).max(1.0) * 0.02 {
+        best_d = d_pol;
+        best_ll = ll_pol.max(best_ll);
+    }
+
+    if best_ll - ll_zero < ll_crit {
+        0.0
+    } else {
+        best_d
+    }
+}
+
+fn build_proxy_con_systems(nodes: &[JointIdpNode]) -> Vec<ConDipeptideSystem> {
+    nodes
+        .iter()
+        .map(|n| {
+            let mut s =
+                ConDipeptideSystem::new(n.id, n.c_prev.unwrap_or(175.0), n.n_curr, n.root_height);
+            s.ca_curr = n.ca_curr.clone();
+            s.cb_curr = n.cb_curr.clone();
+            s.ca_prev = n.ca_prev.clone();
+            s.cb_prev = n.cb_prev.clone();
+            s.c_curr = n.c_curr.clone();
+            s
+        })
+        .collect()
+}
+
 /// Strictly unlabelled, permutation-invariant global `(dN, dC', dCA, dCB)` offset estimator over
-/// unified `JointIdpNode`s using shared [`fit_1d_unlabelled_marginal_offset`] and
-/// [`evaluate_idp_auto_reference_safety`] from `idp_solver` (`P2-3`, TMS-safe windows).
+/// unified `JointIdpNode`s using segmental-robust [`fit_1d_unlabelled_marginal_offset_robust`]
+/// and [`evaluate_idp_auto_reference_safety`] from `idp_solver` (`180r3.core:P1-1(b)`).
 pub fn estimate_joint_reference_offsets(
     nodes: &[JointIdpNode],
     sequence: &[String],
@@ -1475,27 +1688,237 @@ pub fn estimate_joint_reference_offsets(
     mod_cb.sort_by(|a, b| a.0.total_cmp(&b.0));
 
     let raw = IdpShiftOffsets {
-        d_n: fit_1d_unlabelled_marginal_offset(&obs_n, &mod_n, 38.0, 4.0, 0.02),
-        d_c: fit_1d_unlabelled_marginal_offset(&obs_c, &mod_c, 16.0, 4.0, 0.01),
-        d_ca: fit_1d_unlabelled_marginal_offset(&obs_ca, &mod_ca, 30.0, 4.0, 0.01),
-        d_cb: fit_1d_unlabelled_marginal_offset(&obs_cb, &mod_cb, 60.0, 4.0, 0.015),
+        d_n: fit_1d_unlabelled_marginal_offset_robust(&obs_n, &mod_n, 38.0, 4.0, 0.02),
+        d_c: fit_1d_unlabelled_marginal_offset_robust(&obs_c, &mod_c, 16.0, 4.0, 0.01),
+        d_ca: fit_1d_unlabelled_marginal_offset_robust(&obs_ca, &mod_ca, 30.0, 4.0, 0.01),
+        d_cb: fit_1d_unlabelled_marginal_offset_robust(&obs_cb, &mod_cb, 60.0, 4.0, 0.015),
     };
 
-    let proxy_systems: Vec<ConDipeptideSystem> = nodes
-        .iter()
-        .map(|n| {
-            let mut s =
-                ConDipeptideSystem::new(n.id, n.c_prev.unwrap_or(175.0), n.n_curr, n.root_height);
-            s.ca_curr = n.ca_curr.clone();
-            s.cb_curr = n.cb_curr.clone();
-            s.ca_prev = n.ca_prev.clone();
-            s.cb_prev = n.cb_prev.clone();
-            s.c_curr = n.c_curr.clone();
-            s
-        })
-        .collect();
+    let proxy_systems = build_proxy_con_systems(nodes);
     let safety = evaluate_idp_auto_reference_safety(&proxy_systems, &raw);
     (safety.safe_offsets, safety)
+}
+
+/// Post-Pass-1 sequence-windowed robust offset refinement (`180r3.core:P1-1(b)`):
+/// extracts one deduplicated raw residual `d_k = obs_k - pred_k` per residue `k` for each
+/// nucleus `{N, C', CA, CB}`, computes 9-residue rolling-window medians `m_k`, locates the
+/// disordered coil modal center via Half-Sample Mode (`half_sample_mode`), and computes a
+/// double-Tukey biweight mean immune to 25–35% transient helix/sheet segments.
+fn refine_joint_offsets_post_pass1(
+    at: &[i32],
+    nodes: &[JointIdpNode],
+    seq: &[String],
+    preds: &[NcIdpResiduePrediction],
+    init_offsets: &IdpShiftOffsets,
+) -> (IdpShiftOffsets, IdpAutoRefSafetyReport, bool) {
+    let k_len = seq.len().min(at.len()).min(preds.len());
+    let mut sum_n = vec![0.0f64; k_len];
+    let mut cnt_n = vec![0usize; k_len];
+    let mut sum_c = vec![0.0f64; k_len];
+    let mut cnt_c = vec![0usize; k_len];
+    let mut sum_ca = vec![0.0f64; k_len];
+    let mut cnt_ca = vec![0usize; k_len];
+    let mut sum_cb = vec![0.0f64; k_len];
+    let mut cnt_cb = vec![0usize; k_len];
+
+    let closest_within = |cands: &[f64], target: f64, gate: f64| -> Option<f64> {
+        let mut best_v = None;
+        let mut best_d = gate;
+        for &v in cands.iter().take(MAX_JOINT_CANDS) {
+            let d = (v - target).abs();
+            if d < best_d {
+                best_d = d;
+                best_v = Some(v);
+            }
+        }
+        best_v
+    };
+
+    for k in 1..k_len {
+        let s_i = at[k];
+        if s_i < 0 || (s_i as usize) >= nodes.len() {
+            continue;
+        }
+        let nd = &nodes[s_i as usize];
+        if seq[k] != "PRO" {
+            let d = nd.n_curr - preds[k].n_ppm;
+            if (d - init_offsets.d_n).abs() <= 5.5 {
+                sum_n[k] += d;
+                cnt_n[k] += 1;
+            }
+        }
+        if let Some(cp) = nd.c_prev {
+            if k - 1 + 1 < k_len {
+                let d = cp - preds[k - 1].c_ppm;
+                if (d - init_offsets.d_c).abs() <= 4.0 {
+                    sum_c[k - 1] += d;
+                    cnt_c[k - 1] += 1;
+                }
+            }
+        }
+        if k + 1 < k_len && !nd.c_curr.is_empty() {
+            if let Some(v) = closest_within(&nd.c_curr, preds[k].c_ppm + init_offsets.d_c, 4.0) {
+                sum_c[k] += v - preds[k].c_ppm;
+                cnt_c[k] += 1;
+            }
+        }
+        if let Some(v) = closest_within(&nd.ca_curr, preds[k].ca_ppm + init_offsets.d_ca, 4.0) {
+            sum_ca[k] += v - preds[k].ca_ppm;
+            cnt_ca[k] += 1;
+        }
+        if let Some(v) = closest_within(&nd.ca_prev, preds[k - 1].ca_ppm + init_offsets.d_ca, 4.0) {
+            sum_ca[k - 1] += v - preds[k - 1].ca_ppm;
+            cnt_ca[k - 1] += 1;
+        }
+        if let Some(cb_p) = preds[k].cb_ppm {
+            if let Some(v) = closest_within(&nd.cb_curr, cb_p + init_offsets.d_cb, 4.0) {
+                sum_cb[k] += v - cb_p;
+                cnt_cb[k] += 1;
+            }
+        }
+        if let Some(cb_p) = preds[k - 1].cb_ppm {
+            if let Some(v) = closest_within(&nd.cb_prev, cb_p + init_offsets.d_cb, 4.0) {
+                sum_cb[k - 1] += v - cb_p;
+                cnt_cb[k - 1] += 1;
+            }
+        }
+    }
+
+    let refine_one =
+        |sums: &[f64], cnts: &[usize], d_init: f64, floor_win: f64, floor_res: f64| -> f64 {
+            let mut d_per_k: Vec<Option<f64>> = vec![None; k_len];
+            let mut n_valid = 0usize;
+            for k in 0..k_len {
+                if cnts[k] > 0 {
+                    d_per_k[k] = Some(sums[k] / (cnts[k] as f64));
+                    n_valid += 1;
+                }
+            }
+            if n_valid < 16 {
+                return d_init;
+            }
+
+            // 9-residue rolling-window medians `m_k` (half-window 4, >= 5 valid residues)
+            let mut win_med: Vec<Option<f64>> = vec![None; k_len];
+            let mut valid_meds: Vec<f64> = Vec::with_capacity(k_len);
+            for k in 0..k_len {
+                let lo = k.saturating_sub(4);
+                let hi = (k + 4).min(k_len - 1);
+                let mut buf: Vec<f64> = (lo..=hi).filter_map(|j| d_per_k[j]).collect();
+                if buf.len() >= 5 {
+                    buf.sort_by(|a, b| a.total_cmp(b));
+                    let med = if buf.len() % 2 == 1 {
+                        buf[buf.len() / 2]
+                    } else {
+                        0.5 * (buf[buf.len() / 2 - 1] + buf[buf.len() / 2])
+                    };
+                    win_med[k] = Some(med);
+                    valid_meds.push(med);
+                }
+            }
+            if valid_meds.len() < 12 {
+                return d_init;
+            }
+
+            let d_mode = half_sample_mode(&valid_meds);
+            let mad_of = |vals: &[f64], center: f64| -> f64 {
+                let mut devs: Vec<f64> = vals.iter().map(|v| (v - center).abs()).collect();
+                devs.sort_by(|a, b| a.total_cmp(b));
+                if devs.is_empty() {
+                    0.0
+                } else if devs.len() % 2 == 1 {
+                    devs[devs.len() / 2]
+                } else {
+                    0.5 * (devs[devs.len() / 2 - 1] + devs[devs.len() / 2])
+                }
+            };
+            let scale_win = (1.4826 * mad_of(&valid_meds, d_mode)).max(floor_win);
+            let all_d: Vec<f64> = d_per_k.iter().filter_map(|&v| v).collect();
+            let scale_res = (1.4826 * mad_of(&all_d, d_mode)).max(floor_res);
+
+            // Double-Tukey biweight mean (`c_win = 3.0`, `c_res = 4.685`):
+            // coherent shifted helix/sheet windows get zero/tiny weight!
+            let mut num = 0.0f64;
+            let mut den = 0.0f64;
+            for k in 0..k_len {
+                let (Some(dk), Some(mk)) = (d_per_k[k], win_med[k]) else {
+                    continue;
+                };
+                let w_win = tukey_biweight((mk - d_mode) / (3.0 * scale_win));
+                let w_res = tukey_biweight((dk - d_mode) / (4.685 * scale_res));
+                let w = w_win * w_res;
+                if w > 0.0 {
+                    num += w * dk;
+                    den += w;
+                }
+            }
+            if den < 6.0 {
+                return d_init;
+            }
+            let d_ref = (num / den).clamp(-4.0, 4.0);
+            if d_init == 0.0 && d_ref.abs() < 0.04 {
+                0.0
+            } else {
+                d_ref
+            }
+        };
+
+    let cand_raw = IdpShiftOffsets {
+        d_n: refine_one(&sum_n, &cnt_n, init_offsets.d_n, 0.45, 0.75),
+        d_c: refine_one(&sum_c, &cnt_c, init_offsets.d_c, 0.22, 0.38),
+        d_ca: refine_one(&sum_ca, &cnt_ca, init_offsets.d_ca, 0.24, 0.40),
+        d_cb: refine_one(&sum_cb, &cnt_cb, init_offsets.d_cb, 0.28, 0.48),
+    };
+    let proxy_systems = build_proxy_con_systems(nodes);
+    let safety = evaluate_idp_auto_reference_safety(&proxy_systems, &cand_raw);
+    let safe = safety.safe_offsets;
+
+    let shifted = (safe.d_n - init_offsets.d_n).abs() >= 0.05
+        || (safe.d_c - init_offsets.d_c).abs() >= 0.05
+        || (safe.d_ca - init_offsets.d_ca).abs() >= 0.05
+        || (safe.d_cb - init_offsets.d_cb).abs() >= 0.05;
+    (safe, safety, shifted)
+}
+
+/// Detect periodic tandem / degenerate motif repeats in an IDP sequence (`180r3.core:P2-2`):
+/// measures self-identity `id(d)` across lags `d in 3..=24` against composition background
+/// `p_bg = sum f_aa^2` and returns `(best_period, best_self_identity, best_z_score)`.
+pub fn motif_repeat_metrics(seq: &[String]) -> (usize, f64, f64) {
+    let l = seq.len();
+    if l < 24 {
+        return (0, 0.0, 0.0);
+    }
+    let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
+    for aa in seq {
+        *counts.entry(aa.as_str()).or_insert(0) += 1;
+    }
+    let inv_l = 1.0 / (l as f64);
+    let p_bg: f64 = counts.values().map(|&c| ((c as f64) * inv_l).powi(2)).sum();
+    let p_bg = p_bg.clamp(1e-4, 0.999);
+
+    let mut best_period = 0usize;
+    let mut best_id = 0.0f64;
+    let mut best_z = f64::NEG_INFINITY;
+    for d in 3..=24usize {
+        if l < d + 16 {
+            continue;
+        }
+        let n_cmp = l - d;
+        let matches = (0..n_cmp).filter(|&i| seq[i] == seq[i + d]).count();
+        let id = (matches as f64) / (n_cmp as f64);
+        let sd = (p_bg * (1.0 - p_bg) / (n_cmp as f64)).max(1e-9).sqrt();
+        let z = (id - p_bg) / sd;
+        if z > best_z {
+            best_z = z;
+            best_id = id;
+            best_period = d;
+        }
+    }
+    if !best_z.is_finite() {
+        (0, 0.0, 0.0)
+    } else {
+        (best_period, best_id, best_z)
+    }
 }
 
 // ============================================================================
@@ -4163,40 +4586,264 @@ fn run_island_ensemble(
 }
 
 // ============================================================================
+// Pure-Rust Exact Statistical Tail P-Values (`180r3.core:P1-2`)
+// ============================================================================
+
+/// Natural logarithm of the Gamma function `ln Gamma(z)` via the 9-term Lanczos approximation
+/// (`g = 7`, Lanczos 1964; accurate to `~1e-13` for all `z > 0`).
+pub fn ln_gamma(z: f64) -> f64 {
+    if !z.is_finite() || z <= 0.0 {
+        return f64::NAN;
+    }
+    const COEFFS: [f64; 9] = [
+        0.999_999_999_999_809_9,
+        676.520_368_121_885_1,
+        -1_259.139_216_722_402_8,
+        771.323_428_777_653_1,
+        -176.615_029_162_140_6,
+        12.507_343_278_686_905,
+        -0.138_571_095_265_720_12,
+        9.984_369_578_019_572e-6,
+        1.505_632_735_149_311_6e-7,
+    ];
+    if z < 0.5 {
+        let pi = std::f64::consts::PI;
+        return pi.ln() - (pi * z).sin().abs().max(1e-300).ln() - ln_gamma(1.0 - z);
+    }
+    let zm1 = z - 1.0;
+    let mut x = COEFFS[0];
+    for (idx, &c) in COEFFS.iter().enumerate().skip(1) {
+        x += c / (zm1 + idx as f64);
+    }
+    let t = zm1 + 7.5;
+    0.5 * TAU.ln() + (zm1 + 0.5) * t.ln() - t + x.ln()
+}
+
+/// Regularized incomplete beta function `I_x(a, b)` via modified Lentz continued fraction
+/// (`Press et al., Numerical Recipes`; `a > 0`, `b > 0`, `x in [0, 1]`).
+pub fn regularized_incomplete_beta(a: f64, b: f64, x: f64) -> f64 {
+    if !a.is_finite() || !b.is_finite() || !x.is_finite() || a <= 0.0 || b <= 0.0 {
+        return f64::NAN;
+    }
+    if x <= 0.0 {
+        return 0.0;
+    }
+    if x >= 1.0 {
+        return 1.0;
+    }
+    let ln_bt = ln_gamma(a + b) - ln_gamma(a) - ln_gamma(b) + a * x.ln() + b * (1.0 - x).ln();
+    let bt = ln_bt.exp();
+
+    let betacf = |aa: f64, bb: f64, xx: f64| -> f64 {
+        const MAX_ITER: usize = 200;
+        const EPS: f64 = 1.0e-13;
+        const FPMIN: f64 = 1.0e-300;
+        let qab = aa + bb;
+        let qap = aa + 1.0;
+        let qam = aa - 1.0;
+        let mut c = 1.0f64;
+        let mut d = 1.0 - qab * xx / qap;
+        if d.abs() < FPMIN {
+            d = FPMIN;
+        }
+        d = 1.0 / d;
+        let mut h = d;
+        for m in 1..=MAX_ITER {
+            let mf = m as f64;
+            let m2 = 2.0 * mf;
+            let num_even = mf * (bb - mf) * xx / ((qam + m2) * (aa + m2));
+            d = 1.0 + num_even * d;
+            if d.abs() < FPMIN {
+                d = FPMIN;
+            }
+            c = 1.0 + num_even / c;
+            if c.abs() < FPMIN {
+                c = FPMIN;
+            }
+            d = 1.0 / d;
+            h *= d * c;
+
+            let num_odd = -(aa + mf) * (qab + mf) * xx / ((aa + m2) * (qap + m2));
+            d = 1.0 + num_odd * d;
+            if d.abs() < FPMIN {
+                d = FPMIN;
+            }
+            c = 1.0 + num_odd / c;
+            if c.abs() < FPMIN {
+                c = FPMIN;
+            }
+            d = 1.0 / d;
+            let del = d * c;
+            h *= del;
+            if (del - 1.0).abs() < EPS {
+                break;
+            }
+        }
+        h
+    };
+
+    if x < (a + 1.0) / (a + b + 2.0) {
+        (bt * betacf(a, b, x) / a).clamp(0.0, 1.0)
+    } else {
+        (1.0 - bt * betacf(b, a, 1.0 - x) / b).clamp(0.0, 1.0)
+    }
+}
+
+/// Exact upper-tail p-value `P(F_{df1, df2} >= f)`.
+pub fn f_upper_tail_p(f: f64, df1: f64, df2: f64) -> f64 {
+    if !f.is_finite() || !df1.is_finite() || !df2.is_finite() || df1 <= 0.0 || df2 <= 0.0 {
+        return 1.0;
+    }
+    if f <= 0.0 {
+        return 1.0;
+    }
+    let x = df2 / (df2 + df1 * f);
+    regularized_incomplete_beta(0.5 * df2, 0.5 * df1, x).clamp(0.0, 1.0)
+}
+
+/// Exact two-sided Student-t p-value `P(|T_df| >= abs_t)`.
+pub fn student_t_two_sided_p(abs_t: f64, df: f64) -> f64 {
+    if !abs_t.is_finite() || !df.is_finite() || df <= 0.0 {
+        return 1.0;
+    }
+    let a = abs_t.abs();
+    if a <= 0.0 {
+        return 1.0;
+    }
+    let x = df / (df + a * a);
+    regularized_incomplete_beta(0.5 * df, 0.5, x).clamp(0.0, 1.0)
+}
+
+/// Exact upper-tail Fisher chi-square p-value `P(chi^2_{2 * n_channels} >= x2)` via the exact
+/// finite Poisson sum `exp(-x2/2) * sum_{j=0}^{k-1} (x2/2)^j / j!`.
+pub fn fisher_chi2_p(x2: f64, n_channels: usize) -> f64 {
+    if n_channels == 0 || !x2.is_finite() || x2 <= 0.0 {
+        return 1.0;
+    }
+    let half = 0.5 * x2;
+    let mut sum = 0.0f64;
+    let mut ln_fact = 0.0f64;
+    let ln_half = half.ln();
+    for j in 0..n_channels {
+        if j > 0 {
+            ln_fact += (j as f64).ln();
+        }
+        let ln_term = -half + (j as f64) * ln_half - ln_fact;
+        if ln_term > -745.0 {
+            sum += ln_term.exp();
+        }
+    }
+    sum.clamp(0.0, 1.0)
+}
+
+/// Standard normal upper-tail probability `P(Z >= z) = 0.5 * erfc(z / sqrt(2))`
+/// (Abramowitz & Stegun 7.1.26 rational approximation, max error `< 1.5e-7`, exact symmetry).
+pub fn normal_upper_tail_p(z: f64) -> f64 {
+    if !z.is_finite() {
+        return 1.0;
+    }
+    let erfc_pos = |x: f64| -> f64 {
+        let t = 1.0 / (1.0 + 0.327_591_1 * x);
+        let poly = t
+            * (0.254_829_592
+                + t * (-0.284_496_736
+                    + t * (1.421_413_741 + t * (-1.453_152_027 + t * 1.061_405_429))));
+        (poly * (-x * x).exp()).clamp(0.0, 1.0)
+    };
+    let u = z / std::f64::consts::SQRT_2;
+    if u >= 0.0 {
+        (0.5 * erfc_pos(u)).clamp(0.0, 1.0)
+    } else {
+        (1.0 - 0.5 * erfc_pos(-u)).clamp(0.0, 1.0)
+    }
+}
+
+// ============================================================================
 // Honest Adaptive-Temperature Posterior & Unlabelled QC Calibration (`P1-1`, `P1-2`)
 // ============================================================================
 
-/// Unlabelled predictor-mismatch diagnostic comparing placed backbone shifts against `ncIDP`
-/// random-coil priors after removing global `(dN, dC', dCA, dCB)` reference offsets (`180r2.core:P1-3`).
-#[derive(Clone, Debug, Default, PartialEq)]
+/// Noise-scale-invariant unlabelled predictor-mismatch diagnostic comparing deduplicated
+/// per-`(k, atom)` backbone residuals against `ncIDP` random-coil priors (`180r3.core:P1-2`).
+#[derive(Clone, Debug, PartialEq)]
 pub struct PredictorMismatchReport {
-    /// Global centered unary residual RMS for `15N` (ppm).
+    /// Global centered unary residual RMS for `15N` (ppm, diagnostic only).
     pub rms_n: f64,
-    /// Global centered unary residual RMS for `13C'` (ppm).
+    /// Global centered unary residual RMS for `13C'` (ppm, diagnostic only).
     pub rms_c: f64,
-    /// Global centered unary residual RMS for `13CA` (ppm).
+    /// Global centered unary residual RMS for `13CA` (ppm, diagnostic only).
     pub rms_ca: f64,
-    /// Global centered unary residual RMS for `13CB` (ppm).
+    /// Global centered unary residual RMS for `13CB` (ppm, diagnostic only).
     pub rms_cb: f64,
-    /// Maximum absolute per-AA-type mean residual bias on `15N` (for AA types with `n >= 4`, ppm).
+    /// Maximum absolute per-AA-type mean residual bias on `15N` (ppm, diagnostic only).
     pub max_abs_bias_n: f64,
-    /// Maximum absolute per-AA-type mean residual bias on `13C'` (`n >= 4`, ppm).
+    /// Maximum absolute per-AA-type mean residual bias on `13C'` (ppm, diagnostic only).
     pub max_abs_bias_c: f64,
-    /// Maximum absolute per-AA-type mean residual bias on `13CA` (`n >= 4`, ppm).
+    /// Maximum absolute per-AA-type mean residual bias on `13CA` (ppm, diagnostic only).
     pub max_abs_bias_ca: f64,
-    /// Maximum absolute per-AA-type mean residual bias on `13CB` (`n >= 4`, ppm).
+    /// Maximum absolute per-AA-type mean residual bias on `13CB` (ppm, diagnostic only).
     pub max_abs_bias_cb: f64,
-    /// Human-readable description of the largest per-residue-type systematic residual bias.
+    /// Human-readable description of the strongest detected mismatch signal.
     pub worst_bias_desc: String,
-    /// True when systematic per-AA-type bias (`|bias_N| > 0.65` or `|bias_C'/CA/CB| > 0.28 ppm`)
-    /// or elevated global unary residual RMS warrants `QC = WARN`.
+    /// True if Test 1 (per-AA-type ANOVA / leave-one-out Student-t) fired.
+    pub aa_bias_triggered: bool,
+    /// True if Test 2 (lag-1 autocorrelation / contiguous sliding-window t-scan) fired.
+    pub segmental_bias_triggered: bool,
+    /// True if Test 3 (`seq[k-1]` / `seq[k+1]` neighbor-dependent ANOVA) fired.
+    pub neighbor_bias_triggered: bool,
+    /// Fisher-combined one-way ANOVA p-value for per-AA-type residual bias (`< 0.005` triggers).
+    pub p_aa_fisher: f64,
+    /// Bonferroni-corrected minimum leave-one-group-out Student-t p-value (`< 0.01` triggers).
+    pub p_aa_bonf: f64,
+    /// Fisher-combined one-sided lag-1 autocorrelation p-value (`< 0.005` triggers).
+    pub p_seg_autocorr: f64,
+    /// Bonferroni-corrected minimum contiguous sliding-window Student-t p-value (`< 0.01` triggers).
+    pub p_seg_win_bonf: f64,
+    /// Minimum Fisher-combined neighbor ANOVA p-value across `seq[k-1]` and `seq[k+1]` (`< 0.0025` triggers).
+    pub p_neighbor_fisher: f64,
+    /// Per-residue standardized mismatch score (`length == k_len`; all `0.0` when `!triggered`).
+    pub per_residue_mismatch_z: Vec<f64>,
+    /// True when ANY scale-invariant statistical test (Test 1, Test 2, or Test 3) fires.
     pub triggered: bool,
-    /// Continuous mismatch severity in `[0.0, 3.0]` used to adapt unary posterior temperature.
+    /// Continuous scale-invariant effect-size severity in `[0.0, 3.0]` (`0.0` when `!triggered`).
     pub mismatch_severity: f64,
 }
 
-/// Evaluate unlabelled systematic per-residue-type shift bias and global residual RMS relative
-/// to `ncIDP` random-coil predictions (`180r2.core:P1-3`).
+impl Default for PredictorMismatchReport {
+    fn default() -> Self {
+        Self {
+            rms_n: 0.0,
+            rms_c: 0.0,
+            rms_ca: 0.0,
+            rms_cb: 0.0,
+            max_abs_bias_n: 0.0,
+            max_abs_bias_c: 0.0,
+            max_abs_bias_ca: 0.0,
+            max_abs_bias_cb: 0.0,
+            worst_bias_desc: String::new(),
+            aa_bias_triggered: false,
+            segmental_bias_triggered: false,
+            neighbor_bias_triggered: false,
+            p_aa_fisher: 1.0,
+            p_aa_bonf: 1.0,
+            p_seg_autocorr: 1.0,
+            p_seg_win_bonf: 1.0,
+            p_neighbor_fisher: 1.0,
+            per_residue_mismatch_z: Vec::new(),
+            triggered: false,
+            mismatch_severity: 0.0,
+        }
+    }
+}
+
+/// Evaluate noise-scale-invariant unlabelled predictor mismatch via three complementary
+/// exact statistical tests over deduplicated per-`(k, atom)` residuals (`180r3.core:P1-2`):
+/// 1. Per-AA-type bias (one-way ANOVA F-test Fisher-combined across `{N, C', CA, CB}` +
+///    Bonferroni-corrected leave-one-group-out Student-t for `n_g >= 4`).
+/// 2. Segmental / secondary-structure coherence (lag-1 positive autocorrelation Fisher-combined
+///    across `{N, C', CA, CB}` + Bonferroni-corrected contiguous sliding-window t-scan over
+///    `W in {8, 12, 16}` across `{N, C', CA, CB, d_CA_CB}`).
+/// 3. Neighbor-dependent bias (one-way ANOVA F-test grouped by `seq[k-1]` and `seq[k+1]`,
+///    Fisher-combined across `{N, C', CA, CB}`).
 pub fn evaluate_predictor_mismatch_qc(
     at: &[i32],
     nodes: &[JointIdpNode],
@@ -4206,14 +4853,23 @@ pub fn evaluate_predictor_mismatch_qc(
 ) -> PredictorMismatchReport {
     let k_len = seq.len().min(at.len()).min(preds.len());
     if k_len < 6 || nodes.is_empty() {
-        return PredictorMismatchReport::default();
+        return PredictorMismatchReport {
+            per_residue_mismatch_z: vec![0.0; k_len],
+            ..PredictorMismatchReport::default()
+        };
     }
 
-    // Collect `(aa_type, residual_obs_minus_pred)` for N, C', CA, CB
-    let mut res_n: Vec<(String, f64)> = Vec::new();
-    let mut res_c: Vec<(String, f64)> = Vec::new();
-    let mut res_ca: Vec<(String, f64)> = Vec::new();
-    let mut res_cb: Vec<(String, f64)> = Vec::new();
+    // 1. Deduplicate residuals per `(seq_idx k, atom)` by averaging `*_curr` (from `at[k]`)
+    //    and `*_prev` (from `at[k+1]`) into ONE independent observation per `(k, atom)`.
+    //    Widen outlier gates to `±6.0 ppm` (`15N`) and `±4.2 ppm` (`13C'/13CA/13CB`).
+    let mut sum_n = vec![0.0f64; k_len];
+    let mut cnt_n = vec![0usize; k_len];
+    let mut sum_c = vec![0.0f64; k_len];
+    let mut cnt_c = vec![0usize; k_len];
+    let mut sum_ca = vec![0.0f64; k_len];
+    let mut cnt_ca = vec![0usize; k_len];
+    let mut sum_cb = vec![0.0f64; k_len];
+    let mut cnt_cb = vec![0usize; k_len];
 
     let closest_within = |cands: &[f64], target_obs: f64, gate: f64| -> Option<f64> {
         let mut best_v = None;
@@ -4235,151 +4891,487 @@ pub fn evaluate_predictor_mismatch_qc(
         }
         let nd = &nodes[s_i as usize];
 
-        // 15N(k) (exclude Pro from amide-N centering so imino/amide offsets don't mix)
         if seq[k] != "PRO" {
             let dn = (nd.n_curr - offsets.d_n) - preds[k].n_ppm;
-            if dn.abs() <= 4.5 {
-                res_n.push((seq[k].clone(), dn));
+            if dn.abs() <= 6.0 {
+                sum_n[k] += dn;
+                cnt_n[k] += 1;
             }
         }
-        // 13C'(k-1) from c_prev
         if let Some(cp) = nd.c_prev {
             let dc = (cp - offsets.d_c) - preds[k - 1].c_ppm;
-            if dc.abs() <= 2.5 {
-                res_c.push((seq[k - 1].clone(), dc));
+            if dc.abs() <= 4.2 {
+                sum_c[k - 1] += dc;
+                cnt_c[k - 1] += 1;
             }
         }
-        // 13C'(k) from c_curr (excluding C-term COO-)
         if k + 1 < k_len && !nd.c_curr.is_empty() {
-            if let Some(v) = closest_within(&nd.c_curr, preds[k].c_ppm + offsets.d_c, 2.5) {
-                res_c.push((seq[k].clone(), (v - offsets.d_c) - preds[k].c_ppm));
+            if let Some(v) = closest_within(&nd.c_curr, preds[k].c_ppm + offsets.d_c, 4.2) {
+                sum_c[k] += (v - offsets.d_c) - preds[k].c_ppm;
+                cnt_c[k] += 1;
             }
         }
-        // 13CA(k) & 13CA(k-1)
-        if let Some(v) = closest_within(&nd.ca_curr, preds[k].ca_ppm + offsets.d_ca, 2.8) {
-            res_ca.push((seq[k].clone(), (v - offsets.d_ca) - preds[k].ca_ppm));
+        if let Some(v) = closest_within(&nd.ca_curr, preds[k].ca_ppm + offsets.d_ca, 4.2) {
+            sum_ca[k] += (v - offsets.d_ca) - preds[k].ca_ppm;
+            cnt_ca[k] += 1;
         }
-        if let Some(v) = closest_within(&nd.ca_prev, preds[k - 1].ca_ppm + offsets.d_ca, 2.8) {
-            res_ca.push((seq[k - 1].clone(), (v - offsets.d_ca) - preds[k - 1].ca_ppm));
+        if let Some(v) = closest_within(&nd.ca_prev, preds[k - 1].ca_ppm + offsets.d_ca, 4.2) {
+            sum_ca[k - 1] += (v - offsets.d_ca) - preds[k - 1].ca_ppm;
+            cnt_ca[k - 1] += 1;
         }
-        // 13CB(k) & 13CB(k-1)
         if let Some(cb_p) = preds[k].cb_ppm {
-            if let Some(v) = closest_within(&nd.cb_curr, cb_p + offsets.d_cb, 3.2) {
-                res_cb.push((seq[k].clone(), (v - offsets.d_cb) - cb_p));
+            if let Some(v) = closest_within(&nd.cb_curr, cb_p + offsets.d_cb, 4.2) {
+                sum_cb[k] += (v - offsets.d_cb) - cb_p;
+                cnt_cb[k] += 1;
             }
         }
         if let Some(cb_p) = preds[k - 1].cb_ppm {
-            if let Some(v) = closest_within(&nd.cb_prev, cb_p + offsets.d_cb, 3.2) {
-                res_cb.push((seq[k - 1].clone(), (v - offsets.d_cb) - cb_p));
+            if let Some(v) = closest_within(&nd.cb_prev, cb_p + offsets.d_cb, 4.2) {
+                sum_cb[k - 1] += (v - offsets.d_cb) - cb_p;
+                cnt_cb[k - 1] += 1;
             }
         }
     }
 
-    // Helper: center residuals (removing global mean), compute global RMS & max |per-AA bias| (n>=4)
-    let analyze_atom = |obs: &[(String, f64)],
-                        atom: &str,
-                        bias_thresh: f64|
-     -> (f64, f64, f64, Option<(f64, String)>) {
-        if obs.len() < 8 {
-            return (0.0, 0.0, 0.0, None);
-        }
-        let g_mean = obs.iter().map(|(_, r)| *r).sum::<f64>() / (obs.len() as f64);
-        let rms = (obs.iter().map(|(_, r)| (r - g_mean).powi(2)).sum::<f64>() / (obs.len() as f64))
-            .sqrt();
-        let mut by_aa: BTreeMap<&str, (f64, usize)> = BTreeMap::new();
-        for (aa, r) in obs {
-            let e = by_aa.entry(aa.as_str()).or_insert((0.0, 0));
-            e.0 += r - g_mean;
-            e.1 += 1;
-        }
-        let mut max_abs = 0.0f64;
-        let mut worst_ratio = 0.0f64;
-        let mut worst_desc: Option<(f64, String)> = None;
-        let mut sum_abs = 0.0f64;
-        let mut n_aa = 0usize;
-        for (aa, (s, c)) in by_aa {
-            if c < 4 {
-                continue;
-            }
-            let mean_b = s / (c as f64);
-            let ab = mean_b.abs();
-            sum_abs += ab;
-            n_aa += 1;
-            if ab > max_abs {
-                max_abs = ab;
-                let ratio = ab / bias_thresh.max(1e-6);
-                if ratio > worst_ratio {
-                    worst_ratio = ratio;
-                    worst_desc = Some((ratio, format!("{aa} {atom} {mean_b:+.2} ppm (n={c})")));
-                }
+    // Build MAD-Winsorized (`±3.0 * MAD`, scale-invariant!) centered per-k arrays (`Option<f64>`)
+    // + global RMS for each channel so isolated misassignment spikes cannot cause false ANOVA/t triggers.
+    let build_centered = |sums: &[f64], cnts: &[usize], s_floor: f64| -> (Vec<Option<f64>>, f64) {
+        let mut raw = vec![None; k_len];
+        let mut vals: Vec<f64> = Vec::with_capacity(k_len);
+        for k in 0..k_len {
+            if cnts[k] > 0 {
+                let v = sums[k] / (cnts[k] as f64);
+                raw[k] = Some(v);
+                vals.push(v);
             }
         }
-        let mean_abs = if n_aa > 0 {
-            sum_abs / (n_aa as f64)
+        let n = vals.len();
+        if n < 6 {
+            return (vec![None; k_len], 0.0);
+        }
+        vals.sort_by(|a, b| a.total_cmp(b));
+        let med = if n % 2 == 1 {
+            vals[n / 2]
         } else {
-            0.0
+            0.5 * (vals[n / 2 - 1] + vals[n / 2])
         };
-        (rms, max_abs, mean_abs, worst_desc)
+        let mut devs: Vec<f64> = vals.iter().map(|&v| (v - med).abs()).collect();
+        devs.sort_by(|a, b| a.total_cmp(b));
+        let mad = if n % 2 == 1 {
+            devs[n / 2]
+        } else {
+            0.5 * (devs[n / 2 - 1] + devs[n / 2])
+        };
+        let sigma_rob = (1.4826 * mad).max(s_floor);
+        let clip_rad = 3.0 * sigma_rob;
+
+        let mut s = 0.0f64;
+        for v in raw.iter_mut().flatten() {
+            *v = med + (*v - med).clamp(-clip_rad, clip_rad);
+            s += *v;
+        }
+        let mean = s / (n as f64);
+        let mut sq = 0.0f64;
+        for v in raw.iter_mut().flatten() {
+            *v -= mean;
+            sq += (*v) * (*v);
+        }
+        (raw, (sq / (n as f64)).sqrt())
     };
 
-    let (rms_n, max_abs_bias_n, mean_b_n, desc_n) = analyze_atom(&res_n, "N", 0.65);
-    let (rms_c, max_abs_bias_c, mean_b_c, desc_c) = analyze_atom(&res_c, "C'", 0.28);
-    let (rms_ca, max_abs_bias_ca, mean_b_ca, desc_ca) = analyze_atom(&res_ca, "CA", 0.28);
-    let (rms_cb, max_abs_bias_cb, mean_b_cb, desc_cb) = analyze_atom(&res_cb, "CB", 0.28);
+    let (ch_n, rms_n) = build_centered(&sum_n, &cnt_n, 0.20);
+    let (ch_c, rms_c) = build_centered(&sum_c, &cnt_c, 0.08);
+    let (ch_ca, rms_ca) = build_centered(&sum_ca, &cnt_ca, 0.08);
+    let (ch_cb, rms_cb) = build_centered(&sum_cb, &cnt_cb, 0.08);
 
-    let mut worst_bias_desc = String::new();
-    let mut best_ratio = 0.0f64;
-    for cand in [desc_n, desc_c, desc_ca, desc_cb].into_iter().flatten() {
-        if cand.0 > best_ratio {
-            best_ratio = cand.0;
-            worst_bias_desc = cand.1;
+    // 5th segmental channel: `d_CA_CB[k] = r_CA[k] - r_CB[k]` (MAD-Winsorized & centered)
+    let mut sum_cacb = vec![0.0f64; k_len];
+    let mut cnt_cacb = vec![0usize; k_len];
+    for k in 0..k_len {
+        if let (Some(rca), Some(rcb)) = (ch_ca[k], ch_cb[k]) {
+            sum_cacb[k] = rca - rcb;
+            cnt_cacb[k] = 1;
         }
     }
-    if worst_bias_desc.is_empty() {
-        worst_bias_desc = "elevated global unary RMS".to_string();
+    let (ch_cacb, _rms_cacb) = build_centered(&sum_cacb, &cnt_cacb, 0.11);
+
+    let four_channels: [(&str, &[Option<f64>], f64, f64); 4] = [
+        ("N", &ch_n, 0.20, rms_n),
+        ("C'", &ch_c, 0.08, rms_c),
+        ("CA", &ch_ca, 0.08, rms_ca),
+        ("CB", &ch_cb, 0.08, rms_cb),
+    ];
+
+    // Helper: one-way ANOVA F-test on `(group_label, value)` pairs (`n_g >= 2`, `K >= 4`, `df_w >= 15`)
+    let one_way_anova = |pairs: &[(&str, f64)], s_floor: f64| -> Option<(f64, f64)> {
+        let mut groups: BTreeMap<&str, Vec<f64>> = BTreeMap::new();
+        for &(g, v) in pairs {
+            groups.entry(g).or_default().push(v);
+        }
+        let valid_groups: Vec<Vec<f64>> = groups
+            .into_values()
+            .filter(|vals| vals.len() >= 2)
+            .collect();
+        let k_grp = valid_groups.len();
+        let n_tot: usize = valid_groups.iter().map(|v| v.len()).sum();
+        if k_grp < 4 || n_tot < k_grp + 15 {
+            return None;
+        }
+        let grand_mean = valid_groups.iter().flatten().sum::<f64>() / (n_tot as f64);
+        let mut ss_between = 0.0f64;
+        let mut ss_within = 0.0f64;
+        for grp in &valid_groups {
+            let gm = grp.iter().sum::<f64>() / (grp.len() as f64);
+            ss_between += (grp.len() as f64) * (gm - grand_mean).powi(2);
+            for &v in grp {
+                ss_within += (v - gm).powi(2);
+            }
+        }
+        let df1 = (k_grp - 1) as f64;
+        let df2 = (n_tot - k_grp) as f64;
+        let ms_b = ss_between / df1;
+        let ms_w = (ss_within / df2).max(s_floor * s_floor);
+        let f_val = ms_b / ms_w;
+        Some((f_val, f_upper_tail_p(f_val, df1, df2)))
+    };
+
+    // ------------------------------------------------------------------------
+    // TEST 1: Per-AA-type bias (one-way ANOVA + leave-one-group-out Student t)
+    // ------------------------------------------------------------------------
+    let mut aa_pvals: Vec<f64> = Vec::new();
+    let mut max_f_aa = 0.0f64;
+    let mut min_p_aa_t = 1.0f64;
+    let mut n_aa_t_tests = 0usize;
+    let mut max_abs_biases = [0.0f64; 4];
+    let mut best_aa_t_desc: Option<(f64, String)> = None;
+    let mut aa_group_abs_t: BTreeMap<String, f64> = BTreeMap::new();
+
+    for (ci, &(atom, ch, s_floor, _)) in four_channels.iter().enumerate() {
+        let pairs: Vec<(&str, f64)> = (0..k_len)
+            .filter_map(|k| ch[k].map(|r| (seq[k].as_str(), r)))
+            .collect();
+        if let Some((f_val, pf)) = one_way_anova(&pairs, s_floor) {
+            aa_pvals.push(pf);
+            max_f_aa = max_f_aa.max(f_val);
+        }
+
+        let mut by_aa: BTreeMap<&str, Vec<f64>> = BTreeMap::new();
+        for &(aa, r) in &pairs {
+            by_aa.entry(aa).or_default().push(r);
+        }
+        let n_all = pairs.len();
+        let sum_all: f64 = pairs.iter().map(|(_, r)| *r).sum();
+        let sum2_all: f64 = pairs.iter().map(|(_, r)| r * r).sum();
+        for (aa, grp) in &by_aa {
+            let ng = grp.len();
+            let n_rest = n_all.saturating_sub(ng);
+            if ng < 4 || n_rest < 10 {
+                continue;
+            }
+            let sum_g: f64 = grp.iter().sum();
+            let sum2_g: f64 = grp.iter().map(|r| r * r).sum();
+            let mean_g = sum_g / (ng as f64);
+            let sum_r = sum_all - sum_g;
+            let sum2_r = sum2_all - sum2_g;
+            let mean_r = sum_r / (n_rest as f64);
+
+            max_abs_biases[ci] = max_abs_biases[ci].max(mean_g.abs());
+
+            let ss_g = (sum2_g - (sum_g * sum_g) / (ng as f64)).max(0.0);
+            let ss_r = (sum2_r - (sum_r * sum_r) / (n_rest as f64)).max(0.0);
+            let df = (ng + n_rest - 2) as f64;
+            let s2_pool = ((ss_g + ss_r) / df).max(s_floor * s_floor);
+            let se = (s2_pool * (1.0 / (ng as f64) + 1.0 / (n_rest as f64))).sqrt();
+            let abs_t = (mean_g - mean_r).abs() / se.max(1e-12);
+            let pt = student_t_two_sided_p(abs_t, df);
+            n_aa_t_tests += 1;
+            if pt < min_p_aa_t {
+                min_p_aa_t = pt;
+            }
+            let entry = aa_group_abs_t.entry((*aa).to_string()).or_insert(0.0);
+            *entry = entry.max(abs_t);
+            if best_aa_t_desc.as_ref().is_none_or(|(bt, _)| abs_t > *bt) {
+                best_aa_t_desc = Some((
+                    abs_t,
+                    format!("{aa} {atom} {mean_g:+.2} ppm (n={ng}, |t|={abs_t:.2})"),
+                ));
+            }
+        }
     }
 
-    let rms_elevated = (res_n.len() >= 12 && rms_n > 1.05)
-        || (res_c.len() >= 12 && rms_c > 0.48)
-        || (res_ca.len() >= 12 && rms_ca > 0.52)
-        || (res_cb.len() >= 12 && rms_cb > 0.62);
+    let p_aa_fisher = if aa_pvals.is_empty() {
+        1.0
+    } else {
+        let x2: f64 = aa_pvals.iter().map(|&p| -2.0 * p.max(1e-30).ln()).sum();
+        fisher_chi2_p(x2, aa_pvals.len())
+    };
+    let p_aa_bonf = if n_aa_t_tests == 0 {
+        1.0
+    } else {
+        (min_p_aa_t * (n_aa_t_tests as f64)).min(1.0)
+    };
+    let aa_bias_triggered = p_aa_fisher < 0.002 || p_aa_bonf < 0.005;
 
-    // Require either clear per-AA systematic bias exceeding sampling noise (`rms` above clean
-    // 1.0x coil floor OR bias well above 2.5*SE) or elevated global unary RMS.
-    let bias_triggered = (max_abs_bias_n > 0.65 && (rms_n > 0.60 || max_abs_bias_n > 0.82))
-        || (max_abs_bias_c > 0.28 && (rms_c > 0.31 || max_abs_bias_c > 0.38))
-        || (max_abs_bias_ca > 0.28 && (rms_ca > 0.32 || max_abs_bias_ca > 0.38))
-        || (max_abs_bias_cb > 0.28 && (rms_cb > 0.38 || max_abs_bias_cb > 0.42));
+    // ------------------------------------------------------------------------
+    // TEST 2: Segmental / secondary-structure coherence (2a lag-1 autocorr + 2b sliding-window t-scan)
+    // ------------------------------------------------------------------------
+    let mut ac_pvals: Vec<f64> = Vec::new();
+    let mut max_ac_z = 0.0f64;
+    for &(_, ch, _, _) in &four_channels {
+        let mut num = 0.0f64;
+        let mut den_a = 0.0f64;
+        let mut den_b = 0.0f64;
+        let mut n_pairs = 0usize;
+        for k in 0..k_len.saturating_sub(1) {
+            if let (Some(ra), Some(rb)) = (ch[k], ch[k + 1]) {
+                num += ra * rb;
+                den_a += ra * ra;
+                den_b += rb * rb;
+                n_pairs += 1;
+            }
+        }
+        if n_pairs >= 12 && den_a > 1e-12 && den_b > 1e-12 {
+            let rho1 = num / (den_a * den_b).sqrt();
+            let z = (rho1 + 1.0 / (n_pairs as f64)) * (n_pairs as f64).sqrt();
+            max_ac_z = max_ac_z.max(z);
+            ac_pvals.push(normal_upper_tail_p(z));
+        }
+    }
+    let p_seg_autocorr = if ac_pvals.is_empty() {
+        1.0
+    } else {
+        let x2: f64 = ac_pvals.iter().map(|&p| -2.0 * p.max(1e-30).ln()).sum();
+        fisher_chi2_p(x2, ac_pvals.len())
+    };
 
-    let triggered = bias_triggered || rms_elevated;
+    // (2b) Contiguous sliding-window two-sample Student t-scan for W in {8, 12, 16}, step = 2
+    let five_channels: [(&str, &[Option<f64>], f64); 5] = [
+        ("N", &ch_n, 0.20),
+        ("C'", &ch_c, 0.08),
+        ("CA", &ch_ca, 0.08),
+        ("CB", &ch_cb, 0.08),
+        ("CA-CB", &ch_cacb, 0.11),
+    ];
+    let mut min_p_win = 1.0f64;
+    let mut n_win_tests = 0usize;
+    let mut max_win_t = 0.0f64;
+    let mut best_win_desc: Option<(f64, String)> = None;
+    let mut per_res_win_t = vec![0.0f64; k_len];
 
-    // Continuous mismatch severity in `[0.0, 3.0]` reflecting BOTH systematic per-AA bias and
-    // excess unary variance above nominal random-coil widths.
-    let bias_excess = ((max_abs_bias_n - 0.55).max(0.0) / 0.55)
-        .max((max_abs_bias_c - 0.24).max(0.0) / 0.28)
-        .max((max_abs_bias_ca - 0.24).max(0.0) / 0.28)
-        .max((max_abs_bias_cb - 0.26).max(0.0) / 0.30);
-    let mean_bias_excess = ((mean_b_n - 0.28).max(0.0) / 0.45)
-        .max((mean_b_c - 0.14).max(0.0) / 0.22)
-        .max((mean_b_ca - 0.14).max(0.0) / 0.22)
-        .max((mean_b_cb - 0.16).max(0.0) / 0.24);
-    let rms_excess = ((rms_n - 0.72).max(0.0) / 0.50)
-        .max((rms_c - 0.34).max(0.0) / 0.28)
-        .max((rms_ca - 0.36).max(0.0) / 0.28)
-        .max((rms_cb - 0.42).max(0.0) / 0.34);
-    let mismatch_severity =
-        (0.50 * bias_excess + 0.45 * mean_bias_excess + 0.55 * rms_excess).clamp(0.0, 3.0);
+    for &(atom, ch, s_floor) in &five_channels {
+        // Prefix sums for O(1) window statistics
+        let mut pref_cnt = vec![0usize; k_len + 1];
+        let mut pref_sum = vec![0.0f64; k_len + 1];
+        let mut pref_sum2 = vec![0.0f64; k_len + 1];
+        for k in 0..k_len {
+            pref_cnt[k + 1] = pref_cnt[k];
+            pref_sum[k + 1] = pref_sum[k];
+            pref_sum2[k + 1] = pref_sum2[k];
+            if let Some(r) = ch[k] {
+                pref_cnt[k + 1] += 1;
+                pref_sum[k + 1] += r;
+                pref_sum2[k + 1] += r * r;
+            }
+        }
+        let tot_n = pref_cnt[k_len];
+        let tot_s = pref_sum[k_len];
+        let tot_s2 = pref_sum2[k_len];
+        if tot_n < 20 {
+            continue;
+        }
+        for &w_len in &[8usize, 12, 16] {
+            if k_len < w_len {
+                continue;
+            }
+            let mut start = 0usize;
+            while start + w_len <= k_len {
+                let end = start + w_len;
+                let n_in = pref_cnt[end] - pref_cnt[start];
+                let n_out = tot_n - n_in;
+                if n_in >= 5 && n_out >= 15 {
+                    let s_in = pref_sum[end] - pref_sum[start];
+                    let s2_in = pref_sum2[end] - pref_sum2[start];
+                    let s_out = tot_s - s_in;
+                    let s2_out = tot_s2 - s2_in;
+
+                    let mean_in = s_in / (n_in as f64);
+                    let mean_out = s_out / (n_out as f64);
+                    let ss_in = (s2_in - (s_in * s_in) / (n_in as f64)).max(0.0);
+                    let ss_out = (s2_out - (s_out * s_out) / (n_out as f64)).max(0.0);
+                    let df = (n_in + n_out - 2) as f64;
+                    let s2_pool = ((ss_in + ss_out) / df).max(s_floor * s_floor);
+                    let se = (s2_pool * (1.0 / (n_in as f64) + 1.0 / (n_out as f64))).sqrt();
+                    let abs_t = (mean_in - mean_out).abs() / se.max(1e-12);
+                    let pw = student_t_two_sided_p(abs_t, df);
+                    n_win_tests += 1;
+                    if pw < min_p_win {
+                        min_p_win = pw;
+                    }
+                    if abs_t > max_win_t {
+                        max_win_t = abs_t;
+                    }
+                    if best_win_desc.as_ref().is_none_or(|(bt, _)| abs_t > *bt) {
+                        best_win_desc = Some((
+                            abs_t,
+                            format!(
+                                "segment [{start}..{end}) {atom} {:+.2} ppm (|t|={abs_t:.2})",
+                                mean_in - mean_out
+                            ),
+                        ));
+                    }
+                    if abs_t >= 2.2 {
+                        for v in per_res_win_t.iter_mut().take(end).skip(start) {
+                            *v = v.max(abs_t);
+                        }
+                    }
+                }
+                start += 2;
+            }
+        }
+    }
+    let p_seg_win_bonf = if n_win_tests == 0 {
+        1.0
+    } else {
+        (min_p_win * (n_win_tests as f64)).min(1.0)
+    };
+    let segmental_bias_triggered = p_seg_autocorr < 0.002 || p_seg_win_bonf < 0.005;
+
+    // ------------------------------------------------------------------------
+    // TEST 3: Neighbor-dependent bias (ANOVA grouped by `seq[k-1]` and `seq[k+1]`)
+    // ------------------------------------------------------------------------
+    let mut prev_pvals: Vec<f64> = Vec::new();
+    let mut next_pvals: Vec<f64> = Vec::new();
+    let mut max_f_nb = 0.0f64;
+    for &(_, ch, s_floor, _) in &four_channels {
+        let prev_pairs: Vec<(&str, f64)> = (1..k_len)
+            .filter_map(|k| ch[k].map(|r| (seq[k - 1].as_str(), r)))
+            .collect();
+        if let Some((f_val, pf)) = one_way_anova(&prev_pairs, s_floor) {
+            prev_pvals.push(pf);
+            max_f_nb = max_f_nb.max(f_val);
+        }
+        let next_pairs: Vec<(&str, f64)> = (0..k_len.saturating_sub(1))
+            .filter_map(|k| ch[k].map(|r| (seq[k + 1].as_str(), r)))
+            .collect();
+        if let Some((f_val, pf)) = one_way_anova(&next_pairs, s_floor) {
+            next_pvals.push(pf);
+            max_f_nb = max_f_nb.max(f_val);
+        }
+    }
+    let p_prev_fisher = if prev_pvals.is_empty() {
+        1.0
+    } else {
+        let x2: f64 = prev_pvals.iter().map(|&p| -2.0 * p.max(1e-30).ln()).sum();
+        fisher_chi2_p(x2, prev_pvals.len())
+    };
+    let p_next_fisher = if next_pvals.is_empty() {
+        1.0
+    } else {
+        let x2: f64 = next_pvals.iter().map(|&p| -2.0 * p.max(1e-30).ln()).sum();
+        fisher_chi2_p(x2, next_pvals.len())
+    };
+    let p_neighbor_fisher = p_prev_fisher.min(p_next_fisher);
+    let neighbor_bias_triggered = p_prev_fisher < 0.0025 || p_next_fisher < 0.0025;
+
+    let triggered = aa_bias_triggered || segmental_bias_triggered || neighbor_bias_triggered;
+
+    // Build human-readable summary & scale-free effect-size `mismatch_severity` + `per_residue_mismatch_z`
+    let mut parts: Vec<String> = Vec::new();
+    if aa_bias_triggered {
+        if let Some((_, ref d)) = best_aa_t_desc {
+            parts.push(format!(
+                "per-AA bias {d} (p_F={p_aa_fisher:.2e}, p_t={p_aa_bonf:.2e})"
+            ));
+        } else {
+            parts.push(format!("per-AA bias (p_F={p_aa_fisher:.2e})"));
+        }
+    }
+    if segmental_bias_triggered {
+        if let Some((_, ref d)) = best_win_desc {
+            parts.push(format!(
+                "segmental coherence {d} (p_ac={p_seg_autocorr:.2e}, p_win={p_seg_win_bonf:.2e})"
+            ));
+        } else {
+            parts.push(format!(
+                "segmental autocorrelation (p_ac={p_seg_autocorr:.2e})"
+            ));
+        }
+    }
+    if neighbor_bias_triggered {
+        parts.push(format!(
+            "neighbor-dependent shift bias (p_prev={p_prev_fisher:.2e}, p_next={p_next_fisher:.2e})"
+        ));
+    }
+    let worst_bias_desc = parts.join("; ");
+
+    let (mismatch_severity, per_residue_mismatch_z) = if !triggered {
+        (0.0, vec![0.0; k_len])
+    } else {
+        let min_p = p_aa_fisher
+            .min(p_aa_bonf)
+            .min(p_seg_autocorr)
+            .min(p_seg_win_bonf)
+            .min(p_neighbor_fisher)
+            .max(1e-30);
+        let log_p_sig = ((-min_p.log10()) - 2.0).max(0.0) / 3.2;
+        let stat_sig = ((max_f_aa - 1.5).max(0.0) / 3.0)
+            .max((max_f_nb - 1.5).max(0.0) / 3.0)
+            .max((max_win_t - 2.5).max(0.0) / 3.0)
+            .max((max_ac_z - 2.0).max(0.0) / 3.0);
+        let sev = (0.35 + 0.55 * log_p_sig + 0.55 * stat_sig).clamp(0.35, 3.0);
+
+        let mut per_z = vec![0.0f64; k_len];
+        for k in 0..k_len {
+            let mut z_sum = 0.0f64;
+            let mut z_cnt = 0usize;
+            for &(_, ch, s_floor, rms_ch) in &four_channels {
+                if let Some(r) = ch[k] {
+                    let sd = rms_ch.max(s_floor);
+                    z_sum += (r / sd).abs();
+                    z_cnt += 1;
+                }
+            }
+            let local_res_z = if z_cnt > 0 {
+                z_sum / (z_cnt as f64)
+            } else {
+                0.0
+            };
+            let aa_t = if aa_bias_triggered {
+                aa_group_abs_t.get(&seq[k]).copied().unwrap_or(0.0)
+            } else {
+                0.0
+            };
+            let win_t = if segmental_bias_triggered {
+                per_res_win_t[k]
+            } else {
+                0.0
+            };
+            per_z[k] =
+                (0.45 * local_res_z + 0.45 * (win_t - 1.5).max(0.0) + 0.35 * (aa_t - 1.5).max(0.0))
+                    .clamp(0.0, 6.0);
+        }
+        (sev, per_z)
+    };
 
     PredictorMismatchReport {
         rms_n,
         rms_c,
         rms_ca,
         rms_cb,
-        max_abs_bias_n,
-        max_abs_bias_c,
-        max_abs_bias_ca,
-        max_abs_bias_cb,
+        max_abs_bias_n: max_abs_biases[0],
+        max_abs_bias_c: max_abs_biases[1],
+        max_abs_bias_ca: max_abs_biases[2],
+        max_abs_bias_cb: max_abs_biases[3],
         worst_bias_desc,
+        aa_bias_triggered,
+        segmental_bias_triggered,
+        neighbor_bias_triggered,
+        p_aa_fisher,
+        p_aa_bonf,
+        p_seg_autocorr,
+        p_seg_win_bonf,
+        p_neighbor_fisher,
+        per_residue_mismatch_z,
         triggered,
         mismatch_severity,
     }
@@ -4412,6 +5404,8 @@ struct PosteriorDiagnostics {
 fn compute_posteriors_honest(
     best: &JointReplicaState,
     replicas: &[JointReplicaState],
+    unlocked_replicas: Option<&[JointReplicaState]>,
+    pass1_locked_nodes: &[bool],
     nodes: &[JointIdpNode],
     seq: &[String],
     preds: &[NcIdpResiduePrediction],
@@ -4515,18 +5509,24 @@ fn compute_posteriors_honest(
     } else {
         0.0
     };
-    diag.emp_rms_seq_ca = if sq_ca_diffs.len() >= 5 {
-        (sq_ca_diffs.iter().sum::<f64>() / (sq_ca_diffs.len() as f64)).sqrt()
-    } else {
-        0.0
+    let trimmed_rms = |sq_vals: &mut Vec<f64>| -> f64 {
+        if sq_vals.len() < 5 {
+            return 0.0;
+        }
+        sq_vals.sort_by(|a, b| a.total_cmp(b));
+        let keep = if sq_vals.len() >= 10 {
+            ((sq_vals.len() * 9) / 10).max(5)
+        } else {
+            sq_vals.len()
+        };
+        let mean_sq = sq_vals[..keep].iter().sum::<f64>() / (keep as f64);
+        mean_sq.sqrt()
     };
-    diag.emp_rms_seq_c = if sq_c_diffs.len() >= 5 {
-        (sq_c_diffs.iter().sum::<f64>() / (sq_c_diffs.len() as f64)).sqrt()
-    } else {
-        0.0
-    };
+    diag.emp_rms_seq_ca = trimmed_rms(&mut sq_ca_diffs);
+    diag.emp_rms_seq_c = trimmed_rms(&mut sq_c_diffs);
 
-    // 2. Boltzmann-weighted replica consensus `p_ens`
+    // 2. Boltzmann-weighted replica consensus `p_ens` (strictly UNLOCKED for Pass-1 locked anchors
+    //    so Pass-2 locks never artificially pin `p_ens = 1.0` on misplaced fragments!)
     let max_sc = replicas
         .iter()
         .map(|r| r.score)
@@ -4537,6 +5537,25 @@ fn compute_posteriors_honest(
         .map(|r| ((r.score - max_sc) / tau_ens).clamp(-35.0, 0.0).exp())
         .collect();
     let sum_w: f64 = rep_w.iter().sum::<f64>().max(1e-12);
+
+    let (unl_w, unl_sum_w): (Vec<f64>, f64) = if let Some(u_reps) = unlocked_replicas {
+        if !u_reps.is_empty() {
+            let u_max = u_reps
+                .iter()
+                .map(|r| r.score)
+                .fold(f64::NEG_INFINITY, f64::max);
+            let wv: Vec<f64> = u_reps
+                .iter()
+                .map(|r| ((r.score - u_max) / tau_ens).clamp(-35.0, 0.0).exp())
+                .collect();
+            let sw = wv.iter().sum::<f64>().max(1e-12);
+            (wv, sw)
+        } else {
+            (Vec::new(), 1.0)
+        }
+    } else {
+        (Vec::new(), 1.0)
+    };
 
     let mut ens_sum = 0.0f64;
     for s in 0..s_len {
@@ -4550,7 +5569,21 @@ fn compute_posteriors_honest(
                 agree += w;
             }
         }
-        let pe = (agree / sum_w).clamp(0.0, 1.0);
+        let mut pe = (agree / sum_w).clamp(0.0, 1.0);
+        if pass1_locked_nodes.get(s).copied().unwrap_or(false) {
+            if let Some(u_reps) = unlocked_replicas {
+                if !u_reps.is_empty() {
+                    let mut u_agree = 0.0f64;
+                    for (r, &w) in u_reps.iter().zip(unl_w.iter()) {
+                        if r.pos[s] == k_best {
+                            u_agree += w;
+                        }
+                    }
+                    let pe_unl = (u_agree / unl_sum_w).clamp(0.0, 1.0);
+                    pe = pe.min(pe_unl);
+                }
+            }
+        }
         diag.p_ens[s] = pe;
         ens_sum += pe;
     }
@@ -4560,7 +5593,72 @@ fn compute_posteriors_honest(
         0.0
     };
 
-    // 3. Evaluate single/2-swap, multi-way cycle, and `2..=4`-residue motif-swap competitors
+    // 3. Detect motif repeats (`180r3.core:P2-2`), find maximal contiguous sequential walk chains,
+    //    and evaluate whole-chain non-overlapping swap competitors for `clen in 5..=24` so
+    //    misregistered multi-residue fragments see their true global competitors!
+    let (motif_period, motif_id, motif_z) = motif_repeat_metrics(seq);
+    let motif_repeat_warn = k_len >= 24 && motif_id >= 0.28 && motif_z >= 4.5;
+
+    let mut chain_len = vec![0usize; k_len];
+    let mut chain_best_swap = vec![f64::NEG_INFINITY; k_len];
+    {
+        let mut work_chain_at = best.at.clone();
+        let mut k = 1usize;
+        while k < k_len {
+            if best.at[k] < 0 {
+                k += 1;
+                continue;
+            }
+            let mut end = k;
+            while end + 1 < k_len
+                && best.at[end + 1] >= 0
+                && p_mat.get(best.at[end] as usize, best.at[end + 1] as usize) >= 0.8
+            {
+                end += 1;
+            }
+            let clen = end - k + 1;
+            for v in chain_len.iter_mut().take(end + 1).skip(k) {
+                *v = clen;
+            }
+            if (5..=24).contains(&clen) && k_len > clen {
+                let mut best_d = f64::NEG_INFINITY;
+                for k_alt in 1..=(k_len - clen) {
+                    if k_alt.abs_diff(k) < clen {
+                        continue;
+                    }
+                    let feasible = (0..clen).all(|o| {
+                        let a = work_chain_at[k + o];
+                        let b = work_chain_at[k_alt + o];
+                        (a < 0 || u_mat.get(a as usize, k_alt + o) > FORBID * 0.5)
+                            && (b < 0 || u_mat.get(b as usize, k + o) > FORBID * 0.5)
+                    });
+                    if !feasible {
+                        continue;
+                    }
+                    let before =
+                        eval_two_blocks_local(&work_chain_at, u_mat, p_mat, k, k_alt, clen);
+                    for o in 0..clen {
+                        work_chain_at.swap(k + o, k_alt + o);
+                    }
+                    let after = eval_two_blocks_local(&work_chain_at, u_mat, p_mat, k, k_alt, clen);
+                    for o in 0..clen {
+                        work_chain_at.swap(k + o, k_alt + o);
+                    }
+                    let d = after - before;
+                    if d > best_d {
+                        best_d = d;
+                    }
+                }
+                for v in chain_best_swap.iter_mut().take(end + 1).skip(k) {
+                    *v = best_d;
+                }
+            }
+            k = end + 1;
+        }
+    }
+
+    // 4. Evaluate single/2-swap, multi-way cycle, `2..=4`-residue motif-swap, AND period-shifted
+    //    repeat block-swap competitors (`P2-2`)
     let mut work_at = best.at.clone();
     let mut top_single: Vec<Vec<f64>> = vec![Vec::new(); s_len];
     let mut top_cycle: Vec<Vec<f64>> = vec![Vec::new(); s_len];
@@ -4658,6 +5756,51 @@ fn compute_posteriors_honest(
                 }
             }
         }
+
+        // Period-shifted motif-repeat block swaps (`blen = motif_period.clamp(5, 14)`,
+        // shifts `±motif_period, ±2*motif_period`; `180r3.core:P2-2`)
+        if motif_repeat_warn && motif_period >= 3 {
+            let blen = motif_period.clamp(5, 14).min(k_len.saturating_sub(1));
+            let win_lo = k_star.saturating_sub(blen - 1).max(1);
+            let win_hi = k_star.min(k_len - blen);
+            if win_lo <= win_hi {
+                for k_win in win_lo..=win_hi {
+                    for mult in [-2isize, -1, 1, 2] {
+                        let k_alt_i = (k_win as isize) + mult * (motif_period as isize);
+                        if k_alt_i < 1 || (k_alt_i as usize) + blen > k_len {
+                            continue;
+                        }
+                        let k_alt = k_alt_i as usize;
+                        if k_alt.abs_diff(k_win) < blen {
+                            continue;
+                        }
+                        let feasible = (0..blen).all(|o| {
+                            let a = work_at[k_win + o];
+                            let b = work_at[k_alt + o];
+                            (a < 0 || u_mat.get(a as usize, k_alt + o) > FORBID * 0.5)
+                                && (b < 0 || u_mat.get(b as usize, k_win + o) > FORBID * 0.5)
+                        });
+                        if !feasible {
+                            continue;
+                        }
+                        let before =
+                            eval_two_blocks_local(&work_at, u_mat, p_mat, k_win, k_alt, blen);
+                        for o in 0..blen {
+                            work_at.swap(k_win + o, k_alt + o);
+                        }
+                        let after =
+                            eval_two_blocks_local(&work_at, u_mat, p_mat, k_win, k_alt, blen);
+                        for o in 0..blen {
+                            work_at.swap(k_win + o, k_alt + o);
+                        }
+                        let delta = after - before;
+                        if delta > best_blk {
+                            best_blk = delta;
+                        }
+                    }
+                }
+            }
+        }
         best_motif[s] = best_blk;
 
         let strongest_alt = top_single[s]
@@ -4677,13 +5820,13 @@ fn compute_posteriors_honest(
         1.0
     };
 
-    // 4. Unlabelled predictor-mismatch diagnostic (`180r2.core:P1-3`)
+    // 5. Noise-scale-invariant unlabelled predictor-mismatch diagnostic (`180r3.core:P1-2`)
     diag.predictor_mismatch = evaluate_predictor_mismatch_qc(&best.at, nodes, seq, preds, offsets);
     let pred_sev = diag.predictor_mismatch.mismatch_severity;
 
-    // 5. Adaptive temperature `tau_base` scaled by empirical RMS, node inflation,
-    //    missing channels, fusion scatter, ambiguity, sequence repeat factor, AND
-    //    per-node bilateral `(i-1 -> i -> i+1)` structural support + predictor mismatch!
+    // 6. Adaptive temperature `tau_base` scaled by empirical RMS, node inflation,
+    //    missing channels, fusion scatter, ambiguity, sequence/motif repeat factor, AND
+    //    per-node bilateral `(i-1 -> i -> i+1)` walk chain + `per_residue_mismatch_z[k]`!
     let (h_bits, max_aa, max_dipep, top3_dipep) = sequence_complexity_metrics(seq);
     let max_homo = max_homopolymer_run(seq);
     let seq_extreme_repeat = k_len >= 16
@@ -4707,14 +5850,12 @@ fn compute_posteriors_honest(
     };
     let rms_scale = rms_ca_scale.max(rms_c_scale);
 
-    // Decoy/node inflation factor: `n_nodes / n_assignable > 1.15` widens uncertainty!
     let inflation_scale = if diag.node_ratio > 1.15 {
         (1.0 + 1.35 * (diag.node_ratio - 1.15)).clamp(1.0, 2.8)
     } else {
         1.0
     };
 
-    // Missing channels / sparse connectivity / fusion scatter
     let conn_deficit = (0.88 - diag.connectivity_frac).max(0.0);
     let sup_deficit = (0.85 - diag.support_3d_frac).max(0.0);
     let channel_scale = (1.0 + 2.8 * conn_deficit + 1.5 * sup_deficit).clamp(1.0, 2.2);
@@ -4729,10 +5870,34 @@ fn compute_posteriors_honest(
         2.80
     } else if seq_warn_repeat {
         2.05
+    } else if motif_repeat_warn {
+        1.42
     } else {
         1.0
     };
     let ambig_scale = (1.0 + 1.45 * (diag.ambig_placement_frac - 0.15).max(0.0)).clamp(1.0, 2.2);
+
+    // Quasi-likelihood empirical unary dispersion scaling (`s_emp / sigma_model`): prevents
+    // `p_loc` from saturating to 1.0 ties when true random-coil dispersion exceeds nominal 1x!
+    let mut disp_ratios = [0.0f64; 4];
+    let mut n_disp = 0usize;
+    for (rms_obs, sigma_nom) in [
+        (diag.predictor_mismatch.rms_n, 0.65),
+        (diag.predictor_mismatch.rms_c, 0.35),
+        (diag.predictor_mismatch.rms_ca, 0.35),
+        (diag.predictor_mismatch.rms_cb, 0.42),
+    ] {
+        if rms_obs > 1e-6 {
+            disp_ratios[n_disp] = rms_obs / sigma_nom;
+            n_disp += 1;
+        }
+    }
+    let mean_disp_ratio = if n_disp > 0 {
+        disp_ratios[..n_disp].iter().sum::<f64>() / (n_disp as f64)
+    } else {
+        1.0
+    };
+    let unary_disp_scale = (1.0 + 0.65 * (mean_disp_ratio - 1.10).max(0.0)).clamp(1.0, 1.90);
 
     let tau_base_no_pred = (2.05
         * rms_scale
@@ -4740,8 +5905,9 @@ fn compute_posteriors_honest(
         * channel_scale
         * fusion_scale
         * repeat_scale
-        * ambig_scale)
-        .clamp(2.05, 16.0);
+        * ambig_scale
+        * unary_disp_scale)
+        .clamp(2.05, 18.0);
 
     for s in 0..s_len {
         let k_i = best.pos[s];
@@ -4751,7 +5917,8 @@ fn compute_posteriors_honest(
         let k_star = k_i as usize;
         let pair_prev = pair_prev_vec[s];
         let pair_next = pair_next_vec[s];
-        let gap = (-strongest_alt_vec[s]).max(0.0);
+        let strongest_with_chain = strongest_alt_vec[s].max(chain_best_swap[k_star]);
+        let gap = (-strongest_with_chain).max(0.0);
 
         let is_nterm_slot = k_star == 1;
         let is_cterm_slot = k_star + 1 == k_len;
@@ -4767,22 +5934,34 @@ fn compute_posteriors_honest(
         };
         let n_strong_links = usize::from(pair_prev >= 0.8) + usize::from(pair_next >= 0.8);
 
-        // Bilateral `(i-1 -> i -> i+1)` sequential walk corroboration is invariant to unary
-        // predictor bias, whereas unilateral or isolated placements depend heavily on unary priors.
-        let (mut node_struct_scale, node_pred_scale) =
-            if bilateral_corroborated && pair_min_side >= 1.4 && gap >= 3.5 {
-                (0.84, (1.0 + 0.72 * pred_sev).clamp(1.0, 2.7))
-            } else if bilateral_corroborated {
-                (1.06, (1.0 + 0.98 * pred_sev).clamp(1.0, 3.2))
-            } else if n_strong_links == 1 {
-                (1.30, (1.0 + 1.25 * pred_sev).clamp(1.0, 3.6))
-            } else {
-                (1.95, (1.0 + 1.60 * pred_sev).clamp(1.0, 4.2))
-            };
+        let mut node_struct_scale = if bilateral_corroborated && pair_min_side >= 1.4 && gap >= 3.5
+        {
+            0.84
+        } else if bilateral_corroborated {
+            1.06
+        } else if n_strong_links == 1 {
+            1.32
+        } else {
+            1.95
+        };
         if !nodes[s].has_3d_support() {
             node_struct_scale *= 1.35;
         }
-        let tau_node = (tau_base_no_pred * node_struct_scale * node_pred_scale).clamp(1.75, 22.0);
+        // Under `predictor_mismatch.triggered`, apply a modest uniform structural temperature
+        // adjustment WITHOUT penalizing per-residue `local_z` (under systematic bias, correctly
+        // assigned residues held by sequential links have LARGER residuals vs the biased prior
+        // than misassigned residues that matched the biased prior by accident!).
+        let node_pred_scale = if diag.predictor_mismatch.triggered {
+            let base_p = if bilateral_corroborated {
+                0.15 * pred_sev
+            } else {
+                0.30 * pred_sev
+            };
+            (1.0 + base_p).clamp(1.0, 2.0)
+        } else {
+            1.0
+        };
+        let tau_node = (tau_base_no_pred * node_struct_scale * node_pred_scale).clamp(1.75, 24.0);
 
         let mut alt_sum = (d_unassign_vec[s] / tau_node).clamp(-35.0, 18.0).exp();
         for &d in &top_single[s] {
@@ -4791,26 +5970,26 @@ fn compute_posteriors_honest(
         for &cd in &top_cycle[s] {
             alt_sum += (cd / (1.15 * tau_node)).clamp(-35.0, 18.0).exp();
         }
-        if best_motif[s] > -5.0 {
-            alt_sum += (best_motif[s] / (1.15 * tau_node)).clamp(-35.0, 18.0).exp();
+        let best_blk_all = best_motif[s].max(chain_best_swap[k_star]);
+        if best_blk_all > -12.0 {
+            alt_sum += (best_blk_all / (1.20 * tau_node)).clamp(-35.0, 18.0).exp();
         }
         let p_loc = (1.0 / (1.0 + alt_sum)).clamp(0.0, 1.0);
         diag.p_local[s] = p_loc;
 
-        // Margin & bilateral rank separator (`180r2.core:P1-3`): wide-margin bilateral walks
-        // rank cleanly above unilateral / narrow-gap placements in the `[0.8, 1.0]` tail.
-        // Under detected predictor mismatch (`pred_sev > 0`), apply a Bayesian model-misspecification
-        // error floor `epsilon_model` so biased runs cannot saturate into `[0.95, 1.0]`.
+        // Combine `p_loc`, unlocked replica consensus `p_ens`, bilateral margin, and contiguous
+        // sequential walk-chain length (`chain_len`) — all bias-invariant discriminators!
         let margin_mod = if bilateral_corroborated && gap >= 4.0 {
             1.0
         } else if bilateral_corroborated {
             (0.90 + 0.10 * (gap / 4.0).clamp(0.0, 1.0)).clamp(0.90, 1.0)
         } else {
-            (0.80 + 0.13 * (gap / 4.5).clamp(0.0, 1.0)).clamp(0.80, 0.93)
+            (0.76 + 0.16 * (gap / 4.5).clamp(0.0, 1.0)).clamp(0.76, 0.92)
         };
-        let eps_model = (0.048 * pred_sev).clamp(0.0, 0.16);
-        let combined =
-            (1.0 - eps_model) * (0.74 * p_loc + 0.26 * (p_loc * diag.p_ens[s]).sqrt()) * margin_mod;
+        let chain_bonus =
+            0.78 + 0.22 * ((chain_len[k_star].saturating_sub(1) as f64) / 6.0).clamp(0.0, 1.0);
+        let p_core = 0.40 * p_loc + 0.35 * diag.p_ens[s] + 0.25 * (p_loc * diag.p_ens[s]).sqrt();
+        let combined = p_core * margin_mod * chain_bonus;
         diag.raw_post[s] = combined.clamp(0.0, 1.0);
     }
 
@@ -5125,18 +6304,21 @@ pub fn assign_joint_idp(
             emp_rms_seq_ca: 0.0,
             emp_rms_seq_c: 0.0,
             fusion_rms_ppm: (build.fusion_rms_c_ppm, build.fusion_rms_n_ppm),
+            predictor_mismatch: PredictorMismatchReport::default(),
             qc_verdict: DatasetQcVerdict::Abstain,
             qc_reasons,
         });
     }
 
     let cas_tables = build_calibrated_cas_tables(&dataset.cas_spectra, &nodes, &seq, cfg);
-    let u_mat = try_joint_idp_unary_matrix(
+    let mut active_offsets = build.fitted_offsets;
+    let mut active_ref_report = build.auto_ref_report;
+    let mut u_mat = try_joint_idp_unary_matrix(
         &nodes,
         &seq,
         &cas_tables,
         cfg,
-        &build.fitted_offsets,
+        &active_offsets,
         &dataset.user_locks,
     )?;
     let p_mat = try_joint_idp_pair_matrix(&nodes, cfg)?;
@@ -5155,13 +6337,16 @@ pub fn assign_joint_idp(
         run_island_ensemble(&u_mat, &p_mat, &valid_user_locks, cfg, 0);
     let pass1_score = pass1_best.score;
 
+    let no_locks_mask = vec![false; s_len];
     let p1_diag = compute_posteriors_honest(
         &pass1_best,
         &pass1_replicas,
+        None,
+        &no_locks_mask,
         &nodes,
         &seq,
         &preds,
-        &build.fitted_offsets,
+        &active_offsets,
         &u_mat,
         &p_mat,
         build.fusion_rms_c_ppm,
@@ -5169,8 +6354,31 @@ pub fn assign_joint_idp(
         build.hn_unmatched_frac,
     );
 
-    // Conservative Pass-1 -> Pass-2 anchor-lock propagation
-    let mut pass1_locked_anchors = if cfg.enable_two_pass_anchor_lock {
+    // Post-Pass-1 sequence-windowed robust offset refinement (`180r3.core:P1-1(b)`):
+    // immune to 25–35% coherent transient helix/sheet segments pulling global C13/N15 offsets.
+    let n_assigned_p1 = pass1_best.pos.iter().filter(|&&p| p >= 0).count();
+    let mut offset_refined = false;
+    if cfg.auto_reference_offset && n_assigned_p1 >= 20 && p1_diag.connectivity_frac >= 0.45 {
+        let (refined_off, refined_safety, shifted) =
+            refine_joint_offsets_post_pass1(&pass1_best.at, &nodes, &seq, &preds, &active_offsets);
+        if shifted {
+            active_offsets = refined_off;
+            active_ref_report = refined_safety;
+            u_mat = try_joint_idp_unary_matrix(
+                &nodes,
+                &seq,
+                &cas_tables,
+                cfg,
+                &active_offsets,
+                &dataset.user_locks,
+            )?;
+            offset_refined = true;
+        }
+    }
+
+    // Conservative Pass-1 -> Pass-2 anchor-lock propagation (cleared whenever offsets refined,
+    // because Pass 1 ran under stale offsets!)
+    let mut pass1_locked_anchors = if !offset_refined && cfg.enable_two_pass_anchor_lock {
         select_conservative_pass1_anchors(
             &pass1_best,
             &p1_diag.p_ens,
@@ -5194,29 +6402,48 @@ pub fn assign_joint_idp(
     }
 
     let n_assignable_slots = k_len.saturating_sub(1);
-    let run_pass2 = cfg.enable_two_pass_anchor_lock
-        && !pass1_locked_anchors.is_empty()
-        && combined_locks.len() < s_len.min(n_assignable_slots);
+    let run_pass2 = offset_refined
+        || (cfg.enable_two_pass_anchor_lock
+            && !pass1_locked_anchors.is_empty()
+            && combined_locks.len() < s_len.min(n_assignable_slots));
 
     let (final_best, final_replicas, final_diag, pass2_score_gain) = if run_pass2 {
         let (p2_best, p2_replicas) =
             run_island_ensemble(&u_mat, &p_mat, &combined_locks, cfg, 0xA5A5_5A5A_1234_5678);
-        if p2_best.score >= pass1_best.score - 1e-6 {
+        if offset_refined || p2_best.score >= pass1_best.score - 1e-6 {
             // Evaluate honest posteriors WITHOUT any circular Pass-2 lock floor (`180.core:P1-1`)
+            // and using UNLOCKED Pass-1 replicas for Pass-1 locked anchors!
+            let mut p1_lock_mask = vec![false; s_len];
+            for &(ls, _) in &pass1_locked_anchors {
+                if ls < s_len {
+                    p1_lock_mask[ls] = true;
+                }
+            }
+            let unl_ref = if !offset_refined && !pass1_locked_anchors.is_empty() {
+                Some(pass1_replicas.as_slice())
+            } else {
+                None
+            };
             let p2_diag = compute_posteriors_honest(
                 &p2_best,
                 &p2_replicas,
+                unl_ref,
+                &p1_lock_mask,
                 &nodes,
                 &seq,
                 &preds,
-                &build.fitted_offsets,
+                &active_offsets,
                 &u_mat,
                 &p_mat,
                 build.fusion_rms_c_ppm,
                 build.fusion_rms_n_ppm,
                 build.hn_unmatched_frac,
             );
-            let gain = (p2_best.score - pass1_score).max(0.0);
+            let gain = if offset_refined {
+                0.0
+            } else {
+                (p2_best.score - pass1_score).max(0.0)
+            };
             (p2_best, p2_replicas, p2_diag, gain)
         } else {
             pass1_locked_anchors.clear();
@@ -5226,12 +6453,12 @@ pub fn assign_joint_idp(
         (pass1_best, pass1_replicas, p1_diag, 0.0)
     };
 
-    // Comprehensive unlabelled Dataset QC Verdict (`180.core:P1-2`, `180r2.core:P1-3`, `P1-4`):
-    // Ports Spec 14 §2.4 low-complexity/repeat guards + decoy/node inflation + fusion RMS +
-    // empirical sequential matching RMS + predictor-mismatch residual bias + ambiguity gates.
+    // Comprehensive unlabelled Dataset QC Verdict (`180r3.core:P1-1`, `P1-2`, `P2-2`):
     let (h_aa_bits, max_aa_frac, max_dipep_frac, top3_dipep_frac) =
         sequence_complexity_metrics(&seq);
     let max_homo_run = max_homopolymer_run(&seq);
+    let (motif_period, motif_id, motif_z) = motif_repeat_metrics(&seq);
+    let motif_repeat_warn = k_len >= 24 && motif_id >= 0.28 && motif_z >= 4.5;
 
     let mut qc_reasons = build.warnings;
     let mut severe_abstain = false;
@@ -5286,7 +6513,7 @@ pub fn assign_joint_idp(
         severe_degeneracy_warn = true;
     }
 
-    // (c) Primary-sequence low-complexity & repeat gate (`180r2.core:P1-4`: escalate near-random repeats to ABSTAIN)
+    // (c) Primary-sequence low-complexity & periodic motif-repeat gate (`180r2.core:P1-4`, `180r3.core:P2-2`)
     let low_cx_warn = k_len >= 16
         && (h_aa_bits < 2.60
             || max_aa_frac >= 0.35
@@ -5316,19 +6543,32 @@ pub fn assign_joint_idp(
             top3_dipep_frac * 100.0
         ));
         severe_degeneracy_warn = true;
+    } else if motif_repeat_warn {
+        qc_reasons.push(format!(
+            "Low-complexity / motif-repeat IDP sequence (period={motif_period}, self-identity={:.1}%, z={motif_z:.2})",
+            motif_id * 100.0
+        ));
+        severe_degeneracy_warn = true;
     }
 
-    // (d) Systematic predictor-mismatch gate (`180r2.core:P1-3`)
-    if final_diag.predictor_mismatch.triggered {
+    // (d) Noise-scale-invariant predictor-mismatch gate (`180r3.core:P1-1(a)`, `P1-2`)
+    let pred_mismatch_triggered = final_diag.predictor_mismatch.triggered;
+    if pred_mismatch_triggered {
         qc_reasons.push(format!(
-            "Systematic per-residue-type shift bias vs ncIDP prior ({}; unary RMS: N={:.2}, C'={:.2}, CA={:.2}, CB={:.2} ppm)",
+            "Systematic shift bias vs ncIDP prior ({}; unary RMS: N={:.2}, C'={:.2}, CA={:.2}, CB={:.2} ppm)",
             final_diag.predictor_mismatch.worst_bias_desc,
             final_diag.predictor_mismatch.rms_n,
             final_diag.predictor_mismatch.rms_c,
             final_diag.predictor_mismatch.rms_ca,
             final_diag.predictor_mismatch.rms_cb,
         ));
-        mild_warn = true;
+        if final_diag.predictor_mismatch.mismatch_severity >= 2.6
+            && final_diag.mean_ens_agreement < 0.55
+        {
+            severe_abstain = true;
+        } else {
+            mild_warn = true;
+        }
     }
 
     // (e) Matching noise, HN<->CON fusion scatter, ensemble disagreement & placement ambiguity gates
@@ -5370,7 +6610,7 @@ pub fn assign_joint_idp(
         severe_abstain = true;
     }
 
-    if !build.auto_ref_report.refused_nuclei.is_empty() {
+    if !active_ref_report.refused_nuclei.is_empty() {
         mild_warn = true;
     }
 
@@ -5382,9 +6622,15 @@ pub fn assign_joint_idp(
         DatasetQcVerdict::Pass
     };
 
-    // Map honest raw posteriors through dedicated `JOINT_IDP_CALIBRATION_KNOTS` WITHOUT
-    // `P2-3` double-discounting under PASS/WARN (`tau_node` already accounts for noise,
-    // predictor mismatch, inflation, and ambiguity inside `raw_post`).
+    // Map honest raw posteriors through dedicated unbiased `JOINT_IDP_CALIBRATION_KNOTS`.
+    // Under `predictor_mismatch.triggered` (`180r3.core:P1-1(a)`), strictly cap calibrated
+    // confidence below `cfg.hc_threshold` via a strictly-monotone compression (preserving full
+    // AUROC rank ordering while eliminating false HC calls under out-of-distribution bias!).
+    let hc_cap = (cfg.hc_threshold - 0.01).clamp(0.10, 0.79);
+    let top_knot_y = JOINT_IDP_CALIBRATION_KNOTS
+        .last()
+        .map_or(0.95, |k| k.1)
+        .max(hc_cap + 0.01);
     let confidence: Vec<f64> = final_diag
         .raw_post
         .iter()
@@ -5398,15 +6644,17 @@ pub fn assign_joint_idp(
                     DatasetQcVerdict::Abstain => {
                         if repeat_abstain {
                             // Near-random low-complexity repeats (~5-15% acc): provisional cap <= 0.15
-                            cal = (cal * 0.25).min(0.15);
+                            cal = (cal * 0.16).min(0.15);
                         } else {
                             // Severe decoy/compound degradation: provisional cap <= 0.35
-                            cal = (cal * 0.45).min((cfg.hc_threshold - 0.45).clamp(0.10, 0.35));
+                            cal = (cal * 0.38).min((cfg.hc_threshold - 0.45).clamp(0.10, 0.35));
                         }
                     }
                     DatasetQcVerdict::Warn => {
                         if compound_noise_warn {
-                            cal = cal.min((cfg.hc_threshold - 0.01).clamp(0.10, 0.79));
+                            // Strictly-monotone compression below `hc_cap` under compound noise/decoy
+                            // degradation (preserves AUROC while eliminating false HC calls)
+                            cal = (cal * (hc_cap / top_knot_y)).min(hc_cap);
                         }
                     }
                     DatasetQcVerdict::Pass => {}
@@ -5498,8 +6746,8 @@ pub fn assign_joint_idp(
         },
         run_scores,
         pass1_locked_anchors,
-        fitted_offsets: build.fitted_offsets,
-        auto_ref_report: build.auto_ref_report,
+        fitted_offsets: active_offsets,
+        auto_ref_report: active_ref_report,
         trosy_calibration: build.trosy_calibration,
         polarity_report: build.polarity_report,
         c_term_coo_candidates: build.c_term_coo_candidates,
@@ -5513,7 +6761,52 @@ pub fn assign_joint_idp(
         emp_rms_seq_ca: final_diag.emp_rms_seq_ca,
         emp_rms_seq_c: final_diag.emp_rms_seq_c,
         fusion_rms_ppm: (build.fusion_rms_c_ppm, build.fusion_rms_n_ppm),
+        predictor_mismatch: final_diag.predictor_mismatch,
         qc_verdict,
         qc_reasons,
     })
+}
+
+#[cfg(test)]
+mod stats_tests {
+    use super::*;
+
+    #[test]
+    fn test_exact_statistical_tail_p_values_against_textbook_critical_values() {
+        // Standard normal upper tail
+        assert!((normal_upper_tail_p(0.0) - 0.5).abs() < 1e-6);
+        assert!((normal_upper_tail_p(1.959_964) - 0.025).abs() < 1e-5);
+        assert!((normal_upper_tail_p(2.575_829) - 0.005).abs() < 1e-5);
+        assert!((normal_upper_tail_p(-1.959_964) - 0.975).abs() < 1e-5);
+
+        // Two-sided Student-t tail
+        assert!((student_t_two_sided_p(2.085_963, 20.0) - 0.05).abs() < 1e-4);
+        assert!((student_t_two_sided_p(2.845_340, 20.0) - 0.01).abs() < 1e-4);
+        assert!((student_t_two_sided_p(1.983_972, 100.0) - 0.05).abs() < 1e-4);
+
+        // F upper tail
+        assert!((f_upper_tail_p(2.710_890, 5.0, 20.0) - 0.05).abs() < 1e-4);
+        assert!((f_upper_tail_p(4.102_680, 5.0, 20.0) - 0.01).abs() < 1e-4);
+        assert!((f_upper_tail_p(1.926_74, 10.0, 100.0) - 0.05).abs() < 1e-3);
+
+        // Exact Fisher chi-square (`df = 2 * n_channels`)
+        assert!((fisher_chi2_p(5.991_465, 1) - 0.05).abs() < 1e-4);
+        assert!((fisher_chi2_p(15.507_313, 4) - 0.05).abs() < 1e-4);
+        assert!((fisher_chi2_p(20.090_235, 4) - 0.01).abs() < 1e-4);
+
+        // Default PredictorMismatchReport must have all p_* = 1.0
+        let def = PredictorMismatchReport::default();
+        assert_eq!(def.p_aa_fisher, 1.0);
+        assert_eq!(def.p_aa_bonf, 1.0);
+        assert_eq!(def.p_seg_autocorr, 1.0);
+        assert_eq!(def.p_seg_win_bonf, 1.0);
+        assert_eq!(def.p_neighbor_fisher, 1.0);
+        assert!(!def.triggered);
+        assert_eq!(def.mismatch_severity, 0.0);
+
+        // Half-sample mode ignores a 30% shifted helix shoulder
+        let mut vals = vec![-2.70; 70];
+        vals.extend(std::iter::repeat_n(-1.50, 30));
+        assert!((half_sample_mode(&vals) - (-2.70)).abs() < 0.02);
+    }
 }
