@@ -36,9 +36,8 @@ use nmr_core::bayes_sa::{
 use nmr_core::c13_detected::{
     infer_cas_mode_from_hint, parse_cas_cli_spec, parse_cas_peaks_str, pick_caco_2d, pick_con_2d,
     pick_con_anchored_3d, simulate_idp_13c_cubes, C13DetectedExp, C13PickedDataset,
-    C13PickerConfig, C13Strip3DPeak, Caco2DPeak, CacoPeakKind, CasMode, CasPeak, CasSpectrum,
-    Con2DPeak, IdpCubeSimConfig, CAS_LOG_LIKELIHOOD_NATS, CAS_MATCH_TOL_C_PRIME_PPM,
-    CAS_MATCH_TOL_N15_PPM,
+    C13PickerConfig, C13Strip3DPeak, Caco2DPeak, CacoPeakKind, CasPeak, CasSpectrum, Con2DPeak,
+    IdpCubeSimConfig, CAS_LOG_LIKELIHOOD_NATS, CAS_MATCH_TOL_C_PRIME_PPM, CAS_MATCH_TOL_N15_PPM,
 };
 use nmr_core::dihedrals::{
     predict_dihedrals, validate_dihedrals_against_torsions, DihedralRestraint,
@@ -656,9 +655,19 @@ fn load_cas_spectrum_from_cli(spec: &str, snr: f32) -> Result<CasSpectrum, Strin
             .collect();
         let mode = mode_opt
             .or_else(|| infer_cas_mode_from_hint(Some(&path), None))
-            .unwrap_or(CasMode::Cacon);
+            .ok_or_else(|| {
+                format!(
+                    "cannot infer CAS direction (cacon = i-1 vs canco = i) for --cas {spec:?}; specify cacon_{res_label}=<path> or canco_{res_label}=<path> explicitly"
+                )
+            })?;
         (mode, cas_pks)
     };
+    if mode_opt.is_none() {
+        eprintln!(
+            "Warning: --cas {spec:?} inferred direction `{}` from path/file metadata; specify `cacon_{res_label}=...` or `canco_{res_label}=...` explicitly to prevent i vs i-1 inversion.",
+            mode.as_str()
+        );
+    }
     let name = format!("{}_{}", mode.as_str(), res_label);
     Ok(CasSpectrum {
         name,
@@ -694,12 +703,16 @@ pub(crate) fn execute_assignment_workflow_with_cli_options(
     };
     let prep = preprocess_peaks_with_options(raw_peaks, &tol, build_opts)?;
     if let Some(ref h_pol) = prep.polarity.hncacb {
-        if h_pol.signs_inverted {
+        if let Some(ref w) = h_pol.warning {
+            eprintln!("Warning: [polarity] {w}");
+        } else if h_pol.signs_inverted {
             eprintln!("[polarity] {}", h_pol.summary);
         }
     }
     if let Some(ref c_pol) = prep.polarity.cbcaconh {
-        if c_pol.signs_inverted {
+        if let Some(ref w) = c_pol.warning {
+            eprintln!("Warning: [polarity] {w}");
+        } else if c_pol.signs_inverted {
             eprintln!("[polarity] {}", c_pol.summary);
         }
     }
@@ -2515,6 +2528,11 @@ fn load_c13_input_bundle_with_extras(
                 &amide_roots,
                 (snr as f64).max(4.0),
             ));
+        } else {
+            eprintln!(
+                "Warning: --hncaconh {} skipped because no HNCO amide (H, N) peaks were provided to anchor 3D HN(CA)CONH strips (supply --peaks <peaks.tsv> with HNCO peaks or a pre-picked N-N TSV).",
+                bp.display()
+            );
         }
     }
 
@@ -2584,7 +2602,9 @@ pub(crate) fn execute_idp_13c_workflow_with_extras(
         );
         if let Some(ref pol) = hnco_stats.hncacb_polarity {
             if let Some(ref hp) = pol.hncacb {
-                if hp.signs_inverted {
+                if let Some(ref w) = hp.warning {
+                    eprintln!("Warning: [idp-13c polarity] {w}");
+                } else if hp.signs_inverted {
                     eprintln!("[idp-13c polarity] {}", hp.summary);
                 }
             }
@@ -2649,13 +2669,9 @@ pub(crate) fn execute_idp_13c_workflow_with_extras(
 
     let (result, engine_label) = match engine_req {
         EngineRequest::Gpu if requires_cpu_extensions => {
-            eprintln!(
-                "Note: CAS / (H)N(CA)CON / HNCO->HNCACB features run on the CPU (f64) IDP solver."
+            return Err(
+                "--engine gpu is not supported with CPU-only --regime idp-13c extensions (CAS, (H)N(CA)CON, HN(CA)CONH, or HNCO->HNCACB); use --engine cpu or --engine auto (no silent CPU fallback per docs/specs/14-regime-solvers.md)".to_string(),
             );
-            (
-                assign_idp_13c_cpu(&systems, sequence, &idp_cfg),
-                "idp-13c CPU (f64, CAS/NN-guided)".to_string(),
-            )
         }
         EngineRequest::Gpu => {
             let gpu = GpuEngine::new_headless()?;
@@ -2666,10 +2682,15 @@ pub(crate) fn execute_idp_13c_workflow_with_extras(
             let res = nmr_gpu::idp_gpu::assign_idp_13c_gpu(&gpu, &systems, sequence, &idp_cfg)?;
             (res, label)
         }
-        EngineRequest::Auto if requires_cpu_extensions => (
-            assign_idp_13c_cpu(&systems, sequence, &idp_cfg),
-            "idp-13c CPU (f64, CAS/NN-guided)".to_string(),
-        ),
+        EngineRequest::Auto if requires_cpu_extensions => {
+            eprintln!(
+                "Warning: --regime idp-13c with CPU-only extensions (CAS / (H)N(CA)CON / HN(CA)CONH / HNCO->HNCACB) is not supported on WebGPU; falling back to CPU (f64) IDP solver under --engine auto."
+            );
+            (
+                assign_idp_13c_cpu(&systems, sequence, &idp_cfg),
+                "idp-13c CPU (f64, CAS/NN-guided, auto-fallback)".to_string(),
+            )
+        }
         EngineRequest::Auto => match GpuEngine::new_headless() {
             Ok(gpu) => {
                 let label = format!(
@@ -10406,6 +10427,86 @@ seq#\tresidue\tH\tN\tC\tCA\tsidechains
             assigned.shifts.len() >= 300,
             "expected substantial assigned shifts via CLI assign with RD-1/4/5 flags, got {}",
             assigned.shifts.len()
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_p1_2_idp_13c_engine_gpu_fails_closed_with_cas() {
+        let dir = env::temp_dir().join(format!("nmr_cli_p1_2_idp_gpu_{}", process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let con_tsv = dir.join("con.tsv");
+        fs::write(
+            &con_tsv,
+            "exp\tc_prev\tn_curr\theight\n\
+             CON\t174.50\t124.20\t1000\n\
+             CON\t177.20\t115.80\t1000\n\
+             CON\t174.80\t113.50\t1000\n\
+             CON\t173.10\t137.00\t1000\n\
+             CON\t176.20\t121.00\t1000\n",
+        )
+        .unwrap();
+
+        let cas_tsv = dir.join("cacon_ser.tsv");
+        fs::write(&cas_tsv, "c_prime\tn15\theight\n174.80\t113.50\t900\n").unwrap();
+
+        let out_prefix = dir.join("out_idp");
+        let err = cmd_assign(&[
+            "--regime".into(),
+            "idp-13c".into(),
+            "--con".into(),
+            con_tsv.to_string_lossy().into_owned(),
+            "--cas".into(),
+            format!("cacon_ser={}", cas_tsv.display()),
+            "--seq".into(),
+            "MASTPE".into(),
+            "--engine".into(),
+            "gpu".into(),
+            "--runs".into(),
+            "4".into(),
+            "--steps".into(),
+            "200".into(),
+            "--out".into(),
+            out_prefix.to_string_lossy().into_owned(),
+        ])
+        .expect_err("explicit --engine gpu with --cas must fail closed (173.idp:P1-2)");
+        assert!(
+            err.contains("--engine gpu") && err.contains("CAS"),
+            "unexpected error message: {err}"
+        );
+
+        // --engine auto must still succeed via CPU fallback with loud warning
+        cmd_assign(&[
+            "--regime".into(),
+            "idp-13c".into(),
+            "--con".into(),
+            con_tsv.to_string_lossy().into_owned(),
+            "--cas".into(),
+            format!("cacon_ser={}", cas_tsv.display()),
+            "--seq".into(),
+            "MASTPE".into(),
+            "--engine".into(),
+            "auto".into(),
+            "--runs".into(),
+            "4".into(),
+            "--steps".into(),
+            "200".into(),
+            "--out".into(),
+            out_prefix.to_string_lossy().into_owned(),
+        ])
+        .expect("--engine auto with --cas must succeed via CPU fallback");
+
+        // Ambiguous CAS direction without cacon/canco must also fail closed
+        let ambig_cas = dir.join("ser_peaks.tsv");
+        fs::write(&ambig_cas, "c_prime\tn15\theight\n174.80\t113.50\t900\n").unwrap();
+        let dir_err = load_cas_spectrum_from_cli(&format!("ser={}", ambig_cas.display()), 5.0)
+            .expect_err("ambiguous CAS direction must fail closed");
+        assert!(
+            dir_err.contains("cacon") && dir_err.contains("canco"),
+            "unexpected CAS direction error: {dir_err}"
         );
 
         let _ = fs::remove_dir_all(&dir);

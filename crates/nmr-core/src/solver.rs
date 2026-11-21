@@ -201,15 +201,14 @@ pub fn evaluate_auto_reference_safety(detailed: &DetailedReferenceOffsets) -> Au
     let mut refused_nuclei = Vec::new();
     let mut warnings = Vec::new();
 
-    let effective_fit_ppm = |fit: &NucleusOffsetFit| -> Option<f64> {
-        if fit.status == OffsetFitStatus::TooFewValues || fit.n_values < 5 {
-            return None;
-        }
-        if fit.status == OffsetFitStatus::Fitted {
+    // Only genuinely fitted channels participate in carbon spread diagnostics;
+    // `NotSignificant` (`0.0`) or `TooFewValues` channels are excluded so they cannot
+    // artificially inflate spread against a uniform TMS shift or raise false polarity warnings.
+    let fitted_ppm = |fit: &NucleusOffsetFit| -> Option<f64> {
+        if fit.status == OffsetFitStatus::Fitted && fit.n_values >= 5 {
             Some(fit.applied_ppm)
         } else {
-            // Non-fitted (NotSignificant) channels keep 0.00 applied offset
-            Some(0.0)
+            None
         }
     };
 
@@ -250,25 +249,32 @@ pub fn evaluate_auto_reference_safety(detailed: &DetailedReferenceOffsets) -> Au
         &mut safe_offsets.n,
     );
 
-    // Check spread across `(CA, CB, C')` when at least one carbon channel moved appreciably
+    // Atomic 13C refusal: if ANY carbon channel is refused, zero ALL carbon channels (dCA, dCB, dC)
+    // regardless of spread so carbon shifts are never left inconsistently referenced.
+    if refused_nuclei
+        .iter()
+        .any(|n| matches!(n.as_str(), "13CA" | "13CB" | "13C'"))
+    {
+        safe_offsets.ca = 0.0;
+        safe_offsets.cb = 0.0;
+        safe_offsets.c = 0.0;
+    }
+
+    // Check spread across fitted `(CA, CB, C')` channels only
     let mut c_entries: Vec<(&str, f64)> = Vec::with_capacity(3);
-    let mut any_c_active = false;
     for (lbl, fit) in [
         ("CA", &detailed.ca),
         ("CB", &detailed.cb),
         ("C'", &detailed.c),
     ] {
-        if let Some(v) = effective_fit_ppm(fit) {
-            if fit.status == OffsetFitStatus::Fitted || v.abs() > 1.0 {
-                any_c_active = true;
-            }
+        if let Some(v) = fitted_ppm(fit) {
             c_entries.push((lbl, v));
         }
     }
 
     let mut c13_spread_ppm = 0.0;
     let mut polarity_swap_warning = None;
-    if any_c_active && c_entries.len() >= 2 {
+    if c_entries.len() >= 2 {
         let min_c = c_entries.iter().map(|x| x.1).fold(f64::INFINITY, f64::min);
         let max_c = c_entries
             .iter()
@@ -286,16 +292,45 @@ pub fn evaluate_auto_reference_safety(detailed: &DetailedReferenceOffsets) -> Au
             );
             warnings.push(msg.clone());
             polarity_swap_warning = Some(msg);
-            if refused_nuclei
-                .iter()
-                .any(|n| matches!(n.as_str(), "13CA" | "13CB" | "13C'"))
-            {
-                // Avoid applying partial carbon offsets across a CA/CB-swapped dataset
-                safe_offsets.ca = 0.0;
-                safe_offsets.cb = 0.0;
-                safe_offsets.c = 0.0;
-            }
         }
+    }
+    // Extreme CA/CB refusal while C' stays near zero (diverging by > 2.0 ppm from C') indicates
+    // a polarity/CA-CB swap even when C' is NotSignificant (and thus excluded from c13_spread_ppm),
+    // while avoiding false polarity alarms on uniform TMS-shifted datasets (e.g. dCA=-3.6, dC'=-2.7).
+    let ca_or_cb_refused = refused_nuclei
+        .iter()
+        .any(|n| matches!(n.as_str(), "13CA" | "13CB"));
+    let c_prime_refused = refused_nuclei.iter().any(|n| n == "13C'");
+    let c_anchor = if detailed.c.status == OffsetFitStatus::Fitted {
+        Some(detailed.c.applied_ppm)
+    } else if detailed.c.status == OffsetFitStatus::NotSignificant && detailed.c.n_values >= 5 {
+        Some(detailed.c.candidate_ppm)
+    } else {
+        None
+    };
+    let aliph_diverges_from_c = c_anchor.is_some_and(|c0| {
+        [
+            (detailed.ca.status, detailed.ca.applied_ppm),
+            (detailed.cb.status, detailed.cb.applied_ppm),
+        ]
+        .iter()
+        .any(|&(st, v)| st == OffsetFitStatus::Fitted && (v - c0).abs() > 2.0)
+    });
+    if polarity_swap_warning.is_none()
+        && ca_or_cb_refused
+        && !c_prime_refused
+        && aliph_diverges_from_c
+    {
+        let desc = c_entries
+            .iter()
+            .map(|(l, v)| format!("d{l}={v:+.2}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let msg = format!(
+            "refused extreme aliphatic 13C offset(s) ({desc}) diverging > 2.0 ppm from 13C' — likely HNCACB/HN(CO)CACB polarity or CA/CB swap (RD-1; retry with --hncacb-polarity)"
+        );
+        warnings.push(msg.clone());
+        polarity_swap_warning = Some(msg);
     }
 
     // Detect uniform -2..-3 ppm 13C shift indicative of TMS (vs DSS) chemical-shift referencing
@@ -2664,6 +2699,76 @@ mod tests {
         let n_safety = evaluate_auto_reference_safety(&big_n);
         assert_eq!(n_safety.safe_offsets.n, 0.0);
         assert!(n_safety.refused_nuclei.contains(&"15N".to_string()));
+
+        // 4. Atomic 13C refusal even when spread <= 1.0 ppm (CA refused at -3.8 -> CB/C' also zeroed)
+        let partial_c_refuse = DetailedReferenceOffsets {
+            ca: NucleusOffsetFit {
+                status: OffsetFitStatus::Fitted,
+                applied_ppm: -3.80,
+                candidate_ppm: -3.80,
+                log_likelihood_gain: 10.0,
+                n_values: 40,
+            },
+            cb: NucleusOffsetFit {
+                status: OffsetFitStatus::Fitted,
+                applied_ppm: -3.20,
+                candidate_ppm: -3.20,
+                log_likelihood_gain: 10.0,
+                n_values: 40,
+            },
+            c: NucleusOffsetFit {
+                status: OffsetFitStatus::Fitted,
+                applied_ppm: -3.10,
+                candidate_ppm: -3.10,
+                log_likelihood_gain: 10.0,
+                n_values: 40,
+            },
+            ..Default::default()
+        };
+        let atomic_sf = evaluate_auto_reference_safety(&partial_c_refuse);
+        assert!(atomic_sf.refused_nuclei.contains(&"13CA".to_string()));
+        assert_eq!(atomic_sf.safe_offsets.ca, 0.0);
+        assert_eq!(atomic_sf.safe_offsets.cb, 0.0);
+        assert_eq!(atomic_sf.safe_offsets.c, 0.0);
+
+        // 5. NotSignificant (0.0) channel excluded from carbon spread so TMS hint is preserved
+        let tms_with_ns_cb = DetailedReferenceOffsets {
+            ca: NucleusOffsetFit {
+                status: OffsetFitStatus::Fitted,
+                applied_ppm: -2.65,
+                candidate_ppm: -2.65,
+                log_likelihood_gain: 12.0,
+                n_values: 40,
+            },
+            cb: NucleusOffsetFit {
+                status: OffsetFitStatus::NotSignificant,
+                applied_ppm: 0.0,
+                candidate_ppm: -0.20,
+                log_likelihood_gain: 0.4,
+                n_values: 25,
+            },
+            c: NucleusOffsetFit {
+                status: OffsetFitStatus::Fitted,
+                applied_ppm: -2.60,
+                candidate_ppm: -2.60,
+                log_likelihood_gain: 12.0,
+                n_values: 40,
+            },
+            ..Default::default()
+        };
+        let tms_ns_sf = evaluate_auto_reference_safety(&tms_with_ns_cb);
+        assert!(
+            tms_ns_sf.c13_spread_ppm < 0.1,
+            "NotSignificant channel must not inflate spread: {tms_ns_sf:?}"
+        );
+        assert!(tms_ns_sf.polarity_swap_warning.is_none());
+        assert!(
+            tms_ns_sf
+                .tms_reference_hint
+                .as_deref()
+                .is_some_and(|h| h.contains("TMS")),
+            "expected TMS hint when NotSignificant CB is excluded: {tms_ns_sf:?}"
+        );
     }
 
     #[test]
