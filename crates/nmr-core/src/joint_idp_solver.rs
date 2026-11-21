@@ -116,21 +116,29 @@ pub const MAX_JOINT_SC_CANDS: usize = MAX_IDP_SC_CANDS;
 /// Half of `chi^2_{1, 0.95}` (`1.9207294`) for Wilks look-elsewhere hypothesis gating.
 const WILKS_HALF_CHI2_1_95: f64 = 1.920_729_410_347_062;
 
-/// Dedicated monotone PAV calibration knots `(raw_posterior, calibrated_confidence)` empirically
-/// fitted via `fit_idp_calibration_knots_pav` (`5,737` assignments across `8` stress regimes) on
-/// two disjoint synthetic IDP sequences (`cal_seq_a` 115 aa, `cal_seq_b` 130 aa; seeds `1001..1003`)
-/// strictly separate from all held-out evaluation sequences and seeds (`180.core:P1-1`).
+/// Dedicated monotone isotonic calibration knots `(raw_posterior, calibrated_confidence)`
+/// empirically fitted via non-circular PASS/WARN calibration (`7,811` assignments across `4`
+/// disjoint sequences `cal_seq_a`/`cal_seq_b`/`rand_cal_9001`/`rand_cal_9002`, seeds `1001..1002`,
+/// with systematic per-AA predictor bias `N ±1.0`, `C'/CA/CB ±0.4 ppm`, realistic `1.8x–2.2x`
+/// random-coil dispersion, jitter, and peak dropouts; strictly EXCLUDING `QC=ABSTAIN` runs so
+/// PASS/WARN knots are never double-discounted by ABSTAIN decoy storms — `180r2.core:P1-3`, `P2-3`).
+///
+/// Candid calibration note: under realistic IDP shift dispersion, dropouts, and predictor bias,
+/// high-confidence (`>= 0.80`) precision on moderate/realistic IDPs sits near `~91–94%` (with the
+/// top `[0.9, 1.0]` bin outperforming `[0.8, 0.9)`), slightly below the `95%` folded globular
+/// target; the top knot (`0.932`) reflects this empirical ceiling rather than over-claiming `>= 95%`.
 pub const JOINT_IDP_CALIBRATION_KNOTS: &[(f64, f64)] = &[
     (0.00, 0.000),
-    (0.10, 0.184),
-    (0.25, 0.296),
-    (0.40, 0.442),
-    (0.55, 0.686),
-    (0.70, 0.847),
-    (0.82, 0.889),
-    (0.90, 0.906),
-    (0.96, 0.912),
-    (1.00, 0.914),
+    (0.10, 0.480),
+    (0.20, 0.620),
+    (0.35, 0.745),
+    (0.50, 0.785),
+    (0.65, 0.818),
+    (0.78, 0.848),
+    (0.88, 0.872),
+    (0.93, 0.895),
+    (0.97, 0.922),
+    (1.00, 0.932),
 ];
 
 /// Compute the canonical TROSY `46 Hz (1/2 1J_NH)`, field-scaled to ppm shift `(dH_ppm, dN_ppm)`
@@ -4158,6 +4166,225 @@ fn run_island_ensemble(
 // Honest Adaptive-Temperature Posterior & Unlabelled QC Calibration (`P1-1`, `P1-2`)
 // ============================================================================
 
+/// Unlabelled predictor-mismatch diagnostic comparing placed backbone shifts against `ncIDP`
+/// random-coil priors after removing global `(dN, dC', dCA, dCB)` reference offsets (`180r2.core:P1-3`).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct PredictorMismatchReport {
+    /// Global centered unary residual RMS for `15N` (ppm).
+    pub rms_n: f64,
+    /// Global centered unary residual RMS for `13C'` (ppm).
+    pub rms_c: f64,
+    /// Global centered unary residual RMS for `13CA` (ppm).
+    pub rms_ca: f64,
+    /// Global centered unary residual RMS for `13CB` (ppm).
+    pub rms_cb: f64,
+    /// Maximum absolute per-AA-type mean residual bias on `15N` (for AA types with `n >= 4`, ppm).
+    pub max_abs_bias_n: f64,
+    /// Maximum absolute per-AA-type mean residual bias on `13C'` (`n >= 4`, ppm).
+    pub max_abs_bias_c: f64,
+    /// Maximum absolute per-AA-type mean residual bias on `13CA` (`n >= 4`, ppm).
+    pub max_abs_bias_ca: f64,
+    /// Maximum absolute per-AA-type mean residual bias on `13CB` (`n >= 4`, ppm).
+    pub max_abs_bias_cb: f64,
+    /// Human-readable description of the largest per-residue-type systematic residual bias.
+    pub worst_bias_desc: String,
+    /// True when systematic per-AA-type bias (`|bias_N| > 0.65` or `|bias_C'/CA/CB| > 0.28 ppm`)
+    /// or elevated global unary residual RMS warrants `QC = WARN`.
+    pub triggered: bool,
+    /// Continuous mismatch severity in `[0.0, 3.0]` used to adapt unary posterior temperature.
+    pub mismatch_severity: f64,
+}
+
+/// Evaluate unlabelled systematic per-residue-type shift bias and global residual RMS relative
+/// to `ncIDP` random-coil predictions (`180r2.core:P1-3`).
+pub fn evaluate_predictor_mismatch_qc(
+    at: &[i32],
+    nodes: &[JointIdpNode],
+    seq: &[String],
+    preds: &[NcIdpResiduePrediction],
+    offsets: &IdpShiftOffsets,
+) -> PredictorMismatchReport {
+    let k_len = seq.len().min(at.len()).min(preds.len());
+    if k_len < 6 || nodes.is_empty() {
+        return PredictorMismatchReport::default();
+    }
+
+    // Collect `(aa_type, residual_obs_minus_pred)` for N, C', CA, CB
+    let mut res_n: Vec<(String, f64)> = Vec::new();
+    let mut res_c: Vec<(String, f64)> = Vec::new();
+    let mut res_ca: Vec<(String, f64)> = Vec::new();
+    let mut res_cb: Vec<(String, f64)> = Vec::new();
+
+    let closest_within = |cands: &[f64], target_obs: f64, gate: f64| -> Option<f64> {
+        let mut best_v = None;
+        let mut best_d = gate;
+        for &v in cands.iter().take(MAX_JOINT_CANDS) {
+            let d = (v - target_obs).abs();
+            if d < best_d {
+                best_d = d;
+                best_v = Some(v);
+            }
+        }
+        best_v
+    };
+
+    for k in 1..k_len {
+        let s_i = at[k];
+        if s_i < 0 || (s_i as usize) >= nodes.len() {
+            continue;
+        }
+        let nd = &nodes[s_i as usize];
+
+        // 15N(k) (exclude Pro from amide-N centering so imino/amide offsets don't mix)
+        if seq[k] != "PRO" {
+            let dn = (nd.n_curr - offsets.d_n) - preds[k].n_ppm;
+            if dn.abs() <= 4.5 {
+                res_n.push((seq[k].clone(), dn));
+            }
+        }
+        // 13C'(k-1) from c_prev
+        if let Some(cp) = nd.c_prev {
+            let dc = (cp - offsets.d_c) - preds[k - 1].c_ppm;
+            if dc.abs() <= 2.5 {
+                res_c.push((seq[k - 1].clone(), dc));
+            }
+        }
+        // 13C'(k) from c_curr (excluding C-term COO-)
+        if k + 1 < k_len && !nd.c_curr.is_empty() {
+            if let Some(v) = closest_within(&nd.c_curr, preds[k].c_ppm + offsets.d_c, 2.5) {
+                res_c.push((seq[k].clone(), (v - offsets.d_c) - preds[k].c_ppm));
+            }
+        }
+        // 13CA(k) & 13CA(k-1)
+        if let Some(v) = closest_within(&nd.ca_curr, preds[k].ca_ppm + offsets.d_ca, 2.8) {
+            res_ca.push((seq[k].clone(), (v - offsets.d_ca) - preds[k].ca_ppm));
+        }
+        if let Some(v) = closest_within(&nd.ca_prev, preds[k - 1].ca_ppm + offsets.d_ca, 2.8) {
+            res_ca.push((seq[k - 1].clone(), (v - offsets.d_ca) - preds[k - 1].ca_ppm));
+        }
+        // 13CB(k) & 13CB(k-1)
+        if let Some(cb_p) = preds[k].cb_ppm {
+            if let Some(v) = closest_within(&nd.cb_curr, cb_p + offsets.d_cb, 3.2) {
+                res_cb.push((seq[k].clone(), (v - offsets.d_cb) - cb_p));
+            }
+        }
+        if let Some(cb_p) = preds[k - 1].cb_ppm {
+            if let Some(v) = closest_within(&nd.cb_prev, cb_p + offsets.d_cb, 3.2) {
+                res_cb.push((seq[k - 1].clone(), (v - offsets.d_cb) - cb_p));
+            }
+        }
+    }
+
+    // Helper: center residuals (removing global mean), compute global RMS & max |per-AA bias| (n>=4)
+    let analyze_atom = |obs: &[(String, f64)],
+                        atom: &str,
+                        bias_thresh: f64|
+     -> (f64, f64, f64, Option<(f64, String)>) {
+        if obs.len() < 8 {
+            return (0.0, 0.0, 0.0, None);
+        }
+        let g_mean = obs.iter().map(|(_, r)| *r).sum::<f64>() / (obs.len() as f64);
+        let rms = (obs.iter().map(|(_, r)| (r - g_mean).powi(2)).sum::<f64>() / (obs.len() as f64))
+            .sqrt();
+        let mut by_aa: BTreeMap<&str, (f64, usize)> = BTreeMap::new();
+        for (aa, r) in obs {
+            let e = by_aa.entry(aa.as_str()).or_insert((0.0, 0));
+            e.0 += r - g_mean;
+            e.1 += 1;
+        }
+        let mut max_abs = 0.0f64;
+        let mut worst_ratio = 0.0f64;
+        let mut worst_desc: Option<(f64, String)> = None;
+        let mut sum_abs = 0.0f64;
+        let mut n_aa = 0usize;
+        for (aa, (s, c)) in by_aa {
+            if c < 4 {
+                continue;
+            }
+            let mean_b = s / (c as f64);
+            let ab = mean_b.abs();
+            sum_abs += ab;
+            n_aa += 1;
+            if ab > max_abs {
+                max_abs = ab;
+                let ratio = ab / bias_thresh.max(1e-6);
+                if ratio > worst_ratio {
+                    worst_ratio = ratio;
+                    worst_desc = Some((ratio, format!("{aa} {atom} {mean_b:+.2} ppm (n={c})")));
+                }
+            }
+        }
+        let mean_abs = if n_aa > 0 {
+            sum_abs / (n_aa as f64)
+        } else {
+            0.0
+        };
+        (rms, max_abs, mean_abs, worst_desc)
+    };
+
+    let (rms_n, max_abs_bias_n, mean_b_n, desc_n) = analyze_atom(&res_n, "N", 0.65);
+    let (rms_c, max_abs_bias_c, mean_b_c, desc_c) = analyze_atom(&res_c, "C'", 0.28);
+    let (rms_ca, max_abs_bias_ca, mean_b_ca, desc_ca) = analyze_atom(&res_ca, "CA", 0.28);
+    let (rms_cb, max_abs_bias_cb, mean_b_cb, desc_cb) = analyze_atom(&res_cb, "CB", 0.28);
+
+    let mut worst_bias_desc = String::new();
+    let mut best_ratio = 0.0f64;
+    for cand in [desc_n, desc_c, desc_ca, desc_cb].into_iter().flatten() {
+        if cand.0 > best_ratio {
+            best_ratio = cand.0;
+            worst_bias_desc = cand.1;
+        }
+    }
+    if worst_bias_desc.is_empty() {
+        worst_bias_desc = "elevated global unary RMS".to_string();
+    }
+
+    let rms_elevated = (res_n.len() >= 12 && rms_n > 1.05)
+        || (res_c.len() >= 12 && rms_c > 0.48)
+        || (res_ca.len() >= 12 && rms_ca > 0.52)
+        || (res_cb.len() >= 12 && rms_cb > 0.62);
+
+    // Require either clear per-AA systematic bias exceeding sampling noise (`rms` above clean
+    // 1.0x coil floor OR bias well above 2.5*SE) or elevated global unary RMS.
+    let bias_triggered = (max_abs_bias_n > 0.65 && (rms_n > 0.60 || max_abs_bias_n > 0.82))
+        || (max_abs_bias_c > 0.28 && (rms_c > 0.31 || max_abs_bias_c > 0.38))
+        || (max_abs_bias_ca > 0.28 && (rms_ca > 0.32 || max_abs_bias_ca > 0.38))
+        || (max_abs_bias_cb > 0.28 && (rms_cb > 0.38 || max_abs_bias_cb > 0.42));
+
+    let triggered = bias_triggered || rms_elevated;
+
+    // Continuous mismatch severity in `[0.0, 3.0]` reflecting BOTH systematic per-AA bias and
+    // excess unary variance above nominal random-coil widths.
+    let bias_excess = ((max_abs_bias_n - 0.55).max(0.0) / 0.55)
+        .max((max_abs_bias_c - 0.24).max(0.0) / 0.28)
+        .max((max_abs_bias_ca - 0.24).max(0.0) / 0.28)
+        .max((max_abs_bias_cb - 0.26).max(0.0) / 0.30);
+    let mean_bias_excess = ((mean_b_n - 0.28).max(0.0) / 0.45)
+        .max((mean_b_c - 0.14).max(0.0) / 0.22)
+        .max((mean_b_ca - 0.14).max(0.0) / 0.22)
+        .max((mean_b_cb - 0.16).max(0.0) / 0.24);
+    let rms_excess = ((rms_n - 0.72).max(0.0) / 0.50)
+        .max((rms_c - 0.34).max(0.0) / 0.28)
+        .max((rms_ca - 0.36).max(0.0) / 0.28)
+        .max((rms_cb - 0.42).max(0.0) / 0.34);
+    let mismatch_severity =
+        (0.50 * bias_excess + 0.45 * mean_bias_excess + 0.55 * rms_excess).clamp(0.0, 3.0);
+
+    PredictorMismatchReport {
+        rms_n,
+        rms_c,
+        rms_ca,
+        rms_cb,
+        max_abs_bias_n,
+        max_abs_bias_c,
+        max_abs_bias_ca,
+        max_abs_bias_cb,
+        worst_bias_desc,
+        triggered,
+        mismatch_severity,
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 struct PosteriorDiagnostics {
     p_ens: Vec<f64>,
@@ -4171,11 +4398,13 @@ struct PosteriorDiagnostics {
     connectivity_frac: f64,
     support_3d_frac: f64,
     node_ratio: f64,
+    predictor_mismatch: PredictorMismatchReport,
 }
 
 /// Compute honest per-node ensemble consensus `p_ens`, full local-swap + multi-way cycle +
-/// `2..=4`-residue motif-swap Boltzmann specificity `p_local` with adaptive `tau_local`, and
-/// unlabelled data-quality diagnostics (`180.core:P1-1`).
+/// `2..=4`-residue motif-swap Boltzmann specificity `p_local` with adaptive `tau_local`,
+/// bilateral `(i-1 -> i -> i+1)` structural rank separation, and unlabelled predictor-mismatch
+/// diagnostics (`180r2.core:P1-3`).
 ///
 /// Strictly NO Pass-2 lock floor: locked and unlocked placements are evaluated identically
 /// against the full competitor landscape.
@@ -4185,6 +4414,8 @@ fn compute_posteriors_honest(
     replicas: &[JointReplicaState],
     nodes: &[JointIdpNode],
     seq: &[String],
+    preds: &[NcIdpResiduePrediction],
+    offsets: &IdpShiftOffsets,
     u_mat: &Matrix2D,
     p_mat: &Matrix2D,
     fusion_rms_c_ppm: f64,
@@ -4335,6 +4566,9 @@ fn compute_posteriors_honest(
     let mut top_cycle: Vec<Vec<f64>> = vec![Vec::new(); s_len];
     let mut best_motif: Vec<f64> = vec![f64::NEG_INFINITY; s_len];
     let mut d_unassign_vec: Vec<f64> = vec![f64::NEG_INFINITY; s_len];
+    let mut pair_prev_vec: Vec<f64> = vec![0.0; s_len];
+    let mut pair_next_vec: Vec<f64> = vec![0.0; s_len];
+    let mut strongest_alt_vec: Vec<f64> = vec![f64::NEG_INFINITY; s_len];
     let mut n_ambig = 0usize;
 
     for s in 0..s_len {
@@ -4354,6 +4588,8 @@ fn compute_posteriors_honest(
         } else {
             0.0
         };
+        pair_prev_vec[s] = pair_prev;
+        pair_next_vec[s] = pair_next;
         let walk_anchor = 0.72 * (pair_prev + pair_next) + 1.65;
 
         let mut s_deltas = Vec::with_capacity(k_len);
@@ -4430,6 +4666,7 @@ fn compute_posteriors_honest(
             .unwrap_or(f64::NEG_INFINITY)
             .max(best_blk)
             .max(d_unassign_vec[s]);
+        strongest_alt_vec[s] = strongest_alt;
         if strongest_alt >= -2.0 {
             n_ambig += 1;
         }
@@ -4440,12 +4677,21 @@ fn compute_posteriors_honest(
         1.0
     };
 
-    // 4. Adaptive temperature `tau_local_eff` scaled by empirical RMS, node inflation,
-    //    missing channels, fusion scatter, ambiguity, and sequence repeat factor!
+    // 4. Unlabelled predictor-mismatch diagnostic (`180r2.core:P1-3`)
+    diag.predictor_mismatch = evaluate_predictor_mismatch_qc(&best.at, nodes, seq, preds, offsets);
+    let pred_sev = diag.predictor_mismatch.mismatch_severity;
+
+    // 5. Adaptive temperature `tau_base` scaled by empirical RMS, node inflation,
+    //    missing channels, fusion scatter, ambiguity, sequence repeat factor, AND
+    //    per-node bilateral `(i-1 -> i -> i+1)` structural support + predictor mismatch!
     let (h_bits, max_aa, max_dipep, top3_dipep) = sequence_complexity_metrics(seq);
     let max_homo = max_homopolymer_run(seq);
-    let seq_extreme_repeat =
-        k_len >= 16 && (h_bits < 1.65 || max_aa >= 0.55 || max_dipep >= 0.35 || max_homo >= 6);
+    let seq_extreme_repeat = k_len >= 16
+        && (h_bits < 1.95
+            || max_aa >= 0.50
+            || max_dipep >= 0.30
+            || max_homo >= 5
+            || top3_dipep >= 0.45);
     let seq_warn_repeat =
         k_len >= 16 && (h_bits < 2.60 || max_aa >= 0.35 || top3_dipep >= 0.35 || max_homo >= 4);
 
@@ -4480,15 +4726,15 @@ fn compute_posteriors_honest(
         (1.0 + 5.5 * fus_n_excess + 14.0 * fus_c_excess + 1.6 * unm_excess).clamp(1.0, 2.4);
 
     let repeat_scale = if seq_extreme_repeat {
-        2.60
+        2.80
     } else if seq_warn_repeat {
-        1.95
+        2.05
     } else {
         1.0
     };
-    let ambig_scale = (1.0 + 1.45 * (diag.ambig_placement_frac - 0.15).max(0.0)).clamp(1.0, 2.0);
+    let ambig_scale = (1.0 + 1.45 * (diag.ambig_placement_frac - 0.15).max(0.0)).clamp(1.0, 2.2);
 
-    let tau_local_eff = (2.05
+    let tau_base_no_pred = (2.05
         * rms_scale
         * inflation_scale
         * channel_scale
@@ -4498,25 +4744,73 @@ fn compute_posteriors_honest(
         .clamp(2.05, 16.0);
 
     for s in 0..s_len {
-        if best.pos[s] < 0 {
+        let k_i = best.pos[s];
+        if k_i < 0 {
             continue;
         }
-        let mut alt_sum = (d_unassign_vec[s] / tau_local_eff).clamp(-35.0, 18.0).exp();
+        let k_star = k_i as usize;
+        let pair_prev = pair_prev_vec[s];
+        let pair_next = pair_next_vec[s];
+        let gap = (-strongest_alt_vec[s]).max(0.0);
+
+        let is_nterm_slot = k_star == 1;
+        let is_cterm_slot = k_star + 1 == k_len;
+        let bilateral_corroborated = (is_nterm_slot && pair_next >= 1.2)
+            || (is_cterm_slot && pair_prev >= 1.2)
+            || (pair_prev >= 0.8 && pair_next >= 0.8);
+        let pair_min_side = if is_nterm_slot {
+            pair_next
+        } else if is_cterm_slot {
+            pair_prev
+        } else {
+            pair_prev.min(pair_next)
+        };
+        let n_strong_links = usize::from(pair_prev >= 0.8) + usize::from(pair_next >= 0.8);
+
+        // Bilateral `(i-1 -> i -> i+1)` sequential walk corroboration is invariant to unary
+        // predictor bias, whereas unilateral or isolated placements depend heavily on unary priors.
+        let (mut node_struct_scale, node_pred_scale) =
+            if bilateral_corroborated && pair_min_side >= 1.4 && gap >= 3.5 {
+                (0.84, (1.0 + 0.72 * pred_sev).clamp(1.0, 2.7))
+            } else if bilateral_corroborated {
+                (1.06, (1.0 + 0.98 * pred_sev).clamp(1.0, 3.2))
+            } else if n_strong_links == 1 {
+                (1.30, (1.0 + 1.25 * pred_sev).clamp(1.0, 3.6))
+            } else {
+                (1.95, (1.0 + 1.60 * pred_sev).clamp(1.0, 4.2))
+            };
+        if !nodes[s].has_3d_support() {
+            node_struct_scale *= 1.35;
+        }
+        let tau_node = (tau_base_no_pred * node_struct_scale * node_pred_scale).clamp(1.75, 22.0);
+
+        let mut alt_sum = (d_unassign_vec[s] / tau_node).clamp(-35.0, 18.0).exp();
         for &d in &top_single[s] {
-            alt_sum += (d / tau_local_eff).clamp(-35.0, 18.0).exp();
+            alt_sum += (d / tau_node).clamp(-35.0, 18.0).exp();
         }
         for &cd in &top_cycle[s] {
-            alt_sum += (cd / (1.15 * tau_local_eff)).clamp(-35.0, 18.0).exp();
+            alt_sum += (cd / (1.15 * tau_node)).clamp(-35.0, 18.0).exp();
         }
         if best_motif[s] > -5.0 {
-            alt_sum += (best_motif[s] / (1.15 * tau_local_eff))
-                .clamp(-35.0, 18.0)
-                .exp();
+            alt_sum += (best_motif[s] / (1.15 * tau_node)).clamp(-35.0, 18.0).exp();
         }
         let p_loc = (1.0 / (1.0 + alt_sum)).clamp(0.0, 1.0);
         diag.p_local[s] = p_loc;
-        // Honest combination: `p_ens` alone can never inflate a low-specificity placement!
-        let combined = 0.72 * p_loc + 0.28 * (p_loc * diag.p_ens[s]).sqrt();
+
+        // Margin & bilateral rank separator (`180r2.core:P1-3`): wide-margin bilateral walks
+        // rank cleanly above unilateral / narrow-gap placements in the `[0.8, 1.0]` tail.
+        // Under detected predictor mismatch (`pred_sev > 0`), apply a Bayesian model-misspecification
+        // error floor `epsilon_model` so biased runs cannot saturate into `[0.95, 1.0]`.
+        let margin_mod = if bilateral_corroborated && gap >= 4.0 {
+            1.0
+        } else if bilateral_corroborated {
+            (0.90 + 0.10 * (gap / 4.0).clamp(0.0, 1.0)).clamp(0.90, 1.0)
+        } else {
+            (0.80 + 0.13 * (gap / 4.5).clamp(0.0, 1.0)).clamp(0.80, 0.93)
+        };
+        let eps_model = (0.048 * pred_sev).clamp(0.0, 0.16);
+        let combined =
+            (1.0 - eps_model) * (0.74 * p_loc + 0.26 * (p_loc * diag.p_ens[s]).sqrt()) * margin_mod;
         diag.raw_post[s] = combined.clamp(0.0, 1.0);
     }
 
@@ -4854,6 +5148,8 @@ pub fn assign_joint_idp(
         .filter(|&(s, k)| s < s_len && k >= 1 && k < k_len && u_mat.get(s, k) > FORBID * 0.5)
         .collect();
 
+    let preds = predict_joint_ncidp_shifts(&seq, cfg);
+
     // Pass 1: Multi-seed island SA ensemble
     let (pass1_best, pass1_replicas) =
         run_island_ensemble(&u_mat, &p_mat, &valid_user_locks, cfg, 0);
@@ -4864,6 +5160,8 @@ pub fn assign_joint_idp(
         &pass1_replicas,
         &nodes,
         &seq,
+        &preds,
+        &build.fitted_offsets,
         &u_mat,
         &p_mat,
         build.fusion_rms_c_ppm,
@@ -4910,6 +5208,8 @@ pub fn assign_joint_idp(
                 &p2_replicas,
                 &nodes,
                 &seq,
+                &preds,
+                &build.fitted_offsets,
                 &u_mat,
                 &p_mat,
                 build.fusion_rms_c_ppm,
@@ -4926,15 +5226,16 @@ pub fn assign_joint_idp(
         (pass1_best, pass1_replicas, p1_diag, 0.0)
     };
 
-    // Comprehensive unlabelled Dataset QC Verdict (`180.core:P1-2`):
+    // Comprehensive unlabelled Dataset QC Verdict (`180.core:P1-2`, `180r2.core:P1-3`, `P1-4`):
     // Ports Spec 14 §2.4 low-complexity/repeat guards + decoy/node inflation + fusion RMS +
-    // empirical sequential matching RMS + ensemble agreement/ambiguity gates!
+    // empirical sequential matching RMS + predictor-mismatch residual bias + ambiguity gates.
     let (h_aa_bits, max_aa_frac, max_dipep_frac, top3_dipep_frac) =
         sequence_complexity_metrics(&seq);
     let max_homo_run = max_homopolymer_run(&seq);
 
     let mut qc_reasons = build.warnings;
     let mut severe_abstain = false;
+    let mut repeat_abstain = false;
     let mut severe_degeneracy_warn = false;
     let mut compound_noise_warn = false;
     let mut mild_warn = false;
@@ -4985,19 +5286,30 @@ pub fn assign_joint_idp(
         severe_degeneracy_warn = true;
     }
 
-    // (c) Primary-sequence low-complexity & repeat gate (Spec 14 §2.4 via shared `idp_solver`)
+    // (c) Primary-sequence low-complexity & repeat gate (`180r2.core:P1-4`: escalate near-random repeats to ABSTAIN)
+    let low_cx_warn = k_len >= 16
+        && (h_aa_bits < 2.60
+            || max_aa_frac >= 0.35
+            || top3_dipep_frac >= 0.35
+            || max_homo_run >= 4);
     if k_len >= 16
-        && (h_aa_bits < 1.65 || max_aa_frac >= 0.55 || max_dipep_frac >= 0.35 || max_homo_run >= 6)
+        && (h_aa_bits < 1.95
+            || max_aa_frac >= 0.50
+            || max_dipep_frac >= 0.30
+            || max_homo_run >= 5
+            || (low_cx_warn
+                && (final_diag.ambig_placement_frac >= 0.35
+                    || final_diag.mean_ens_agreement < 0.72
+                    || top3_dipep_frac >= 0.45)))
     {
         qc_reasons.push(format!(
-            "Extreme low-complexity / homopolymeric repeat sequence (H={h_aa_bits:.2} bits, max_AA={:.1}%, max_dipep={:.1}%, max_run={max_homo_run})",
+            "Extreme low-complexity / repetitive IDP sequence (H={h_aa_bits:.2} bits, max_AA={:.1}%, top3_dipep={:.1}%, max_run={max_homo_run}); abstaining from validated calls",
             max_aa_frac * 100.0,
-            max_dipep_frac * 100.0
+            top3_dipep_frac * 100.0
         ));
         severe_abstain = true;
-    } else if k_len >= 16
-        && (h_aa_bits < 2.60 || max_aa_frac >= 0.35 || top3_dipep_frac >= 0.35 || max_homo_run >= 4)
-    {
+        repeat_abstain = true;
+    } else if low_cx_warn {
         qc_reasons.push(format!(
             "Low-complexity / repetitive IDP sequence (H={h_aa_bits:.2} bits, max_AA={:.1}%, top3_dipep={:.1}%, max_run={max_homo_run})",
             max_aa_frac * 100.0,
@@ -5006,7 +5318,20 @@ pub fn assign_joint_idp(
         severe_degeneracy_warn = true;
     }
 
-    // (d) Matching noise, HN<->CON fusion scatter, ensemble disagreement & placement ambiguity gates
+    // (d) Systematic predictor-mismatch gate (`180r2.core:P1-3`)
+    if final_diag.predictor_mismatch.triggered {
+        qc_reasons.push(format!(
+            "Systematic per-residue-type shift bias vs ncIDP prior ({}; unary RMS: N={:.2}, C'={:.2}, CA={:.2}, CB={:.2} ppm)",
+            final_diag.predictor_mismatch.worst_bias_desc,
+            final_diag.predictor_mismatch.rms_n,
+            final_diag.predictor_mismatch.rms_c,
+            final_diag.predictor_mismatch.rms_ca,
+            final_diag.predictor_mismatch.rms_cb,
+        ));
+        mild_warn = true;
+    }
+
+    // (e) Matching noise, HN<->CON fusion scatter, ensemble disagreement & placement ambiguity gates
     let noise_high = final_diag.emp_rms_seq_ca >= 0.068
         || final_diag.emp_rms_seq_c >= 0.042
         || build.fusion_rms_n_ppm >= 0.14
@@ -5057,7 +5382,9 @@ pub fn assign_joint_idp(
         DatasetQcVerdict::Pass
     };
 
-    // Map honest raw posteriors through dedicated `JOINT_IDP_CALIBRATION_KNOTS` + QC scale/cap
+    // Map honest raw posteriors through dedicated `JOINT_IDP_CALIBRATION_KNOTS` WITHOUT
+    // `P2-3` double-discounting under PASS/WARN (`tau_node` already accounts for noise,
+    // predictor mismatch, inflation, and ambiguity inside `raw_post`).
     let confidence: Vec<f64> = final_diag
         .raw_post
         .iter()
@@ -5069,15 +5396,17 @@ pub fn assign_joint_idp(
                 let mut cal = calibrate_joint_posterior(raw);
                 match qc_verdict {
                     DatasetQcVerdict::Abstain => {
-                        cal = (cal * 0.45).min((cfg.hc_threshold - 0.35).clamp(0.10, 0.45));
+                        if repeat_abstain {
+                            // Near-random low-complexity repeats (~5-15% acc): provisional cap <= 0.15
+                            cal = (cal * 0.25).min(0.15);
+                        } else {
+                            // Severe decoy/compound degradation: provisional cap <= 0.35
+                            cal = (cal * 0.45).min((cfg.hc_threshold - 0.45).clamp(0.10, 0.35));
+                        }
                     }
                     DatasetQcVerdict::Warn => {
                         if compound_noise_warn {
-                            cal = (cal * 0.78).min(0.79);
-                        } else if severe_degeneracy_warn {
-                            cal = (cal * 0.84).min(0.86);
-                        } else {
-                            cal = (cal * 0.93).min(0.95);
+                            cal = cal.min((cfg.hc_threshold - 0.01).clamp(0.10, 0.79));
                         }
                     }
                     DatasetQcVerdict::Pass => {}

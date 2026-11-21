@@ -3124,10 +3124,12 @@ pub(crate) fn execute_idp_joint_workflow(
 
 fn render_joint_idp_json(wf: &JointIdpWorkflowOutput) -> Result<String, String> {
     let n_hc = wf.conf.values().filter(|&&c| c >= 0.8).count();
+    let provisional = wf.result.qc_verdict == nmr_core::qc::DatasetQcVerdict::Abstain;
     let payload = serde_json::json!({
         "regime": "idp-joint",
         "engine": wf.engine_label,
         "qc_verdict": wf.result.qc_verdict.as_str(),
+        "provisional": provisional,
         "qc_reasons": wf.result.qc_reasons,
         "score": wf.result.score,
         "pass1_score": wf.result.pass1_score,
@@ -3152,6 +3154,125 @@ fn render_joint_idp_json(wf: &JointIdpWorkflowOutput) -> Result<String, String> 
         "residue_assignments": wf.result.residue_assignments,
     });
     serde_json::to_string_pretty(&payload).map_err(|e| format!("failed to serialize json: {e}"))
+}
+
+fn sanitize_star_quoted_text(s: &str) -> String {
+    s.replace('"', "'").replace(['\r', '\n'], " ")
+}
+
+fn joint_qc_reasons_summary(wf: &JointIdpWorkflowOutput) -> String {
+    if wf.result.qc_reasons.is_empty() {
+        "unlabelled QC gate triggered".to_string()
+    } else {
+        sanitize_star_quoted_text(&wf.result.qc_reasons.join("; "))
+    }
+}
+
+/// Write NMR-STAR v3 output for `idp-joint`, always injecting `_Assigned_chem_shift_list.Details`
+/// so `QC=ABSTAIN` outputs are unambiguously marked `PROVISIONAL (QC=ABSTAIN)` (`180r2.core:P1-4`).
+fn write_joint_idp_star(path: &Path, wf: &JointIdpWorkflowOutput) -> Result<(), String> {
+    let verdict = wf.result.qc_verdict;
+    let reasons = joint_qc_reasons_summary(wf);
+    let hdr = if verdict == nmr_core::qc::DatasetQcVerdict::Abstain {
+        format!(
+            "PROVISIONAL_OUTPUT: QC=ABSTAIN ({reasons}; do not treat as validated assignments)\n{}",
+            wf.star_header
+        )
+    } else {
+        wf.star_header.clone()
+    };
+    write_star_with_header(path, &wf.pred, Some(&wf.conf), Some(&hdr))?;
+
+    let details_val = match verdict {
+        nmr_core::qc::DatasetQcVerdict::Abstain => {
+            format!("PROVISIONAL (QC=ABSTAIN): {reasons}; do not treat as validated assignments")
+        }
+        nmr_core::qc::DatasetQcVerdict::Warn => format!("QC=WARN: {reasons}"),
+        nmr_core::qc::DatasetQcVerdict::Pass => "QC=PASS".to_string(),
+    };
+    let raw =
+        fs::read_to_string(path).map_err(|e| format!("failed to read {}: {e}", path.display()))?;
+    let anchor = "   _Assigned_chem_shift_list.Sf_category  assigned_chemical_shifts";
+    let patched = raw.replacen(
+        anchor,
+        &format!(
+            "{anchor}\n   _Assigned_chem_shift_list.Details      \"{}\"",
+            sanitize_star_quoted_text(&details_val)
+        ),
+        1,
+    );
+    fs::write(path, patched).map_err(|e| format!("failed to write {}: {e}", path.display()))
+}
+
+/// Write shifts TSV for `idp-joint` with a `qc_verdict` column and `# PROVISIONAL_OUTPUT: QC=ABSTAIN`
+/// header whenever `qc_verdict == Abstain` (`180r2.core:P1-4`).
+fn write_joint_shifts_tsv(path: &Path, wf: &JointIdpWorkflowOutput) -> Result<(), String> {
+    let verdict_str = wf.result.qc_verdict.as_str();
+    let mut tsv_lines = Vec::new();
+    if wf.result.qc_verdict == nmr_core::qc::DatasetQcVerdict::Abstain {
+        tsv_lines.push(format!(
+            "# PROVISIONAL_OUTPUT: QC=ABSTAIN ({}; do not treat as validated assignments)",
+            joint_qc_reasons_summary(wf)
+        ));
+    }
+    tsv_lines.push("seq_id\tresidue\tatom\tshift\tconfidence\tqc_verdict".to_string());
+    for (&(k, ref atom), &v) in &wf.pred.shifts {
+        let c = wf.conf.get(&k).copied().unwrap_or(0.0);
+        tsv_lines.push(format!(
+            "{}\t{}\t{}\t{:.3}\t{:.4}\t{}",
+            wf.pred.seq_ids[k], wf.pred.sequence[k], atom, v, c, verdict_str
+        ));
+    }
+    fs::write(path, tsv_lines.join("\n") + "\n").map_err(|e| format!("{e}"))
+}
+
+/// Write NEF v1.1 output for `idp-joint`, prepending an explicit `PROVISIONAL (QC=ABSTAIN)`
+/// header comment under `Abstain` (`180r2.core:P1-4`).
+fn write_joint_idp_nef(
+    path: &Path,
+    project_name: &str,
+    wf: &JointIdpWorkflowOutput,
+    hn_peaks: &[Peak],
+) -> Result<(), String> {
+    let nef_doc =
+        NefDocument::from_reference_and_peaks(project_name, &wf.pred, Some(&wf.conf), hn_peaks);
+    let body = nmr_core::nef::write_nef_str(&nef_doc);
+    let text = match wf.result.qc_verdict {
+        nmr_core::qc::DatasetQcVerdict::Abstain => format!(
+            "# PROVISIONAL (QC=ABSTAIN): {}; do not treat as validated assignments\n{body}",
+            joint_qc_reasons_summary(wf)
+        ),
+        nmr_core::qc::DatasetQcVerdict::Warn => {
+            format!("# QC=WARN: {}\n{body}", joint_qc_reasons_summary(wf))
+        }
+        nmr_core::qc::DatasetQcVerdict::Pass => body,
+    };
+    fs::write(path, text).map_err(|e| format!("failed to write NEF file {}: {e}", path.display()))
+}
+
+/// Emit a loud stderr advisory whenever `idp-joint` abstains (`180r2.core:P1-4`).
+fn emit_joint_abstain_advisory(wf: &JointIdpWorkflowOutput) {
+    if wf.result.qc_verdict != nmr_core::qc::DatasetQcVerdict::Abstain {
+        return;
+    }
+    let reasons = joint_qc_reasons_summary(wf);
+    eprintln!(
+        "[qc:ABSTAIN] PROVISIONAL OUTPUT ONLY — do not treat these idp-joint placements as validated assignments ({reasons})."
+    );
+    let has_inflation = wf
+        .result
+        .qc_reasons
+        .iter()
+        .any(|r| r.contains("inflation") || r.contains("Decoy"));
+    if has_inflation {
+        eprintln!(
+            "[qc:ABSTAIN] Advisory: root inflation detected; prefer `--regime idp-13c` for reliable anchors and deduplicate decoy / IPAP-satellite roots before re-running `--regime idp-joint`."
+        );
+    } else {
+        eprintln!(
+            "[qc:ABSTAIN] Advisory: prefer `--regime idp-13c` anchors or inspect input spectra / sequence complexity before accepting assignments."
+        );
+    }
 }
 
 type PdbAtomCoordsBundle = (BTreeMap<(i32, String), Vec3>, Vec<Vec3>, Vec<Vec3>);
@@ -4197,8 +4318,8 @@ fn cmd_assign(args: &[String]) -> Result<(), String> {
                 seed,
             )?;
             let dt_solve = t_solve.elapsed().as_secs_f64();
-            write_star_with_header(&str_out, &wf.pred, Some(&wf.conf), Some(&wf.star_header))?;
-            write_shifts_tsv(&tsv_out, &wf.pred, &wf.conf)?;
+            write_joint_idp_star(&str_out, &wf)?;
+            write_joint_shifts_tsv(&tsv_out, &wf)?;
 
             if let Some(ref jp) = json_out_path {
                 if let Some(parent) = jp.parent() {
@@ -4211,14 +4332,9 @@ fn cmd_assign(args: &[String]) -> Result<(), String> {
                     .map_err(|e| format!("failed to write {}: {e}", jp.display()))?;
             }
             if let Some(ref np) = nef_out_path {
-                let nef_doc = NefDocument::from_reference_and_peaks(
-                    "idp_joint",
-                    &wf.pred,
-                    Some(&wf.conf),
-                    &dataset.hn_peaks,
-                );
-                write_nef_file(np, &nef_doc)?;
+                write_joint_idp_nef(np, "idp_joint", &wf, &dataset.hn_peaks)?;
             }
+            emit_joint_abstain_advisory(&wf);
             if let Some(ref rp) = report_out_path {
                 let mut rep = ReportInput::new("idp_joint", wf.pred.clone(), wf.conf.clone());
                 rep.n_peaks = Some(
@@ -7882,6 +7998,9 @@ fn cmd_pipeline(args: &[String]) -> Result<(), String> {
         || peaks_path.is_some()
         || triples.iter().any(|(exp, _)| is_hn_triple_name(exp));
     if !regime_explicit && con_path.is_some() && has_hn_input_for_auto {
+        eprintln!(
+            "[auto-regime] Both 1H-detected amide and 2D CON inputs supplied; auto-selecting --regime idp-joint"
+        );
         regime = RegimeKind::IdpJoint;
     }
 
@@ -8231,17 +8350,12 @@ fn cmd_pipeline(args: &[String]) -> Result<(), String> {
         let html_out = dir.join("report.html");
         let prop_out = dir.join("propensity.tsv");
 
-        write_star_with_header(&star_out, &wf.pred, Some(&wf.conf), Some(&wf.star_header))?;
-        write_shifts_tsv(&tsv_out, &wf.pred, &wf.conf)?;
+        write_joint_idp_star(&star_out, &wf)?;
+        write_joint_shifts_tsv(&tsv_out, &wf)?;
         let json_txt = render_joint_idp_json(&wf)?;
         fs::write(&json_out, format!("{json_txt}\n")).map_err(|e| format!("{e}"))?;
-        let nef_doc = NefDocument::from_reference_and_peaks(
-            &project_name,
-            &wf.pred,
-            Some(&wf.conf),
-            &dataset.hn_peaks,
-        );
-        write_nef_file(&nef_out, &nef_doc)?;
+        write_joint_idp_nef(&nef_out, &project_name, &wf, &dataset.hn_peaks)?;
+        emit_joint_abstain_advisory(&wf);
 
         let prop_cfg = build_propensity_config(report_opts.temp_k, report_opts.ph)?;
         let prop_rep = compute_idp_propensity(&wf.pred, &prop_cfg);
@@ -11428,6 +11542,128 @@ seq#\tresidue\tH\tN\tC\tCA\tsidechains
         assert!(json_txt.contains("\"regime\": \"idp-joint\""));
         assert!(dir.join("clec_joint.str").exists());
         assert!(dir.join("clec_joint.tsv").exists());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_v180_r3_abstain_provisional_outputs_and_pipeline_auto_regime() {
+        let dir = env::temp_dir().join(format!("nmr_cli_v180_r3_abstain_{}", process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        // Low-complexity repeat sequence (`H < 1.95 bits`) + sparse peaks -> guaranteed QC=ABSTAIN!
+        let repeat_seq = "MSPQSPQSPQSSSPPPQQQSPQSPQSPQSSSPPPQQQSPQSPQSPQSSSPPPQQQSPQSA";
+        let hn_tsv = dir.join("hn.tsv");
+        fs::write(
+            &hn_tsv,
+            "experiment\th\tn\tx\tintensity\n\
+             HSQC\t8.25\t116.5\t\t1000\n\
+             HNCO\t8.25\t116.5\t174.2\t900\n\
+             HSQC\t8.30\t120.2\t\t1000\n\
+             HNCO\t8.30\t120.2\t175.0\t900\n",
+        )
+        .unwrap();
+        let con_tsv = dir.join("con.tsv");
+        fs::write(
+            &con_tsv,
+            "exp\tc_prev\tn_curr\theight\n\
+             CON\t174.2\t116.5\t1000\n\
+             CON\t173.1\t137.0\t1000\n\
+             CON\t175.0\t120.2\t1000\n",
+        )
+        .unwrap();
+
+        let out_prefix = dir.join("abstain_out");
+        let json_out = dir.join("abstain.json");
+        let nef_out = dir.join("abstain.nef");
+
+        cmd_assign(&[
+            "--regime".into(),
+            "idp-joint".into(),
+            "--peaks".into(),
+            hn_tsv.to_string_lossy().into_owned(),
+            "--con".into(),
+            con_tsv.to_string_lossy().into_owned(),
+            "--seq".into(),
+            repeat_seq.into(),
+            "--engine".into(),
+            "cpu".into(),
+            "--runs".into(),
+            "4".into(),
+            "--steps".into(),
+            "150".into(),
+            "--json-out".into(),
+            json_out.to_string_lossy().into_owned(),
+            "--nef-out".into(),
+            nef_out.to_string_lossy().into_owned(),
+            "--out".into(),
+            out_prefix.to_string_lossy().into_owned(),
+        ])
+        .expect("ABSTAIN idp-joint assign must succeed with explicit provisional markers");
+
+        let star_txt = fs::read_to_string(dir.join("abstain_out.str")).unwrap();
+        assert!(
+            star_txt.contains("_Assigned_chem_shift_list.Details")
+                && star_txt.contains("PROVISIONAL (QC=ABSTAIN)"),
+            "180r2.core:P1-4: STAR must mark ABSTAIN in _Assigned_chem_shift_list.Details: {star_txt}"
+        );
+        let tsv_txt = fs::read_to_string(dir.join("abstain_out.tsv")).unwrap();
+        assert!(
+            tsv_txt.starts_with("# PROVISIONAL_OUTPUT: QC=ABSTAIN")
+                && tsv_txt.contains("seq_id\tresidue\tatom\tshift\tconfidence\tqc_verdict")
+                && tsv_txt.contains("\tABSTAIN"),
+            "180r2.core:P1-4: TSV must emit PROVISIONAL header and qc_verdict=ABSTAIN column: {tsv_txt}"
+        );
+        let json_txt = fs::read_to_string(&json_out).unwrap();
+        let json_val: serde_json::Value = serde_json::from_str(&json_txt).unwrap();
+        assert_eq!(json_val["qc_verdict"], "ABSTAIN");
+        assert_eq!(json_val["provisional"], true);
+        assert!(
+            json_val["qc_reasons"]
+                .as_array()
+                .is_some_and(|arr| !arr.is_empty()),
+            "JSON must include non-empty qc_reasons under ABSTAIN"
+        );
+        let nef_txt = fs::read_to_string(&nef_out).unwrap();
+        assert!(
+            nef_txt.contains("PROVISIONAL (QC=ABSTAIN)"),
+            "180r2.core:P1-4: NEF must mark PROVISIONAL (QC=ABSTAIN)"
+        );
+
+        // Also verify `cmd_pipeline` auto-selects `idp-joint` and writes identical provisional flags
+        let pipe_dir = dir.join("pipe_abstain");
+        cmd_pipeline(&[
+            "--peaks".into(),
+            hn_tsv.to_string_lossy().into_owned(),
+            "--con".into(),
+            con_tsv.to_string_lossy().into_owned(),
+            "--seq".into(),
+            repeat_seq.into(),
+            "--engine".into(),
+            "cpu".into(),
+            "--runs".into(),
+            "4".into(),
+            "--steps".into(),
+            "150".into(),
+            "--out-dir".into(),
+            pipe_dir.to_string_lossy().into_owned(),
+        ])
+        .expect("ABSTAIN auto-selected idp-joint pipeline must succeed with provisional markers");
+
+        let p_star = fs::read_to_string(pipe_dir.join("shifts.str")).unwrap();
+        let p_tsv = fs::read_to_string(pipe_dir.join("shifts.tsv")).unwrap();
+        let p_json: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(pipe_dir.join("joint_summary.json")).unwrap())
+                .unwrap();
+        let p_nef = fs::read_to_string(pipe_dir.join("result.nef")).unwrap();
+        assert!(p_star.contains("_Assigned_chem_shift_list.Details"));
+        assert!(p_star.contains("PROVISIONAL (QC=ABSTAIN)"));
+        assert!(p_tsv.starts_with("# PROVISIONAL_OUTPUT: QC=ABSTAIN"));
+        assert!(p_tsv.contains("\tABSTAIN"));
+        assert_eq!(p_json["qc_verdict"], "ABSTAIN");
+        assert_eq!(p_json["provisional"], true);
+        assert!(p_nef.contains("PROVISIONAL (QC=ABSTAIN)"));
 
         let _ = fs::remove_dir_all(&dir);
     }
