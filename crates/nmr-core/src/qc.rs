@@ -35,8 +35,12 @@ use crate::priors::{
     estimate_reference_offsets_detailed, one_to_three, DetailedReferenceOffsets, OffsetFitStatus,
     Priors,
 };
-use crate::solver::{pair_matrix, unary_matrix, AssignResult, ScoreConfig};
-use crate::spinsystems::SpinSystem;
+use crate::solver::{
+    evaluate_auto_reference_safety, pair_matrix, unary_matrix, AssignResult, ScoreConfig,
+};
+use crate::spinsystems::{
+    normalize_hncacb_and_cbcaconh_polarity, DetectedPolarity, HncacbPolarity, SpinSystem,
+};
 
 const fn default_one_f64() -> f64 {
     1.0
@@ -149,6 +153,15 @@ pub struct DatasetQcReport {
     /// `CA`-bearing 3D experiments (`0.0` when `< 2` `CA`-bearing 3D experiments are present; `F6a`).
     #[serde(default)]
     pub max_inter_exp_ca_drift_ppm: f64,
+    /// Detected `HNCACB` sign convention (`"cb-negative"`, `"cb-positive"`, `"single-sign"`; `RD-1`).
+    #[serde(default)]
+    pub hncacb_polarity: Option<String>,
+    /// Detected `CBCACONH`/`HN(CO)CACB` sign convention when opposite-sign peaks exist (`RD-1`).
+    #[serde(default)]
+    pub cbcaconh_polarity: Option<String>,
+    /// Advisory chemical-shift referencing convention hints (e.g., `"likely TMS-referenced 13C"`; `RD-2`).
+    #[serde(default)]
+    pub reference_hints: Vec<String>,
     /// True under `DatasetQcVerdict::Warn` (`Q4`): explicitly marks sub-HC calls (`confidence < 0.80`)
     /// as uncalibrated under `Warn` damping rather than fitting a separate small-sample `Warn` isotonic curve.
     #[serde(default)]
@@ -241,6 +254,9 @@ impl Default for DatasetQcReport {
             truncated_fid_zero_filled: false,
             inter_exp_c13_offset_warn: false,
             max_inter_exp_ca_drift_ppm: 0.0,
+            hncacb_polarity: None,
+            cbcaconh_polarity: None,
+            reference_hints: Vec::new(),
             warn_sub_hc_uncalibrated: false,
             confidence_calibrated: true,
             calibration_warning: None,
@@ -386,6 +402,11 @@ fn check_inter_experiment_c13_ca_consistency_with_roots(
     }
 
     let k_amp_ref = roots.len().clamp(8, 256);
+    let (_, pol_rep) = normalize_hncacb_and_cbcaconh_polarity(peaks, HncacbPolarity::Auto);
+    let hncacb_cb_positive = pol_rep
+        .hncacb
+        .as_ref()
+        .is_some_and(|r| r.detected == DetectedPolarity::CbPositive);
     let exp_order = ["HNCA", "HNCACB", "CBCACONH"];
     let mut strips_by_exp: BTreeMap<&'static str, Vec<Vec<f64>>> = BTreeMap::new();
     let mut core_ca_by_exp: BTreeMap<&'static str, Vec<f64>> = BTreeMap::new();
@@ -423,7 +444,9 @@ fn check_inter_experiment_c13_ca_consistency_with_roots(
                 match ename {
                     "HNCA" => (36.0..=76.0).contains(&c),
                     "HNCACB" => {
-                        if has_neg_cb {
+                        if hncacb_cb_positive {
+                            p.sign < 0 && (36.0..=76.0).contains(&c)
+                        } else if has_neg_cb {
                             p.sign > 0 && (36.0..=76.0).contains(&c)
                         } else {
                             p.sign >= 0 && (43.5..=72.0).contains(&c)
@@ -1717,6 +1740,19 @@ pub fn evaluate_dataset_qc_with_gate(
         .filter(|r| r.as_str() == "ASN" || r.as_str() == "GLN")
         .count();
 
+    let polarity_report =
+        peaks.map(|pks| normalize_hncacb_and_cbcaconh_polarity(pks, HncacbPolarity::Auto).1);
+    let hncacb_polarity = polarity_report
+        .as_ref()
+        .and_then(|r| r.hncacb.as_ref().map(|h| h.detected.as_str().to_string()));
+    let cbcaconh_polarity = polarity_report
+        .as_ref()
+        .and_then(|r| r.cbcaconh.as_ref().map(|c| c.detected.as_str().to_string()));
+    let hncacb_cb_positive = polarity_report
+        .as_ref()
+        .and_then(|r| r.hncacb.as_ref())
+        .is_some_and(|h| h.detected == DetectedPolarity::CbPositive);
+
     let (
         n_raw_hsqc_roots,
         n_amide_hsqc_roots,
@@ -1864,7 +1900,12 @@ pub fn evaluate_dataset_qc_with_gate(
             let has_backbone_ca = |root: &Peak| -> bool {
                 raw_3d.iter().any(|p| {
                     let is_ca_chan = p.exp == "HNCA"
-                        || (p.exp == "HNCACB" && p.sign >= 0)
+                        || (p.exp == "HNCACB"
+                            && if hncacb_cb_positive {
+                                p.sign < 0
+                            } else {
+                                p.sign >= 0
+                            })
                         || (p.exp == "HNCOCA" && p.c.is_some_and(|c| c >= 39.0));
                     if !is_ca_chan {
                         return false;
@@ -2073,6 +2114,11 @@ pub fn evaluate_dataset_qc_with_gate(
     let (offset_consistency_ok, offset_issues) = check_offset_consistency(&detailed_offsets);
     let weak_offset_issue =
         has_weak_likelihood_large_offset(&detailed_offsets, QC_MIN_LARGE_OFFSET_GAIN_PER_OBS);
+    let ref_safety = evaluate_auto_reference_safety(&detailed_offsets);
+    let mut reference_hints: Vec<String> = ref_safety.tms_reference_hint.iter().cloned().collect();
+    if let Some(ref pol_warn) = ref_safety.polarity_swap_warning {
+        reference_hints.push(pol_warn.clone());
+    }
 
     // Sequential `(i, i-1)` link coverage (`P >= 1.0`, corroborated `P >= 3.5`, and contiguous
     // `>= 4.min(seg_len)` chain corroboration `13.1:P1-7b`)
@@ -2382,6 +2428,9 @@ pub fn evaluate_dataset_qc_with_gate(
             truncated_fid_zero_filled: false,
             inter_exp_c13_offset_warn,
             max_inter_exp_ca_drift_ppm,
+            hncacb_polarity,
+            cbcaconh_polarity,
+            reference_hints,
             warn_sub_hc_uncalibrated: false,
             confidence_calibrated: true,
             calibration_warning: None,
@@ -2436,16 +2485,25 @@ pub fn evaluate_dataset_qc_with_gate(
             hsqc_3d_rms_dh_ppm, hsqc_3d_rms_dn_ppm
         ));
     }
-    if !offset_consistency_ok {
+    let qc_offset_polarity_fail =
+        !ref_safety.refused_nuclei.is_empty() && ref_safety.c13_spread_ppm > 2.0;
+    let has_any_offset_warn =
+        !offset_consistency_ok || weak_offset_issue.is_some() || qc_offset_polarity_fail;
+    if has_any_offset_warn {
         scale *= 0.78;
         scale_damped = true;
+    }
+    if !offset_consistency_ok {
         warn_reasons.extend(offset_issues);
     }
-    if let Some(ref weak_off_msg) = weak_offset_issue {
-        if offset_consistency_ok {
-            scale *= 0.78;
+    if !offset_consistency_ok || qc_offset_polarity_fail {
+        for rw in &ref_safety.warnings {
+            if !warn_reasons.contains(rw) {
+                warn_reasons.push(rw.clone());
+            }
         }
-        scale_damped = true;
+    }
+    if let Some(ref weak_off_msg) = weak_offset_issue {
         warn_reasons.push(weak_off_msg.clone());
     }
     if assigned_count >= 8 && connectivity_frac < 0.38 {
@@ -2597,6 +2655,9 @@ pub fn evaluate_dataset_qc_with_gate(
             truncated_fid_zero_filled: false,
             inter_exp_c13_offset_warn: false,
             max_inter_exp_ca_drift_ppm,
+            hncacb_polarity: hncacb_polarity.clone(),
+            cbcaconh_polarity: cbcaconh_polarity.clone(),
+            reference_hints: reference_hints.clone(),
             warn_sub_hc_uncalibrated: false,
             confidence_calibrated: true,
             calibration_warning: None,
@@ -2631,6 +2692,9 @@ pub fn evaluate_dataset_qc_with_gate(
             truncated_fid_zero_filled: false,
             inter_exp_c13_offset_warn,
             max_inter_exp_ca_drift_ppm,
+            hncacb_polarity,
+            cbcaconh_polarity,
+            reference_hints,
             warn_sub_hc_uncalibrated: true,
             confidence_calibrated: true,
             calibration_warning: None,

@@ -16,9 +16,11 @@
 use std::f64::consts::TAU;
 
 use crate::af_assign_priors::{AfAssignPriors, AfNoesyPairwiseTable};
+use crate::c13_detected::{cas_llr_adjustment, match_cas_peaks_to_roots, CasSpectrum};
 pub use crate::priors::{
     covalent_atom_offset, delta_covalent, estimate_reference_offsets,
-    expected_covalent_atom_offset, Priors, ShiftOffsets, COVALENT_COIL_WEIGHT,
+    estimate_reference_offsets_detailed, expected_covalent_atom_offset, DetailedReferenceOffsets,
+    NucleusOffsetFit, OffsetFitStatus, Priors, ShiftOffsets, COVALENT_COIL_WEIGHT,
 };
 use crate::qc::{apply_standard_calibration_map, apply_standard_gpu_calibration_map};
 use crate::rng::Rng;
@@ -171,8 +173,207 @@ pub fn candidate_llr_shifted(
     (best - (cands.len() as f64).ln(), best_i)
 }
 
-/// Prepare effective scoring `Priors` (applying `estimate_reference_offsets` when
-/// `cfg.auto_reference` is enabled) and return `(effective_priors, applied_offsets)`.
+/// Maximum plausible automatic chemical-shift referencing correction (ppm) for `13C` (`RD-2`).
+pub const MAX_AUTO_REF_C13_PPM: f64 = 3.5;
+/// Maximum plausible automatic chemical-shift referencing correction (ppm) for `15N` (`RD-2`).
+pub const MAX_AUTO_REF_N15_PPM: f64 = 1.5;
+/// Spread threshold across `(13CA, 13CB, 13C')` offsets above which a polarity/CA-CB swap warning is emitted (`RD-2`).
+pub const AUTO_REF_C13_SPREAD_WARN_PPM: f64 = 1.0;
+
+/// Plausibility, refusal, and referencing-convention audit for automatic offset estimation (`RD-2`).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct AutoRefSafetyReport {
+    pub raw_offsets: ShiftOffsets,
+    pub safe_offsets: ShiftOffsets,
+    pub refused_nuclei: Vec<String>,
+    pub c13_spread_ppm: f64,
+    pub polarity_swap_warning: Option<String>,
+    pub tms_reference_hint: Option<String>,
+    pub warnings: Vec<String>,
+}
+
+/// Inspect fitted/candidate reference offsets for implausible magnitudes (`|13C| > 3.5 ppm`,
+/// `|15N| > 1.5 ppm`), non-uniform `CA/CB/C'` spread (`> 1.0 ppm`, diagnostic of `RD-1` polarity
+/// or `CA/CB` swap), and uniform `-2..-3 ppm` TMS-referenced `13C` offsets (`RD-2`).
+pub fn evaluate_auto_reference_safety(detailed: &DetailedReferenceOffsets) -> AutoRefSafetyReport {
+    let raw_offsets = detailed.to_shift_offsets();
+    let mut safe_offsets = raw_offsets;
+    let mut refused_nuclei = Vec::new();
+    let mut warnings = Vec::new();
+
+    let effective_fit_ppm = |fit: &NucleusOffsetFit| -> Option<f64> {
+        if fit.status == OffsetFitStatus::TooFewValues || fit.n_values < 5 {
+            return None;
+        }
+        if fit.status == OffsetFitStatus::Fitted {
+            Some(fit.applied_ppm)
+        } else {
+            // Non-fitted (NotSignificant) channels keep 0.00 applied offset
+            Some(0.0)
+        }
+    };
+
+    let mut check_cap = |label: &str, fit: &NucleusOffsetFit, cap: f64, slot: &mut f64| {
+        if fit.status == OffsetFitStatus::Fitted && fit.applied_ppm.abs() > cap {
+            let msg = format!(
+                "refused implausible {label} auto-reference offset ({:+.2} ppm, exceeds ±{cap:.2} ppm cap)",
+                fit.applied_ppm
+            );
+            *slot = 0.0;
+            refused_nuclei.push(label.to_string());
+            warnings.push(msg);
+        }
+    };
+
+    check_cap(
+        "13CA",
+        &detailed.ca,
+        MAX_AUTO_REF_C13_PPM,
+        &mut safe_offsets.ca,
+    );
+    check_cap(
+        "13CB",
+        &detailed.cb,
+        MAX_AUTO_REF_C13_PPM,
+        &mut safe_offsets.cb,
+    );
+    check_cap(
+        "13C'",
+        &detailed.c,
+        MAX_AUTO_REF_C13_PPM,
+        &mut safe_offsets.c,
+    );
+    check_cap(
+        "15N",
+        &detailed.n,
+        MAX_AUTO_REF_N15_PPM,
+        &mut safe_offsets.n,
+    );
+
+    // Check spread across `(CA, CB, C')` when at least one carbon channel moved appreciably
+    let mut c_entries: Vec<(&str, f64)> = Vec::with_capacity(3);
+    let mut any_c_active = false;
+    for (lbl, fit) in [
+        ("CA", &detailed.ca),
+        ("CB", &detailed.cb),
+        ("C'", &detailed.c),
+    ] {
+        if let Some(v) = effective_fit_ppm(fit) {
+            if fit.status == OffsetFitStatus::Fitted || v.abs() > 1.0 {
+                any_c_active = true;
+            }
+            c_entries.push((lbl, v));
+        }
+    }
+
+    let mut c13_spread_ppm = 0.0;
+    let mut polarity_swap_warning = None;
+    if any_c_active && c_entries.len() >= 2 {
+        let min_c = c_entries.iter().map(|x| x.1).fold(f64::INFINITY, f64::min);
+        let max_c = c_entries
+            .iter()
+            .map(|x| x.1)
+            .fold(f64::NEG_INFINITY, f64::max);
+        c13_spread_ppm = max_c - min_c;
+        if c13_spread_ppm > AUTO_REF_C13_SPREAD_WARN_PPM {
+            let desc = c_entries
+                .iter()
+                .map(|(l, v)| format!("d{l}={v:+.2}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let msg = format!(
+                "non-uniform 13C offsets ({desc}; spread {c13_spread_ppm:.2} > {AUTO_REF_C13_SPREAD_WARN_PPM:.2} ppm) — likely HNCACB/HN(CO)CACB polarity or CA/CB swap (RD-1; retry with --hncacb-polarity)"
+            );
+            warnings.push(msg.clone());
+            polarity_swap_warning = Some(msg);
+            if refused_nuclei
+                .iter()
+                .any(|n| matches!(n.as_str(), "13CA" | "13CB" | "13C'"))
+            {
+                // Avoid applying partial carbon offsets across a CA/CB-swapped dataset
+                safe_offsets.ca = 0.0;
+                safe_offsets.cb = 0.0;
+                safe_offsets.c = 0.0;
+            }
+        }
+    }
+
+    // Detect uniform -2..-3 ppm 13C shift indicative of TMS (vs DSS) chemical-shift referencing
+    let mut safe_c_fitted = Vec::with_capacity(3);
+    for (fit, app) in [
+        (&detailed.ca, safe_offsets.ca),
+        (&detailed.cb, safe_offsets.cb),
+        (&detailed.c, safe_offsets.c),
+    ] {
+        if fit.status == OffsetFitStatus::Fitted && app.abs() > 0.1 {
+            safe_c_fitted.push(app);
+        }
+    }
+    let tms_reference_hint =
+        if safe_c_fitted.len() >= 2 && c13_spread_ppm <= AUTO_REF_C13_SPREAD_WARN_PPM {
+            let min_app = safe_c_fitted.iter().copied().fold(f64::INFINITY, f64::min);
+            let max_app = safe_c_fitted
+                .iter()
+                .copied()
+                .fold(f64::NEG_INFINITY, f64::max);
+            let mean_app = safe_c_fitted.iter().sum::<f64>() / (safe_c_fitted.len() as f64);
+            if safe_c_fitted
+                .iter()
+                .all(|v| (-MAX_AUTO_REF_C13_PPM..=-1.65).contains(v))
+                && (-3.35..=-1.75).contains(&mean_app)
+                && (max_app - min_app) <= AUTO_REF_C13_SPREAD_WARN_PPM
+            {
+                Some(format!(
+                    "likely TMS-referenced 13C (uniform {:+.2} ppm carbon offset vs DSS priors)",
+                    mean_app
+                ))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+    AutoRefSafetyReport {
+        raw_offsets,
+        safe_offsets,
+        refused_nuclei,
+        c13_spread_ppm,
+        polarity_swap_warning,
+        tms_reference_hint,
+        warnings,
+    }
+}
+
+/// Prepare effective scoring `Priors` alongside full `DetailedReferenceOffsets` and RD-2 safety
+/// diagnostics (`refused_nuclei`, `CA/CB/C'` spread polarity warning, and `TMS` referencing hint).
+pub fn prepare_scoring_priors_checked(
+    systems: &[SpinSystem],
+    sequence: &[String],
+    priors: &Priors,
+    cfg: &ScoreConfig,
+) -> (
+    Priors,
+    ShiftOffsets,
+    DetailedReferenceOffsets,
+    AutoRefSafetyReport,
+) {
+    if cfg.auto_reference {
+        let detailed = estimate_reference_offsets_detailed(systems, sequence, priors);
+        let safety = evaluate_auto_reference_safety(&detailed);
+        let safe = safety.safe_offsets;
+        (priors.with_offsets(&safe), safe, detailed, safety)
+    } else {
+        let zero = ShiftOffsets::default();
+        let detailed = DetailedReferenceOffsets::default();
+        let safety = AutoRefSafetyReport::default();
+        (priors.clone(), zero, detailed, safety)
+    }
+}
+
+/// Prepare effective scoring `Priors` (applying `estimate_reference_offsets` with RD-2 safety caps
+/// `±3.5 ppm` 13C / `±1.5 ppm` 15N when `cfg.auto_reference` is enabled) and return
+/// `(effective_priors, applied_offsets)`.
 ///
 /// Exposed publicly so GPU (`nmr-gpu`) and CLI (`nmr-cli`) engines share identical reference
 /// alignment while `SpinSystem` candidates and output shifts remain in the experimental ppm frame.
@@ -182,12 +383,8 @@ pub fn prepare_scoring_priors(
     priors: &Priors,
     cfg: &ScoreConfig,
 ) -> (Priors, ShiftOffsets) {
-    if cfg.auto_reference {
-        let offsets = estimate_reference_offsets(systems, sequence, priors);
-        (priors.with_offsets(&offsets), offsets)
-    } else {
-        (priors.clone(), ShiftOffsets::default())
-    }
+    let (eff, safe, _, _) = prepare_scoring_priors_checked(systems, sequence, priors, cfg);
+    (eff, safe)
 }
 
 pub fn unary_matrix(
@@ -2107,6 +2304,114 @@ pub fn assign(
     assign_from_matrices_with_locks(&u, &p, cfg, &locks)
 }
 
+/// Apply `(C'_{i-1}, N_i)` amino-acid-selective (`CAS`) log-likelihood evidence onto a globular unary matrix `u` (`RD-4`).
+/// Each `SpinSystem` is anchored via `(C(i-1), N(i))` from `HNCO` (`("C", -1)` candidates + `ss.n`).
+pub fn apply_cas_evidence_to_unary(
+    u: &mut Matrix2D,
+    systems: &[SpinSystem],
+    sequence: &[String],
+    cas_spectra: &[CasSpectrum],
+    c_tol_ppm: f64,
+    n_tol_ppm: f64,
+    match_llr: f64,
+) {
+    if cas_spectra.is_empty() || systems.is_empty() || sequence.len() < 2 {
+        return;
+    }
+    let s_len = systems.len().min(u.rows);
+    let k_len = sequence.len().min(u.cols);
+    let c_key = ("C".to_string(), -1);
+    let mut roots: Vec<(f64, f64)> = Vec::with_capacity(s_len);
+    let mut valid_root = vec![false; s_len];
+    for (s, ss) in systems.iter().take(s_len).enumerate() {
+        if let Some(c_val) = ss
+            .cands
+            .get(&c_key)
+            .and_then(|list| list.iter().find(|&&(_, sup)| sup > 0))
+            .map(|&(v, _)| v)
+        {
+            roots.push((c_val, ss.n));
+            valid_root[s] = true;
+        } else {
+            roots.push((-9999.0, -9999.0));
+        }
+    }
+    if !valid_root.iter().any(|&v| v) {
+        return;
+    }
+
+    for cas in cas_spectra {
+        let raw_hits = match_cas_peaks_to_roots(cas, &roots, c_tol_ppm, n_tol_ppm);
+        let hits: Vec<bool> = raw_hits
+            .into_iter()
+            .zip(valid_root.iter().copied())
+            .map(|(h, ok)| h && ok)
+            .collect();
+        let n_root_hits = hits.iter().filter(|&&h| h).count();
+        let seq_type_count = match cas.mode {
+            crate::c13_detected::CasMode::Cacon => (1..k_len)
+                .filter(|&k| cas.matches_residue(&sequence[k - 1]))
+                .count(),
+            crate::c13_detected::CasMode::Canco => (1..k_len)
+                .filter(|&k| cas.matches_residue(&sequence[k]))
+                .count(),
+        };
+
+        for s in 0..s_len {
+            if !valid_root[s] {
+                continue;
+            }
+            for k in 1..k_len {
+                let cur = u.get(s, k);
+                if cur <= FORBID * 0.5 {
+                    continue;
+                }
+                let target_res = match cas.mode {
+                    crate::c13_detected::CasMode::Cacon => &sequence[k - 1],
+                    crate::c13_detected::CasMode::Canco => &sequence[k],
+                };
+                let delta = cas_llr_adjustment(
+                    cas,
+                    hits[s],
+                    target_res,
+                    match_llr,
+                    seq_type_count,
+                    n_root_hits,
+                );
+                u.set(s, k, cur + delta);
+            }
+        }
+    }
+}
+
+/// Run standard globular backbone assignment augmented with `2D CAS` `(C'_{i-1}, N_i)` residue-type evidence (`RD-4`).
+#[allow(clippy::too_many_arguments)]
+pub fn assign_with_cas(
+    systems: &[SpinSystem],
+    sequence: &[String],
+    priors: &Priors,
+    score_cfg: &ScoreConfig,
+    cfg: &AnnealConfig,
+    cas_spectra: &[CasSpectrum],
+    c_tol_ppm: f64,
+    n_tol_ppm: f64,
+    match_llr: f64,
+) -> AssignResult {
+    let mut u = unary_matrix(systems, sequence, priors, score_cfg);
+    apply_cas_evidence_to_unary(
+        &mut u,
+        systems,
+        sequence,
+        cas_spectra,
+        c_tol_ppm,
+        n_tol_ppm,
+        match_llr,
+    );
+    let p = pair_matrix(systems, score_cfg);
+    let locks = resolve_locked_assignments(systems.len(), sequence, &score_cfg.locked_assignments);
+    assign_from_matrices_with_locks(&u, &p, cfg, &locks)
+}
+
 pub fn assign_from_matrices(u: &Matrix2D, p: &Matrix2D, cfg: &AnnealConfig) -> AssignResult {
     assign_from_matrices_with_locks(u, p, cfg, &[])
 }
@@ -2202,4 +2507,232 @@ fn assign_from_matrices_with_locks_and_af_noe_opts(
         }
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::c13_detected::{CasMode, CasPeak};
+    use crate::evaluate::score;
+    use crate::nmrstar::read_star;
+    use crate::peaks::Peak;
+    use crate::qc::{evaluate_dataset_qc, DatasetQcVerdict};
+    use crate::simulate::{simulate, SimConfig};
+    use crate::spinsystems::{
+        build_spin_systems, build_spin_systems_with_options, HncacbPolarity, RootSelectionMode,
+        SpinSystemBuildOptions, Tolerances,
+    };
+    use std::path::Path;
+
+    #[test]
+    fn test_rd2_uniform_tms_2_9_recovery_and_ca_cb_swap_refusal() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let star = read_star(root.join("data/fixtures/synthetic_ubiquitin.str"), None).unwrap();
+        let priors = Priors::bmrb();
+        let (clean_peaks, truth) = simulate(&star, &SimConfig::default());
+
+        // 1. Uniform -2.9 ppm TMS 13C shift: recovered safely, emits "likely TMS-referenced 13C" hint
+        let tms_peaks: Vec<Peak> = clean_peaks
+            .iter()
+            .cloned()
+            .map(|mut p| {
+                if let Some(c) = p.c.as_mut() {
+                    *c -= 2.90;
+                }
+                p
+            })
+            .collect();
+        let sys_tms = build_spin_systems(&tms_peaks, &Tolerances::default(), 3, false).unwrap();
+        let scfg = ScoreConfig::default();
+        let (_, safe_off, detailed, safety) =
+            prepare_scoring_priors_checked(&sys_tms, &star.sequence, &priors, &scfg);
+        assert!((safe_off.ca - (-2.90)).abs() <= 0.65, "dCA={}", safe_off.ca);
+        assert!((safe_off.cb - (-2.90)).abs() <= 0.65, "dCB={}", safe_off.cb);
+        assert!((safe_off.c - (-2.90)).abs() <= 0.65, "dC={}", safe_off.c);
+        assert!(safety.refused_nuclei.is_empty());
+        assert!(
+            safety
+                .tms_reference_hint
+                .as_deref()
+                .is_some_and(|h| h.contains("likely TMS-referenced 13C")),
+            "expected TMS hint, got {:?}",
+            safety.tms_reference_hint
+        );
+
+        let res_tms = assign(
+            &sys_tms,
+            &star.sequence,
+            &priors,
+            &scfg,
+            &AnnealConfig::default(),
+        );
+        let metrics_tms = score(&res_tms, &truth, 0.8);
+        assert!(
+            metrics_tms.accuracy() >= 0.96,
+            "TMS -2.9 ppm recovery accuracy regressed: {}",
+            metrics_tms.report()
+        );
+        let qc_tms = evaluate_dataset_qc(
+            Some(&tms_peaks),
+            &sys_tms,
+            &star.sequence,
+            &priors,
+            &scfg,
+            &res_tms,
+            Some(&detailed),
+        );
+        assert_eq!(qc_tms.verdict, DatasetQcVerdict::Pass);
+        assert!(qc_tms
+            .reference_hints
+            .iter()
+            .any(|h| h.contains("likely TMS-referenced 13C")));
+
+        // 2. Synthetic CA/CB swap (forced CbNegative override on inverted HNCACB/HNCA-free peaks):
+        // must trigger refusal + polarity warning instead of applying ~ -6 ppm carbon offsets.
+        let mut swapped_peaks: Vec<Peak> = clean_peaks
+            .iter()
+            .filter(|p| p.exp != "HNCA" && p.exp != "HNCOCA")
+            .cloned()
+            .collect();
+        for p in &mut swapped_peaks {
+            if p.exp == "HNCACB" {
+                p.sign = -p.sign;
+            }
+        }
+        let sys_swap = build_spin_systems_with_options(
+            &swapped_peaks,
+            &Tolerances::default(),
+            3,
+            false,
+            SpinSystemBuildOptions {
+                polarity: HncacbPolarity::CbNegative,
+                root_mode: RootSelectionMode::All,
+                merge_nh2: false,
+            },
+        )
+        .unwrap()
+        .systems;
+        let (_, swap_off, swap_det, swap_safety) =
+            prepare_scoring_priors_checked(&sys_swap, &star.sequence, &priors, &scfg);
+        assert!(
+            !swap_safety.refused_nuclei.is_empty() && swap_safety.polarity_swap_warning.is_some(),
+            "CA/CB swap must produce refusal and polarity warning, got {swap_safety:?}"
+        );
+        assert!(
+            swap_off.ca.abs() <= MAX_AUTO_REF_C13_PPM
+                && swap_off.cb.abs() <= MAX_AUTO_REF_C13_PPM
+                && swap_off.c.abs() <= MAX_AUTO_REF_C13_PPM,
+            "out-of-cap carbon offset must never be applied: {swap_off}"
+        );
+        let res_swap = assign(
+            &sys_swap,
+            &star.sequence,
+            &priors,
+            &scfg,
+            &AnnealConfig::default(),
+        );
+        let qc_swap = evaluate_dataset_qc(
+            Some(&swapped_peaks),
+            &sys_swap,
+            &star.sequence,
+            &priors,
+            &scfg,
+            &res_swap,
+            Some(&swap_det),
+        );
+        assert_ne!(qc_swap.verdict, DatasetQcVerdict::Pass);
+        assert!(
+            qc_swap
+                .reasons
+                .iter()
+                .any(|r| r.contains("polarity") || r.contains("RD-1")),
+            "expected polarity warning in QC reasons: {:?}",
+            qc_swap.reasons
+        );
+
+        // 3. Explicit 15N > 1.50 ppm cap check
+        let big_n = DetailedReferenceOffsets {
+            n: NucleusOffsetFit {
+                status: OffsetFitStatus::Fitted,
+                applied_ppm: 2.20,
+                candidate_ppm: 2.20,
+                log_likelihood_gain: 5.0,
+                n_values: 40,
+            },
+            ..Default::default()
+        };
+        let n_safety = evaluate_auto_reference_safety(&big_n);
+        assert_eq!(n_safety.safe_offsets.n, 0.0);
+        assert!(n_safety.refused_nuclei.contains(&"15N".to_string()));
+    }
+
+    #[test]
+    fn test_rd4_globular_cas_cacon_canco_resolves_ambiguous_assignments() {
+        // Synthetic 4-residue test where residue types cannot distinguish roots cleanly without CAS:
+        // seq = [MET, ALA, SER, ALA] -> assignable k=1 (ALA), k=2 (SER), k=3 (ALA)
+        // Make spin systems have identical ambiguous H/N/CA/CB except HNCO C'(i-1) + CAS hits!
+        let seq = vec![
+            "MET".to_string(),
+            "ALA".to_string(),
+            "SER".to_string(),
+            "ALA".to_string(),
+        ];
+        let priors = Priors::bmrb();
+        let make_sys = |h: f64, n: f64, c_prev: f64| {
+            let mut s = SpinSystem::new(h, n);
+            s.cands.insert(("C".to_string(), -1), vec![(c_prev, 1)]);
+            s.cands.insert(("CA".to_string(), 0), vec![(54.5, 1)]);
+            s
+        };
+        let systems = vec![
+            make_sys(8.20, 121.0, 175.10), // true k=1 (prev MET, curr ALA)
+            make_sys(8.20, 121.0, 177.60), // true k=2 (prev ALA, curr SER)
+            make_sys(8.20, 121.0, 174.60), // true k=3 (prev SER, curr ALA)
+        ];
+        let cas = vec![
+            CasSpectrum {
+                name: "cacon_ser".to_string(),
+                mode: CasMode::Cacon,
+                residues: vec!["SER".to_string()],
+                peaks: vec![CasPeak {
+                    c_prime_ppm: 174.61,
+                    n_ppm: 121.04,
+                    height: 100.0,
+                    volume: 100.0,
+                }],
+            },
+            CasSpectrum {
+                name: "canco_ser".to_string(),
+                mode: CasMode::Canco,
+                residues: vec!["SER".to_string()],
+                peaks: vec![CasPeak {
+                    c_prime_ppm: 177.59,
+                    n_ppm: 121.02,
+                    height: 100.0,
+                    volume: 100.0,
+                }],
+            },
+        ];
+        let scfg = ScoreConfig {
+            auto_reference: false,
+            ..ScoreConfig::default()
+        };
+        let res = assign_with_cas(
+            &systems,
+            &seq,
+            &priors,
+            &scfg,
+            &AnnealConfig {
+                runs: 8,
+                steps_per_system: 600,
+                seed: 0,
+                ..AnnealConfig::default()
+            },
+            &cas,
+            0.06,
+            0.20,
+            3.0,
+        );
+        assert_eq!(res.position, vec![1, 2, 3]);
+    }
 }
