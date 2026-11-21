@@ -15,11 +15,13 @@ for ``FERRIC`` across:
   ``Launch-NMR-Workbench.bat``, ``README.md``, and ``THIRD_PARTY.md``.
 - ``linux-x86_64``: deterministic ``.tar.gz`` archive (``bin/ferric-gui``,
   ``bin/ferric``, FreeDesktop ``ferric.desktop``, scalable SVG + ``256x256`` PNG
-  hicolor icons, user-level ``install-desktop.sh``, ``README.md``, ``THIRD_PARTY.md``)
-  plus native Debian/Ubuntu ``.deb`` (``amd64``) and RHEL 9 / AlmaLinux 9 / Rocky 9 /
-  Fedora ``.rpm`` (``x86_64``, ``glibc >= 2.34``).
+  hicolor icons, user-level ``install-desktop.sh``, ``README.md``, ``LICENSE``,
+  ``THIRD_PARTY.md``) plus native Debian/Ubuntu ``.deb`` (``amd64``, with
+  ``/usr/share/doc/ferric/copyright`` and GUI runtime dependencies) and RHEL 9 /
+  AlmaLinux 9 / Rocky 9 / Fedora ``.rpm`` (``x86_64``, ``glibc >= 2.34``).
 - ``linux-i686-cli``: static ``musl`` 32-bit CLI-only ``ferric`` packaged as
-  deterministic ``.tar.gz``, ``.deb`` (``i386``), and ``.rpm`` (``i686``).
+  deterministic ``.tar.gz``, ``.deb`` (``i386``), and ``.rpm`` (``i686``) with
+  ``LICENSE`` and ``THIRD_PARTY.md``.
 - ``--checksums <dir>``: deterministic ``SHA256SUMS.txt`` generator and verifier.
 
 Provenance: Original clean-room Python 3 standard-library release packaging and
@@ -29,6 +31,7 @@ RFC 2083 PNG / Apple ICNS / Windows ICO / SVG icon script (MIT License).
 from __future__ import annotations
 
 import argparse
+import ast
 import gzip
 import hashlib
 import math
@@ -45,6 +48,7 @@ import tarfile
 import tempfile
 import time
 from typing import Dict, List, Optional, Sequence, Tuple
+import unittest
 import xml.etree.ElementTree as ET
 import zipfile
 import zlib
@@ -91,6 +95,40 @@ RELEASE_ARCHIVE_SUFFIXES: Tuple[str, ...] = (
     ".deb",
     ".rpm",
 )
+
+# Runtime libraries loaded via dlopen() by winit/xkbcommon-dl/wayland-sys/ash in ferric-gui.
+GUI_DEB_DEPENDS: Tuple[str, ...] = (
+    "libc6 (>= 2.34)",
+    "libgcc-s1 (>= 3.0)",
+    "libvulkan1",
+    "libxkbcommon0",
+    "libxkbcommon-x11-0",
+    "libx11-6",
+    "libx11-xcb1",
+    "libxcb1",
+    "libxcursor1",
+    "libxi6",
+    "libwayland-client0",
+)
+GUI_DEB_RECOMMENDS: Tuple[str, ...] = ("mesa-vulkan-drivers",)
+GUI_RPM_REQUIRES: Tuple[str, ...] = (
+    "vulkan-loader",
+    "libxkbcommon",
+    "libxkbcommon-x11",
+    "libX11",
+    "libX11-xcb",
+    "libxcb",
+    "libXcursor",
+    "libXi",
+    "libwayland-client",
+)
+GUI_RPM_RECOMMENDS: Tuple[str, ...] = ("mesa-vulkan-drivers",)
+
+
+def _write_text_lf(path: Path, text: str) -> None:
+    """Write UTF-8 text with LF line endings (compatible with Python 3.9+)."""
+    with open(path, "w", encoding="utf-8", newline="\n") as fh:
+        fh.write(text)
 
 
 def read_workspace_version(repo_root: Path) -> str:
@@ -644,7 +682,7 @@ def emit_icon_suite(out_dir: Path) -> Dict[str, Path]:
     svg_text = render_icon_svg()
     validate_svg_text(svg_text)
     svg_path = out_dir / f"{APP_SLUG}.svg"
-    svg_path.write_text(svg_text, encoding="utf-8", newline="\n")
+    _write_text_lf(svg_path, svg_text)
     written["svg"] = svg_path
     return written
 
@@ -1120,10 +1158,9 @@ def _package_macos_bundle(
             shutil.copytree(app_dir, dmg_stage / f"{APP_NAME}.app", symlinks=True)
             os.symlink("/Applications", dmg_stage / "Applications")
             shutil.copyfile(readme_src, dmg_stage / "README.md")
-            (dmg_stage / "CLI_AND_MCP_QUICKSTART.txt").write_text(
+            _write_text_lf(
+                dmg_stage / "CLI_AND_MCP_QUICKSTART.txt",
                 render_cli_and_mcp_quickstart(version, arch_title=arch_title),
-                encoding="utf-8",
-                newline="\n",
             )
             dmg_path = out_dir / f"{prefix}.dmg"
             _create_macos_dmg(f"{APP_NAME} v{version}", dmg_stage, dmg_path)
@@ -1248,10 +1285,8 @@ def render_deb_control(
         f"Installed-Size: {max(1, installed_kib)}",
     ]
     if include_gui:
-        lines.append("Depends: libc6 (>= 2.34), libgcc-s1 (>= 3.0)")
-        lines.append(
-            "Recommends: libvulkan1, mesa-vulkan-drivers, libx11-6, libwayland-client0, libxkbcommon0"
-        )
+        lines.append(f"Depends: {', '.join(GUI_DEB_DEPENDS)}")
+        lines.append(f"Recommends: {', '.join(GUI_DEB_RECOMMENDS)}")
         synopsis = "Open-source GPU-accelerated protein NMR assignment and spectrum workbench"
         ext_desc = (
             " FERRIC provides automated protein NMR backbone/sidechain resonance assignment,\n"
@@ -1318,12 +1353,70 @@ def validate_deb_control(
     if not fields.get("Description") or not saw_continuation:
         raise ValueError("DEBIAN/control Description must include synopsis and extended lines")
     if expect_glibc_dep:
-        deps = fields.get("Depends", "")
-        if "libc6 (>= 2.34)" not in deps:
-            raise ValueError(f"Expected RHEL 9 / glibc 2.34 floor in Depends, got {deps!r}")
+        deps = [tok.strip() for tok in fields.get("Depends", "").split(",") if tok.strip()]
+        for req_dep in GUI_DEB_DEPENDS:
+            if req_dep not in deps:
+                raise ValueError(f"Expected {req_dep!r} in DEBIAN/control Depends, got {deps!r}")
+        recs = [tok.strip() for tok in fields.get("Recommends", "").split(",") if tok.strip()]
+        for rec_dep in GUI_DEB_RECOMMENDS:
+            if rec_dep not in recs:
+                raise ValueError(f"Expected {rec_dep!r} in DEBIAN/control Recommends, got {recs!r}")
     else:
         if "Depends" in fields:
             raise ValueError(f"Static i386 musl CLI .deb must not declare shared Depends, got {fields['Depends']!r}")
+        if "Recommends" in fields:
+            raise ValueError(f"Static i386 musl CLI .deb must not declare GUI Recommends, got {fields['Recommends']!r}")
+
+
+def render_deb_copyright(license_text: str) -> str:
+    """Render Debian policy DEP-5 ``/usr/share/doc/ferric/copyright`` metadata."""
+    cleaned = license_text.strip()
+    if not cleaned:
+        raise ValueError("LICENSE file must not be empty")
+    body_lines = [f" {ln}" if ln.strip() else " ." for ln in cleaned.splitlines()]
+    return "\n".join(
+        [
+            "Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/",
+            f"Upstream-Name: {APP_SLUG}",
+            f"Upstream-Contact: {DEB_MAINTAINER}",
+            f"Source: {PROJECT_URL}",
+            "",
+            "Files: *",
+            "Copyright: 2026 Debashish Sahu",
+            "License: MIT",
+            *body_lines,
+            "Comment: Third-party crate licenses and open scientific data attributions are",
+            f" documented in /usr/share/doc/{APP_SLUG}/THIRD_PARTY.md.",
+        ]
+    ) + "\n"
+
+
+def validate_deb_copyright(copyright_text: str) -> None:
+    """Validate Debian DEP-5 ``copyright`` structure and MIT license text."""
+    if not copyright_text.endswith("\n"):
+        raise ValueError("Debian copyright file must end with a trailing newline")
+    required_lines = (
+        "Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/",
+        f"Upstream-Name: {APP_SLUG}",
+        f"Upstream-Contact: {DEB_MAINTAINER}",
+        f"Source: {PROJECT_URL}",
+        "Files: *",
+        "Copyright: 2026 Debashish Sahu",
+        "License: MIT",
+    )
+    lines = copyright_text.splitlines()
+    for req in required_lines:
+        if req not in lines:
+            raise ValueError(f"Debian copyright missing required DEP-5 line: {req!r}")
+    if "Permission is hereby granted, free of charge" not in copyright_text:
+        raise ValueError("Debian copyright missing MIT permission clause")
+    # Ensure multi-line License block has no unindented blank lines between License: MIT and Comment:
+    lic_idx = lines.index("License: MIT")
+    for ln in lines[lic_idx + 1 :]:
+        if ln.startswith("Comment:"):
+            break
+        if not ln.startswith(" "):
+            raise ValueError(f"Malformed DEP-5 License continuation line: {ln!r}")
 
 
 def render_rpm_spec(
@@ -1335,7 +1428,12 @@ def render_rpm_spec(
     rpm_ver = _rpm_safe_version(version)
     if include_gui:
         summary = "Open-source GPU-accelerated protein NMR assignment and spectrum workbench"
-        extra_header = "Recommends:     vulkan-loader, libxkbcommon, libX11, libwayland-client"
+        extra_header = "\n".join(
+            [
+                f"Requires:       {', '.join(GUI_RPM_REQUIRES)}",
+                f"Recommends:     {', '.join(GUI_RPM_RECOMMENDS)}",
+            ]
+        )
         description = (
             "FERRIC provides automated protein NMR backbone and sidechain resonance\n"
             "assignment, raw Bruker/Varian FID and NUS processing, spin relaxation,\n"
@@ -1351,6 +1449,7 @@ def render_rpm_spec(
                 f"%attr(0644,root,root) /usr/share/icons/hicolor/scalable/apps/{APP_SLUG}.svg",
                 f"%dir /usr/share/doc/{APP_SLUG}",
                 f"%doc /usr/share/doc/{APP_SLUG}/README.md",
+                f"%license /usr/share/doc/{APP_SLUG}/LICENSE",
                 f"%license /usr/share/doc/{APP_SLUG}/THIRD_PARTY.md",
             ]
         )
@@ -1367,6 +1466,7 @@ def render_rpm_spec(
                 f"%attr(0755,root,root) /usr/bin/{CLI_BIN}",
                 f"%dir /usr/share/doc/{APP_SLUG}",
                 f"%doc /usr/share/doc/{APP_SLUG}/README.md",
+                f"%license /usr/share/doc/{APP_SLUG}/LICENSE",
                 f"%license /usr/share/doc/{APP_SLUG}/THIRD_PARTY.md",
             ]
         )
@@ -1404,6 +1504,15 @@ cp -a "{stage_payload.as_posix()}/." %{{buildroot}}/
 """
 
 
+def _parse_rpm_header_list(spec_text: str, prefix: str) -> List[str]:
+    values: List[str] = []
+    for raw_line in spec_text.splitlines():
+        if raw_line.startswith(prefix):
+            rhs = raw_line[len(prefix) :].strip()
+            values.extend(tok.strip() for tok in rhs.split(",") if tok.strip())
+    return values
+
+
 def validate_rpm_spec(spec_text: str, include_gui: bool) -> None:
     """Validate RPM ``.spec`` directives, payload compression, and file ownership rules."""
     for req_directive in (
@@ -1414,13 +1523,24 @@ def validate_rpm_spec(spec_text: str, include_gui: bool) -> None:
         "License:        MIT",
         f"%attr(0755,root,root) /usr/bin/{CLI_BIN}",
         f"%dir /usr/share/doc/{APP_SLUG}",
+        f"%doc /usr/share/doc/{APP_SLUG}/README.md",
+        f"%license /usr/share/doc/{APP_SLUG}/LICENSE",
+        f"%license /usr/share/doc/{APP_SLUG}/THIRD_PARTY.md",
     ):
         if req_directive not in spec_text:
             raise ValueError(f"RPM spec missing required directive: {req_directive!r}")
     for forbidden_dir in ("%dir /usr\n", "%dir /usr/bin\n", "%dir /usr/share/applications\n"):
         if forbidden_dir in spec_text:
             raise ValueError(f"RPM spec must not claim system directory ownership: {forbidden_dir.strip()!r}")
+    reqs = _parse_rpm_header_list(spec_text, "Requires:")
+    recs = _parse_rpm_header_list(spec_text, "Recommends:")
     if include_gui:
+        for req_pkg in GUI_RPM_REQUIRES:
+            if req_pkg not in reqs:
+                raise ValueError(f"Desktop RPM spec missing Requires {req_pkg!r} in {reqs!r}")
+        for rec_pkg in GUI_RPM_RECOMMENDS:
+            if rec_pkg not in recs:
+                raise ValueError(f"Desktop RPM spec missing Recommends {rec_pkg!r} in {recs!r}")
         for gui_entry in (
             f"%attr(0755,root,root) /usr/bin/{GUI_BIN}",
             f"%attr(0644,root,root) /usr/share/applications/{APP_SLUG}.desktop",
@@ -1431,6 +1551,8 @@ def validate_rpm_spec(spec_text: str, include_gui: bool) -> None:
     else:
         if "AutoReqProv:    no" not in spec_text:
             raise ValueError("Static i686 CLI RPM spec must set AutoReqProv: no")
+        if reqs or recs:
+            raise ValueError(f"CLI-only RPM spec must not declare GUI Requires/Recommends: {reqs!r} / {recs!r}")
         if GUI_BIN in spec_text or f"{APP_SLUG}.desktop" in spec_text:
             raise ValueError("CLI-only RPM spec must not reference ferric-gui or ferric.desktop")
 
@@ -1440,6 +1562,7 @@ def _stage_linux_sysroot(
     cli_src: Path,
     readme_src: Path,
     third_party_src: Path,
+    license_src: Path,
     gui_src: Optional[Path] = None,
     desktop_text: Optional[str] = None,
     png_256: Optional[bytes] = None,
@@ -1466,16 +1589,18 @@ def _stage_linux_sysroot(
 
         shutil.copyfile(gui_src, bin_dir / GUI_BIN)
         os.chmod(bin_dir / GUI_BIN, 0o755)
-        (app_dir / f"{APP_SLUG}.desktop").write_text(desktop_text, encoding="utf-8", newline="\n")
+        _write_text_lf(app_dir / f"{APP_SLUG}.desktop", desktop_text)
         (png_dir / f"{APP_SLUG}.png").write_bytes(png_256)
-        (svg_dir / f"{APP_SLUG}.svg").write_text(svg_text, encoding="utf-8", newline="\n")
+        _write_text_lf(svg_dir / f"{APP_SLUG}.svg", svg_text)
         os.chmod(app_dir / f"{APP_SLUG}.desktop", 0o644)
         os.chmod(png_dir / f"{APP_SLUG}.png", 0o644)
         os.chmod(svg_dir / f"{APP_SLUG}.svg", 0o644)
 
     shutil.copyfile(readme_src, doc_dir / "README.md")
+    shutil.copyfile(license_src, doc_dir / "LICENSE")
     shutil.copyfile(third_party_src, doc_dir / "THIRD_PARTY.md")
     os.chmod(doc_dir / "README.md", 0o644)
+    os.chmod(doc_dir / "LICENSE", 0o644)
     os.chmod(doc_dir / "THIRD_PARTY.md", 0o644)
 
     os.chmod(sysroot_dir, 0o755)
@@ -1493,11 +1618,23 @@ def _prepare_deb_tree(
     deb_arch: str,
     include_gui: bool,
 ) -> str:
-    """Copy staged ``/usr`` tree into ``deb_stage`` and emit validated ``DEBIAN/{control,md5sums}``."""
+    """Copy staged ``/usr`` tree into ``deb_stage`` and emit validated ``copyright`` and ``DEBIAN/{control,md5sums}``."""
     mtime = _source_mtime()
     if deb_stage.exists():
         shutil.rmtree(deb_stage)
     shutil.copytree(sysroot_dir, deb_stage)
+
+    doc_dir = deb_stage / "usr" / "share" / "doc" / APP_SLUG
+    license_path = doc_dir / "LICENSE"
+    if not license_path.is_file():
+        raise FileNotFoundError(f"Expected staged LICENSE at {license_path}")
+    copyright_text = render_deb_copyright(license_path.read_text(encoding="utf-8"))
+    validate_deb_copyright(copyright_text)
+    copyright_path = doc_dir / "copyright"
+    _write_text_lf(copyright_path, copyright_text)
+    os.chmod(copyright_path, 0o644)
+    os.utime(copyright_path, (mtime, mtime))
+    os.utime(doc_dir, (mtime, mtime))
 
     payload_files = sorted(
         (p for p in deb_stage.rglob("*") if p.is_file()),
@@ -1518,12 +1655,12 @@ def _prepare_deb_tree(
     )
     validate_deb_control(control_text, expected_arch=deb_arch, expect_glibc_dep=include_gui)
     control_path = debian_dir / "control"
-    control_path.write_text(control_text, encoding="utf-8", newline="\n")
+    _write_text_lf(control_path, control_text)
     os.chmod(control_path, 0o644)
 
     md5_lines = [f"{_md5_file(p)}  {p.relative_to(deb_stage).as_posix()}" for p in payload_files]
     md5_path = debian_dir / "md5sums"
-    md5_path.write_text("\n".join(md5_lines) + "\n", encoding="utf-8", newline="\n")
+    _write_text_lf(md5_path, "\n".join(md5_lines) + "\n")
     os.chmod(md5_path, 0o644)
 
     os.chmod(deb_stage, 0o755)
@@ -1577,7 +1714,7 @@ def _build_rpm_package(
     spec_text = render_rpm_spec(version=version, stage_payload=sysroot_dir, include_gui=include_gui)
     validate_rpm_spec(spec_text, include_gui=include_gui)
     spec_path = rpm_top / "SPECS" / f"{APP_SLUG}.spec"
-    spec_path.write_text(spec_text, encoding="utf-8", newline="\n")
+    _write_text_lf(spec_path, spec_text)
 
     if not shutil.which("rpmbuild"):
         raise RuntimeError(
@@ -1622,6 +1759,7 @@ def package_linux_x86_64(
     gui_src = _require_binary(bin_dir, GUI_BIN)
     cli_src = _require_binary(bin_dir, CLI_BIN)
     readme_src = repo_root / "README.md"
+    license_src = repo_root / "LICENSE"
     third_party_src = repo_root / "THIRD_PARTY.md"
 
     png_256 = generate_icon_pngs((256,))[256]
@@ -1651,15 +1789,16 @@ def package_linux_x86_64(
         os.chmod(bin_stage / GUI_BIN, 0o755)
         os.chmod(bin_stage / CLI_BIN, 0o755)
 
-        (app_stage / f"{APP_SLUG}.desktop").write_text(desktop_text, encoding="utf-8", newline="\n")
-        (svg_stage / f"{APP_SLUG}.svg").write_text(svg_text, encoding="utf-8", newline="\n")
+        _write_text_lf(app_stage / f"{APP_SLUG}.desktop", desktop_text)
+        _write_text_lf(svg_stage / f"{APP_SLUG}.svg", svg_text)
         (png_stage / f"{APP_SLUG}.png").write_bytes(png_256)
 
         installer_path = stage / "install-desktop.sh"
-        installer_path.write_text(render_linux_install_desktop_sh(), encoding="utf-8", newline="\n")
+        _write_text_lf(installer_path, render_linux_install_desktop_sh())
         os.chmod(installer_path, 0o755)
 
         shutil.copyfile(readme_src, stage / "README.md")
+        shutil.copyfile(license_src, stage / "LICENSE")
         shutil.copyfile(third_party_src, stage / "THIRD_PARTY.md")
 
         _write_deterministic_tar_gz(
@@ -1680,6 +1819,7 @@ def package_linux_x86_64(
             cli_src=cli_src,
             readme_src=readme_src,
             third_party_src=third_party_src,
+            license_src=license_src,
             gui_src=gui_src,
             desktop_text=desktop_text,
             png_256=png_256,
@@ -1729,6 +1869,7 @@ def package_linux_i686_cli(
     """Build deterministic ``.tar.gz``, ``.deb`` (``i386``), and ``.rpm`` (``i686``) for ``linux-i686-cli``."""
     cli_src = _require_binary(bin_dir, CLI_BIN)
     readme_src = repo_root / "README.md"
+    license_src = repo_root / "LICENSE"
     third_party_src = repo_root / "THIRD_PARTY.md"
 
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -1745,6 +1886,7 @@ def package_linux_i686_cli(
         shutil.copyfile(cli_src, bin_stage / CLI_BIN)
         os.chmod(bin_stage / CLI_BIN, 0o755)
         shutil.copyfile(readme_src, stage / "README.md")
+        shutil.copyfile(license_src, stage / "LICENSE")
         shutil.copyfile(third_party_src, stage / "THIRD_PARTY.md")
 
         _write_deterministic_tar_gz(
@@ -1761,6 +1903,7 @@ def package_linux_i686_cli(
             cli_src=cli_src,
             readme_src=readme_src,
             third_party_src=third_party_src,
+            license_src=license_src,
             gui_src=None,
         )
         deb_stage = tmp_path / "deb_i686"
@@ -1835,7 +1978,7 @@ def write_checksums(target_dir: Path) -> Path:
             raise ValueError(f"Release archive is empty (0 bytes): {arc}")
         lines.append(f"{_sha256_file(arc)}  {arc.name}")
     out_file = target_dir / "SHA256SUMS.txt"
-    out_file.write_text("\n".join(lines) + "\n", encoding="utf-8", newline="\n")
+    _write_text_lf(out_file, "\n".join(lines) + "\n")
     return out_file
 
 
@@ -1871,7 +2014,7 @@ def _build_mock_binaries(mock_bin_dir: Path, macos_arch: Optional[str] = None) -
     if sys.platform == "darwin" and shutil.which("cc"):
         c_src = mock_bin_dir / "_stub.c"
         out_macho = mock_bin_dir / "_stub_bin"
-        c_src.write_text("int main(void) { return 0; }\n", encoding="utf-8")
+        _write_text_lf(c_src, "int main(void) { return 0; }\n")
         cc_cmd = ["cc", "-O2"]
         if macos_arch is not None:
             cc_cmd.extend(["-arch", macos_arch])
@@ -1958,12 +2101,145 @@ def _verify_macos_self_test_bundle(
         subprocess.run(["hdiutil", "imageinfo", str(mac_dmg)], check=True, capture_output=True, text=True)
 
 
+class PackageReleaseUnitTests(unittest.TestCase):
+    """Unit tests for Python 3.9 compatibility and Linux RPM/DEB metadata generation."""
+
+    def setUp(self) -> None:
+        self.repo_root = Path(__file__).resolve().parent.parent
+        self.version = read_workspace_version(self.repo_root)
+        self.license_text = (self.repo_root / "LICENSE").read_text(encoding="utf-8")
+
+    def test_python39_compatibility_ast(self) -> None:
+        src = Path(__file__).read_text(encoding="utf-8")
+        tree = ast.parse(src)
+        bad_nodes = [
+            type(node).__name__
+            for node in ast.walk(tree)
+            if type(node).__name__ in ("Match", "MatchValue", "MatchAs", "TryStar")
+        ]
+        self.assertEqual(bad_nodes, [], f"Found Python 3.10+ AST syntax: {bad_nodes}")
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call):
+                if isinstance(node.func, ast.Attribute) and node.func.attr == "write_text":
+                    self.fail(f"Found forbidden Path.write_text() call at line {node.lineno}")
+                for kw in node.keywords:
+                    if kw.arg == "strict":
+                        self.fail(f"Found Python 3.10+ zip(..., strict=) at line {node.lineno}")
+
+    def test_write_text_lf_helper(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / "sample.txt"
+            _write_text_lf(p, "alpha\nbeta\n")
+            self.assertEqual(p.read_bytes(), b"alpha\nbeta\n")
+
+    def test_rpm_spec_gui_requires_and_recommends(self) -> None:
+        spec = render_rpm_spec(
+            version=self.version,
+            stage_payload=Path("/tmp/ferric-stage"),
+            include_gui=True,
+        )
+        validate_rpm_spec(spec, include_gui=True)
+        reqs = _parse_rpm_header_list(spec, "Requires:")
+        recs = _parse_rpm_header_list(spec, "Recommends:")
+        for pkg in GUI_RPM_REQUIRES:
+            self.assertIn(pkg, reqs)
+        self.assertIn("mesa-vulkan-drivers", recs)
+        self.assertIn(f"%license /usr/share/doc/{APP_SLUG}/LICENSE", spec)
+        self.assertIn(f"%license /usr/share/doc/{APP_SLUG}/THIRD_PARTY.md", spec)
+        with self.assertRaises(ValueError):
+            validate_rpm_spec(spec.replace("vulkan-loader, ", ""), include_gui=True)
+        with self.assertRaises(ValueError):
+            validate_rpm_spec(spec.replace("mesa-vulkan-drivers", "other-pkg"), include_gui=True)
+        with self.assertRaises(ValueError):
+            validate_rpm_spec(spec.replace(f"%license /usr/share/doc/{APP_SLUG}/LICENSE\n", ""), include_gui=True)
+
+    def test_rpm_spec_cli_only(self) -> None:
+        spec = render_rpm_spec(
+            version=self.version,
+            stage_payload=Path("/tmp/ferric-cli-stage"),
+            include_gui=False,
+        )
+        validate_rpm_spec(spec, include_gui=False)
+        self.assertIn("AutoReqProv:    no", spec)
+        self.assertEqual(_parse_rpm_header_list(spec, "Requires:"), [])
+        self.assertEqual(_parse_rpm_header_list(spec, "Recommends:"), [])
+        self.assertIn(f"%license /usr/share/doc/{APP_SLUG}/LICENSE", spec)
+
+    def test_deb_control_gui_depends_and_recommends(self) -> None:
+        ctrl = render_deb_control(
+            version=self.version,
+            deb_arch="amd64",
+            installed_kib=4096,
+            include_gui=True,
+        )
+        validate_deb_control(ctrl, expected_arch="amd64", expect_glibc_dep=True)
+        for pkg in GUI_DEB_DEPENDS:
+            self.assertIn(pkg, ctrl)
+        self.assertIn("Recommends: mesa-vulkan-drivers", ctrl)
+        with self.assertRaises(ValueError):
+            validate_deb_control(ctrl.replace(", libxkbcommon0", ""), expected_arch="amd64", expect_glibc_dep=True)
+        with self.assertRaises(ValueError):
+            validate_deb_control(ctrl.replace("mesa-vulkan-drivers", "other-pkg"), expected_arch="amd64", expect_glibc_dep=True)
+
+    def test_deb_control_cli_only(self) -> None:
+        ctrl = render_deb_control(
+            version=self.version,
+            deb_arch="i386",
+            installed_kib=2048,
+            include_gui=False,
+        )
+        validate_deb_control(ctrl, expected_arch="i386", expect_glibc_dep=False)
+        self.assertNotIn("Depends:", ctrl)
+        self.assertNotIn("Recommends:", ctrl)
+
+    def test_deb_copyright_generation_and_staging(self) -> None:
+        copyright_text = render_deb_copyright(self.license_text)
+        validate_deb_copyright(copyright_text)
+        with self.assertRaises(ValueError):
+            render_deb_copyright("   \n")
+        with self.assertRaises(ValueError):
+            validate_deb_copyright("License: MIT\n")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            cli_stub = tmp_path / CLI_BIN
+            cli_stub.write_bytes(b"#!/bin/sh\necho ferric\n")
+            os.chmod(cli_stub, 0o755)
+            sysroot = tmp_path / "sysroot"
+            deb_stage = tmp_path / "deb_stage"
+            _stage_linux_sysroot(
+                sysroot_dir=sysroot,
+                cli_src=cli_stub,
+                readme_src=self.repo_root / "README.md",
+                third_party_src=self.repo_root / "THIRD_PARTY.md",
+                license_src=self.repo_root / "LICENSE",
+                gui_src=None,
+            )
+            _prepare_deb_tree(
+                deb_stage=deb_stage,
+                sysroot_dir=sysroot,
+                version=self.version,
+                deb_arch="i386",
+                include_gui=False,
+            )
+            staged_license = deb_stage / "usr" / "share" / "doc" / APP_SLUG / "LICENSE"
+            staged_copyright = deb_stage / "usr" / "share" / "doc" / APP_SLUG / "copyright"
+            self.assertTrue(staged_license.is_file())
+            self.assertTrue(staged_copyright.is_file())
+            self.assertEqual(staged_license.read_bytes(), (self.repo_root / "LICENSE").read_bytes())
+            validate_deb_copyright(staged_copyright.read_text(encoding="utf-8"))
+            md5sums = (deb_stage / "DEBIAN" / "md5sums").read_text(encoding="utf-8")
+            self.assertIn(f"usr/share/doc/{APP_SLUG}/LICENSE", md5sums)
+            self.assertIn(f"usr/share/doc/{APP_SLUG}/copyright", md5sums)
+
+
 def run_self_test(repo_root: Path) -> int:
     """Exercise icon encoders, all 5 platform packagers, .deb/.rpm metadata, and SHA256SUMS."""
     version = read_workspace_version(repo_root)
     is_macos_dmg_capable = sys.platform == "darwin" and bool(shutil.which("hdiutil"))
     has_dpkg_deb = bool(shutil.which("dpkg-deb"))
     has_rpmbuild = bool(shutil.which("rpmbuild"))
+    expected_license_bytes = (repo_root / "LICENSE").read_bytes()
 
     with tempfile.TemporaryDirectory() as tmp:
         tmp_path = Path(tmp)
@@ -1978,7 +2254,7 @@ def run_self_test(repo_root: Path) -> int:
             if p1.read_bytes() != emitted_2[key].read_bytes():
                 raise AssertionError(f"Non-deterministic icon output for {key}")
         print(
-            f"[self-test 1/7] Icon suite OK: PNGs (16,32,48,64,128,256,512), "
+            f"[self-test 1/8] Icon suite OK: PNGs (16,32,48,64,128,256,512), "
             f"ICNS ({emitted['icns'].stat().st_size} B), "
             f"ICO ({emitted['ico'].stat().st_size} B), "
             f"SVG ({emitted['svg'].stat().st_size} B)"
@@ -2006,7 +2282,7 @@ def run_self_test(repo_root: Path) -> int:
             is_macos_dmg_capable=is_macos_dmg_capable,
         )
         print(
-            f"[self-test 2/7] macos-arm64 OK: {[p.name for p in mac_arm_outputs]} "
+            f"[self-test 2/8] macos-arm64 OK: {[p.name for p in mac_arm_outputs]} "
             f"(Info.plist + PkgInfo + 0755 binaries"
             f"{' + arm64 lipo + codesign + UDZO .dmg' if is_macos_dmg_capable else ''})"
         )
@@ -2027,7 +2303,7 @@ def run_self_test(repo_root: Path) -> int:
             is_macos_dmg_capable=is_macos_dmg_capable,
         )
         print(
-            f"[self-test 3/7] macos-x86_64 OK: {[p.name for p in mac_x64_outputs]} "
+            f"[self-test 3/8] macos-x86_64 OK: {[p.name for p in mac_x64_outputs]} "
             f"(Info.plist + PkgInfo + 0755 binaries"
             f"{' + x86_64 lipo + codesign + UDZO .dmg' if is_macos_dmg_capable else ''})"
         )
@@ -2055,7 +2331,7 @@ def run_self_test(repo_root: Path) -> int:
         win_repeat = package_windows_x86_64(repo_root, mock_bins_arm64, win_repeat_dir, version)[0]
         if win_zip.read_bytes() != win_repeat.read_bytes():
             raise AssertionError("Windows .zip output is not byte-for-byte deterministic")
-        print(f"[self-test 4/7] windows-x86_64 OK: {win_zip.name} ({win_zip.stat().st_size} B, deterministic)")
+        print(f"[self-test 4/8] windows-x86_64 OK: {win_zip.name} ({win_zip.stat().st_size} B, deterministic)")
 
         # 5. Linux x86_64 .tar.gz + .deb/.rpm metadata (and live .deb/.rpm when tools exist) + XDG installer
         lin_outputs = package_linux_x86_64(
@@ -2086,10 +2362,15 @@ def run_self_test(repo_root: Path) -> int:
                 f"{lin_prefix}/share/icons/hicolor/scalable/apps/{APP_SLUG}.svg",
                 f"{lin_prefix}/share/icons/hicolor/256x256/apps/{APP_SLUG}.png",
                 f"{lin_prefix}/README.md",
+                f"{lin_prefix}/LICENSE",
                 f"{lin_prefix}/THIRD_PARTY.md",
             ):
                 if req_file not in members:
                     raise AssertionError(f"Missing {req_file} in Linux .tar.gz")
+            lic_member = tf.extractfile(members[f"{lin_prefix}/LICENSE"])
+            assert lic_member is not None
+            if lic_member.read() != expected_license_bytes:
+                raise AssertionError("LICENSE content mismatch in Linux .tar.gz")
             desktop_member = tf.extractfile(members[f"{lin_prefix}/share/applications/{APP_SLUG}.desktop"])
             assert desktop_member is not None
             validate_desktop_entry(desktop_member.read().decode("utf-8"))
@@ -2109,7 +2390,7 @@ def run_self_test(repo_root: Path) -> int:
                 legacy_png_128 = xdg_prefix / "share" / "icons" / "hicolor" / "128x128" / "apps" / "nmr-assign.png"
                 for lp in (legacy_alias, legacy_bin, legacy_desktop, legacy_svg, legacy_png_256, legacy_png_128):
                     lp.parent.mkdir(parents=True, exist_ok=True)
-                    lp.write_text("legacy-v0.13-v0.14\n", encoding="utf-8")
+                    _write_text_lf(lp, "legacy-v0.13-v0.14\n")
 
                 subprocess.run(
                     ["bash", str(extract_dir / lin_prefix / "install-desktop.sh"), "--prefix", str(xdg_prefix)],
@@ -2132,13 +2413,18 @@ def run_self_test(repo_root: Path) -> int:
             lin_deb = dist_dir / f"{lin_prefix}.deb"
             info_out = subprocess.check_output(["dpkg-deb", "--info", str(lin_deb)], text=True)
             contents_out = subprocess.check_output(["dpkg-deb", "--contents", str(lin_deb)], text=True)
-            if "Architecture: amd64" not in info_out or "libc6 (>= 2.34)" not in info_out:
+            if "Architecture: amd64" not in info_out:
                 raise AssertionError(f"Unexpected linux-x86_64 .deb metadata: {info_out}")
+            for req_dep in GUI_DEB_DEPENDS + GUI_DEB_RECOMMENDS:
+                if req_dep not in info_out:
+                    raise AssertionError(f"Missing {req_dep!r} in linux-x86_64 .deb metadata: {info_out}")
             for req_deb_path in (
                 "./usr/bin/ferric",
                 "./usr/bin/ferric-gui",
                 "./usr/share/applications/ferric.desktop",
                 "./usr/share/icons/hicolor/256x256/apps/ferric.png",
+                f"./usr/share/doc/{APP_SLUG}/LICENSE",
+                f"./usr/share/doc/{APP_SLUG}/copyright",
             ):
                 if req_deb_path not in contents_out:
                     raise AssertionError(f"Missing {req_deb_path} in linux-x86_64 .deb")
@@ -2146,11 +2432,20 @@ def run_self_test(repo_root: Path) -> int:
         if has_rpmbuild and shutil.which("rpm"):
             lin_rpm = dist_dir / f"{lin_prefix}.rpm"
             rpm_out = subprocess.check_output(["rpm", "-qp", "--info", "--list", str(lin_rpm)], text=True)
+            rpm_reqs = subprocess.check_output(["rpm", "-qp", "--requires", str(lin_rpm)], text=True)
+            rpm_recs = subprocess.check_output(["rpm", "-qp", "--recommends", str(lin_rpm)], text=True)
+            for req_pkg in GUI_RPM_REQUIRES:
+                if req_pkg not in rpm_reqs:
+                    raise AssertionError(f"Missing {req_pkg!r} in linux-x86_64 .rpm Requires: {rpm_reqs}")
+            for rec_pkg in GUI_RPM_RECOMMENDS:
+                if rec_pkg not in rpm_recs:
+                    raise AssertionError(f"Missing {rec_pkg!r} in linux-x86_64 .rpm Recommends: {rpm_recs}")
             for req_rpm_path in (
                 "/usr/bin/ferric",
                 "/usr/bin/ferric-gui",
                 "/usr/share/applications/ferric.desktop",
                 "/usr/share/icons/hicolor/256x256/apps/ferric.png",
+                f"/usr/share/doc/{APP_SLUG}/LICENSE",
             ):
                 if req_rpm_path not in rpm_out:
                     raise AssertionError(f"Missing {req_rpm_path} in linux-x86_64 .rpm")
@@ -2162,8 +2457,8 @@ def run_self_test(repo_root: Path) -> int:
         if lin_tar.read_bytes() != lin_repeat.read_bytes():
             raise AssertionError("Linux x86_64 .tar.gz output is not byte-for-byte deterministic")
         print(
-            f"[self-test 5/7] linux-x86_64 OK: {[p.name for p in lin_outputs]} "
-            f"(deterministic .tar.gz + validated amd64/x86_64 .deb/.rpm specs)"
+            f"[self-test 5/8] linux-x86_64 OK: {[p.name for p in lin_outputs]} "
+            f"(deterministic .tar.gz + LICENSE/copyright + validated amd64/x86_64 .deb/.rpm specs)"
         )
 
         # 6. Linux i686 static CLI-only .tar.gz + .deb/.rpm metadata (without ferric-gui!)
@@ -2192,7 +2487,7 @@ def run_self_test(repo_root: Path) -> int:
             ):
                 if forbidden in members:
                     raise AssertionError(f"CLI-only i686 archive must not include {forbidden}")
-            for req_doc in (f"{i686_prefix}/README.md", f"{i686_prefix}/THIRD_PARTY.md"):
+            for req_doc in (f"{i686_prefix}/README.md", f"{i686_prefix}/LICENSE", f"{i686_prefix}/THIRD_PARTY.md"):
                 if req_doc not in members:
                     raise AssertionError(f"Missing {req_doc} in linux-i686-cli .tar.gz")
 
@@ -2202,13 +2497,16 @@ def run_self_test(repo_root: Path) -> int:
             contents_out = subprocess.check_output(["dpkg-deb", "--contents", str(i686_deb)], text=True)
             if "Architecture: i386" not in info_out:
                 raise AssertionError(f"Expected Architecture: i386 in i686 .deb: {info_out}")
+            for req_deb_doc in (f"./usr/share/doc/{APP_SLUG}/LICENSE", f"./usr/share/doc/{APP_SLUG}/copyright"):
+                if req_deb_doc not in contents_out:
+                    raise AssertionError(f"Missing {req_deb_doc} in i686 CLI .deb: {contents_out}")
             if "./usr/bin/ferric" not in contents_out or "ferric-gui" in contents_out:
                 raise AssertionError(f"Unexpected contents in i686 CLI .deb: {contents_out}")
 
         if has_rpmbuild and shutil.which("rpm"):
             i686_rpm = dist_dir / f"{i686_prefix}.rpm"
             rpm_out = subprocess.check_output(["rpm", "-qp", "--info", "--list", str(i686_rpm)], text=True)
-            if "/usr/bin/ferric" not in rpm_out or "ferric-gui" in rpm_out:
+            if "/usr/bin/ferric" not in rpm_out or f"/usr/share/doc/{APP_SLUG}/LICENSE" not in rpm_out or "ferric-gui" in rpm_out:
                 raise AssertionError(f"Unexpected contents in i686 CLI .rpm: {rpm_out}")
 
         i686_repeat_dir = tmp_path / "i686_repeat"
@@ -2223,7 +2521,8 @@ def run_self_test(repo_root: Path) -> int:
             shim_dir = tmp_path / "pkg_shims"
             shim_dir.mkdir(parents=True, exist_ok=True)
             dpkg_shim = shim_dir / "dpkg-deb"
-            dpkg_shim.write_text(
+            _write_text_lf(
+                dpkg_shim,
                 "#!/usr/bin/env bash\n"
                 "set -euo pipefail\n"
                 'test "$1" = "-Zxz"\n'
@@ -2231,13 +2530,15 @@ def run_self_test(repo_root: Path) -> int:
                 'test "$3" = "--root-owner-group"\n'
                 'test -f "$4/DEBIAN/control"\n'
                 'test -f "$4/DEBIAN/md5sums"\n'
+                f'test -f "$4/usr/share/doc/{APP_SLUG}/LICENSE"\n'
+                f'test -f "$4/usr/share/doc/{APP_SLUG}/copyright"\n'
+                f'grep -q "usr/share/doc/{APP_SLUG}/copyright" "$4/DEBIAN/md5sums"\n'
                 'printf "!<arch>\\ndebian-binary   mock\\n" > "$5"\n',
-                encoding="utf-8",
-                newline="\n",
             )
             os.chmod(dpkg_shim, 0o755)
             rpm_shim = shim_dir / "rpmbuild"
-            rpm_shim.write_text(
+            _write_text_lf(
+                rpm_shim,
                 "#!/usr/bin/env bash\n"
                 "set -euo pipefail\n"
                 'test "$1" = "-bb"\n'
@@ -2246,10 +2547,9 @@ def run_self_test(repo_root: Path) -> int:
                 'test "$4" = "--define"\n'
                 'TOPDIR="${5#_topdir }"\n'
                 'test -f "$6"\n'
+                f'grep -q "/usr/share/doc/{APP_SLUG}/LICENSE" "$6"\n'
                 'mkdir -p "${TOPDIR}/RPMS/${ARCH}"\n'
                 'printf "\\xed\\xab\\xee\\xdbmock-rpm" > "${TOPDIR}/RPMS/${ARCH}/ferric-mock.${ARCH}.rpm"\n',
-                encoding="utf-8",
-                newline="\n",
             )
             os.chmod(rpm_shim, 0o755)
             old_path = os.environ.get("PATH", "")
@@ -2278,8 +2578,8 @@ def run_self_test(repo_root: Path) -> int:
                 os.environ["PATH"] = old_path
 
         print(
-            f"[self-test 6/7] linux-i686-cli OK: {[p.name for p in i686_outputs]} "
-            f"(CLI-only deterministic .tar.gz + validated i386/i686 .deb/.rpm specs)"
+            f"[self-test 6/8] linux-i686-cli OK: {[p.name for p in i686_outputs]} "
+            f"(CLI-only deterministic .tar.gz + LICENSE/copyright + validated i386/i686 .deb/.rpm specs)"
         )
 
         # 7. Checksum generation & tamper detection (including .deb and .rpm suffixes)
@@ -2318,8 +2618,21 @@ def run_self_test(repo_root: Path) -> int:
             raise AssertionError("verify_checksums failed to detect archive byte corruption")
         verify_checksums(dist_dir)
         print(
-            f"[self-test 7/7] SHA256SUMS.txt OK: {len(verified)} archives verified "
+            f"[self-test 7/8] SHA256SUMS.txt OK: {len(verified)} archives verified "
             f"({sums_file.stat().st_size} B, all 5 suffixes indexed) + tamper rejection confirmed"
+        )
+
+        # 8. Python 3.9 compatibility & Linux RPM/DEB metadata unit tests
+        from io import StringIO
+
+        unit_stream = StringIO()
+        suite = unittest.defaultTestLoader.loadTestsFromTestCase(PackageReleaseUnitTests)
+        unit_result = unittest.TextTestRunner(stream=unit_stream, verbosity=1).run(suite)
+        if not unit_result.wasSuccessful():
+            raise AssertionError(f"Unit tests failed:\n{unit_stream.getvalue()}")
+        print(
+            f"[self-test 8/8] Python 3.9 & RPM/DEB metadata unit tests OK: "
+            f"{unit_result.testsRun} tests passed"
         )
 
     print(f"ALL SELF-TESTS PASSED ({APP_NAME} v{version})")
