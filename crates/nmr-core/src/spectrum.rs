@@ -808,17 +808,94 @@ pub fn read_bruker_pdata_2d_with_warnings(
         );
     }
     let mut warnings = Vec::new();
-    if let Some(a1) = read_sibling_bruker_acqu_params(&dir, "acqus", "acqu") {
-        if let Some(w) = reconcile_bruker_proc_axis_with_acqu(&mut spec.axis_x, &p1, &a1, "X/F2") {
+    let a1 = read_sibling_bruker_acqu_params(&dir, "acqus", "acqu");
+    if let Some(ref a1_map) = a1 {
+        if let Some(w) = reconcile_bruker_proc_axis_with_acqu(&mut spec.axis_x, &p1, a1_map, "X/F2")
+        {
             warnings.push(w);
         }
     }
-    if let Some(a2) = read_sibling_bruker_acqu_params(&dir, "acqu2s", "acqu2") {
-        if let Some(w) = reconcile_bruker_proc_axis_with_acqu(&mut spec.axis_y, &p2, &a2, "Y/F1") {
+    let a2 = read_sibling_bruker_acqu_params(&dir, "acqu2s", "acqu2");
+    if let Some(ref a2_map) = a2 {
+        if let Some(w) = reconcile_bruker_proc_axis_with_acqu(&mut spec.axis_y, &p2, a2_map, "Y/F1")
+        {
             warnings.push(w);
+        }
+    }
+    let exp_2d = infer_2d_exp_for_axis_check(&spec, a1.as_ref());
+    for (idx, (ax, fallback, pmap, amap)) in [
+        (&spec.axis_x, "X/F2", &p1, a1.as_ref()),
+        (&spec.axis_y, "Y/F1", &p2, a2.as_ref()),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let lbl = if ax.label.is_empty() {
+            fallback
+        } else {
+            ax.label.as_str()
+        };
+        let sf_eq_bf = bruker_proc_sf_equals_acqu_bf(pmap, amap);
+        if let Some(w) = check_axis_shift_window(
+            idx,
+            2,
+            lbl,
+            &ax.label,
+            ax.min_ppm(),
+            ax.max_ppm(),
+            &exp_2d,
+            sf_eq_bf,
+        ) {
+            warnings.push(w.message);
         }
     }
     Ok((spec, warnings))
+}
+
+fn bruker_proc_sf_equals_acqu_bf(
+    pmap: &HashMap<String, String>,
+    amap: Option<&HashMap<String, String>>,
+) -> Option<bool> {
+    let sf = pmap
+        .get("SF")
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|v| v.is_finite() && *v > 1.0)?;
+    let bf1 = amap?
+        .get("BF1")
+        .or_else(|| amap?.get("SFO1"))
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|v| v.is_finite() && *v > 1.0)?;
+    Some((sf - bf1).abs() <= 1e-4 * bf1)
+}
+
+fn infer_2d_exp_for_axis_check(
+    spec: &Spectrum2D,
+    acqus: Option<&HashMap<String, String>>,
+) -> String {
+    if expected_axis_shift_window(&spec.name, 0, 2, &spec.axis_x.label).is_some()
+        || expected_axis_shift_window(&spec.name, 1, 2, &spec.axis_y.label).is_some()
+    {
+        return spec.name.clone();
+    }
+    let pp = acqus
+        .and_then(|m| m.get("PULPROG"))
+        .map(|s| s.to_ascii_lowercase())
+        .unwrap_or_default();
+    let nx = canonical_sanity_nucleus(&spec.axis_x.label);
+    let ny = canonical_sanity_nucleus(&spec.axis_y.label);
+    if nx == "13C" && ny == "15N" {
+        return "CON2D".to_string();
+    }
+    if nx == "13C" && ny == "13C" && pp.contains("caco") {
+        return "CACO2D".to_string();
+    }
+    if nx == "1H" && ny == "15N" {
+        return "N15HSQC".to_string();
+    }
+    if nx == "1H" && ny == "13C" {
+        return "C13HSQC".to_string();
+    }
+    spec.name.clone()
 }
 
 /// Read a Bruker TopSpin 2D processed directory (containing `procs`, `proc2s`, and `2rr`, or its parent `<expno>`).
@@ -1040,19 +1117,52 @@ pub fn read_bruker_pdata_3d_with_warnings(
     let p2 = parse_jcamp_params(&proc2s_txt);
     let p3 = parse_jcamp_params(&proc3s_txt);
     let mut warnings = Vec::new();
-    if let Some(a1) = read_sibling_bruker_acqu_params(&dir, "acqus", "acqu") {
-        if let Some(w) = reconcile_bruker_proc_axis_with_acqu(&mut spec.axis_x, &p1, &a1, "X/F3") {
+    let a1 = read_sibling_bruker_acqu_params(&dir, "acqus", "acqu");
+    if let Some(ref a1_map) = a1 {
+        if let Some(w) = reconcile_bruker_proc_axis_with_acqu(&mut spec.axis_x, &p1, a1_map, "X/F3")
+        {
             warnings.push(w);
         }
     }
-    if let Some(a2) = read_sibling_bruker_acqu_params(&dir, "acqu2s", "acqu2") {
-        if let Some(w) = reconcile_bruker_proc_axis_with_acqu(&mut spec.axis_y, &p2, &a2, "Y/F2") {
+    let a2 = read_sibling_bruker_acqu_params(&dir, "acqu2s", "acqu2");
+    if let Some(ref a2_map) = a2 {
+        if let Some(w) = reconcile_bruker_proc_axis_with_acqu(&mut spec.axis_y, &p2, a2_map, "Y/F2")
+        {
             warnings.push(w);
         }
     }
-    if let Some(a3) = read_sibling_bruker_acqu_params(&dir, "acqu3s", "acqu3") {
-        if let Some(w) = reconcile_bruker_proc_axis_with_acqu(&mut spec.axis_z, &p3, &a3, "Z/F1") {
+    let a3 = read_sibling_bruker_acqu_params(&dir, "acqu3s", "acqu3");
+    if let Some(ref a3_map) = a3 {
+        if let Some(w) = reconcile_bruker_proc_axis_with_acqu(&mut spec.axis_z, &p3, a3_map, "Z/F1")
+        {
             warnings.push(w);
+        }
+    }
+    for (idx, (ax, fallback, pmap, amap)) in [
+        (&spec.axis_x, "X/F3", &p1, a1.as_ref()),
+        (&spec.axis_y, "Y/F2", &p2, a2.as_ref()),
+        (&spec.axis_z, "Z/F1", &p3, a3.as_ref()),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let lbl = if ax.label.is_empty() {
+            fallback
+        } else {
+            ax.label.as_str()
+        };
+        let sf_eq_bf = bruker_proc_sf_equals_acqu_bf(pmap, amap);
+        if let Some(w) = check_axis_shift_window(
+            idx,
+            3,
+            lbl,
+            &ax.label,
+            ax.min_ppm(),
+            ax.max_ppm(),
+            &spec.exp,
+            sf_eq_bf,
+        ) {
+            warnings.push(w.message);
         }
     }
     Ok((spec, warnings))
@@ -1281,7 +1391,11 @@ pub fn read_nmrpipe_2d(path: impl AsRef<Path>) -> Result<Spectrum2D, String> {
         .file_name()
         .and_then(|s| s.to_str())
         .unwrap_or("nmrpipe.ft2");
-    read_nmrpipe_2d_from_bytes(name, &bytes)
+    let spec = read_nmrpipe_2d_from_bytes(name, &bytes)?;
+    for w in check_spectrum2d_axis_ranges(&spec, None) {
+        eprintln!("[nmr-core::spectrum warning] {}", w.message);
+    }
+    Ok(spec)
 }
 
 /// Write an NMRPipe 2D spectrum (`.ft2`) with complete frequency referencing.
@@ -1392,7 +1506,11 @@ pub fn read_nmrpipe_3d(path: impl AsRef<Path>, exp: &str) -> Result<Spectrum3D, 
         .file_name()
         .and_then(|s| s.to_str())
         .unwrap_or("nmrpipe.ft3");
-    read_nmrpipe_3d_from_bytes(name, exp, &bytes)
+    let spec = read_nmrpipe_3d_from_bytes(name, exp, &bytes)?;
+    for w in check_spectrum3d_axis_ranges(&spec, None) {
+        eprintln!("[nmr-core::spectrum warning] {}", w.message);
+    }
+    Ok(spec)
 }
 
 /// Write a single-stream NMRPipe 3D file (`.ft3`) with complete frequency referencing.
@@ -1781,7 +1899,11 @@ pub fn read_ucsf_2d(path: impl AsRef<Path>) -> Result<Spectrum2D, String> {
         .file_name()
         .and_then(|s| s.to_str())
         .unwrap_or("spectrum.ucsf");
-    read_ucsf_2d_from_reader(name, total_len, reader)
+    let spec = read_ucsf_2d_from_reader(name, total_len, reader)?;
+    for w in check_spectrum2d_axis_ranges(&spec, None) {
+        eprintln!("[nmr-core::spectrum warning] {}", w.message);
+    }
+    Ok(spec)
 }
 
 /// Write a 2D UCSF Sparky spectrum (`.ucsf`) using standard tile sizes (`64 x 256` capped to axis size).
@@ -2019,7 +2141,11 @@ pub fn read_ucsf_3d(path: impl AsRef<Path>, exp: &str) -> Result<Spectrum3D, Str
         .file_name()
         .and_then(|s| s.to_str())
         .unwrap_or("spectrum3d.ucsf");
-    read_ucsf_3d_from_reader(name, exp, total_len, reader)
+    let spec = read_ucsf_3d_from_reader(name, exp, total_len, reader)?;
+    for w in check_spectrum3d_axis_ranges(&spec, None) {
+        eprintln!("[nmr-core::spectrum warning] {}", w.message);
+    }
+    Ok(spec)
 }
 
 /// Write a 3D UCSF Sparky spectrum (`.ucsf`) using standard tile sizes (`32 x 8 x 128` capped to axis size).
@@ -2225,10 +2351,13 @@ pub fn expected_axis_shift_window(
                     | "CBCACO3D"
                     | "CBCACON"
                     | "CBCACO"
+                    | "CBCANCO"
                     | "HNCACON3D"
                     | "HNCACON"
                     | "CCCON3D"
                     | "CCCON"
+                    | "HCCCON"
+                    | "CACOCON"
                     | "NCACO"
                     | "NCACO3D"
                     | "RELAXR1"
@@ -2265,7 +2394,7 @@ pub fn expected_axis_shift_window(
                 label: "13C aliphatic/aromatic",
             }),
             "CACO2D" | "CACO" | "CANCO3D" | "CANCO" | "CBCACO3D" | "CBCACON" | "CBCACO"
-            | "CCCON3D" | "CCCON" | "NCACO" | "NCACO3D" => {
+            | "CBCANCO" | "CCCON3D" | "CCCON" | "HCCCON" | "CACOCON" | "NCACO" | "NCACO3D" => {
                 if total_axes >= 2 && axis_index == 0 {
                     Some(AxisShiftWindow {
                         min_ppm: 165.0,
@@ -2289,9 +2418,10 @@ pub fn expected_axis_shift_window(
 /// Check a single processed spectral axis range `[obs_min_ppm, obs_max_ppm]` against the
 /// expected window for `(exp_or_class, axis_index, total_axes, nucleus)`.
 ///
-/// Emits a warning whenever coordinates are non-finite / corrupt or when the processed interval
-/// is disjoint from the expected window by more than half the axis sweep width (`gap > 0.5 * width`),
-/// suggesting an `SR`/`SF` referencing check.
+/// Emits a warning whenever coordinates are non-finite / corrupt, when overlap with
+/// `[expected.min_ppm, expected.max_ppm]` is `< 50%` of the observed axis span, or when the
+/// observed axis center lies outside `[expected.min_ppm, expected.max_ppm]`, suggesting an
+/// `SR`/`SF` referencing check.
 #[allow(clippy::too_many_arguments)]
 pub fn check_axis_shift_window(
     axis_index: usize,
@@ -2340,11 +2470,41 @@ pub fn check_axis_shift_window(
     } else {
         0.0
     };
-    if gap > 0.5 * width {
+    let overlap = (obs_max.min(expected.max_ppm) - obs_min.max(expected.min_ppm)).max(0.0);
+    let expected_width = (expected.max_ppm - expected.min_ppm).max(1e-9);
+    let center = 0.5 * (obs_min + obs_max);
+    let center_outside = center < expected.min_ppm || center > expected.max_ppm;
+    let low_overlap = overlap < 0.5 * width.min(expected_width);
+    if low_overlap || center_outside {
         let ref_hint = if sf_equals_bf == Some(true) {
             "SF == BF with unadjusted carrier offset; likely missing SR/SF referencing error"
         } else {
             "likely SR/SF referencing or carrier offset error"
+        };
+        let (miss_ppm, message) = if gap > 0.0 {
+            (
+                gap,
+                format!(
+                    "processed {axis_label} ({nucleus}) window [{obs_min:.1}..{obs_max:.1} ppm] misses expected {} window [{:.0}..{:.0} ppm] by {gap:.1} ppm ({ref_hint})",
+                    expected.label, expected.min_ppm, expected.max_ppm
+                ),
+            )
+        } else {
+            let center_miss = if center < expected.min_ppm {
+                expected.min_ppm - center
+            } else if center > expected.max_ppm {
+                center - expected.max_ppm
+            } else {
+                0.0
+            };
+            let overlap_pct = (overlap / width.max(1e-9)) * 100.0;
+            (
+                center_miss.max(width - overlap),
+                format!(
+                    "processed {axis_label} ({nucleus}) window [{obs_min:.1}..{obs_max:.1} ppm] (center {center:.1} ppm, overlap {overlap_pct:.0}%) is misaligned with expected {} window [{:.0}..{:.0} ppm] ({ref_hint})",
+                    expected.label, expected.min_ppm, expected.max_ppm
+                ),
+            )
         };
         return Some(AxisRangeWarning {
             axis_label: axis_label.to_string(),
@@ -2354,11 +2514,8 @@ pub fn check_axis_shift_window(
             expected_min_ppm: expected.min_ppm,
             expected_max_ppm: expected.max_ppm,
             expected_label: expected.label.to_string(),
-            miss_ppm: gap,
-            message: format!(
-                "processed {axis_label} ({nucleus}) window [{obs_min:.1}..{obs_max:.1} ppm] misses expected {} window [{:.0}..{:.0} ppm] by {gap:.1} ppm ({ref_hint})",
-                expected.label, expected.min_ppm, expected.max_ppm
-            ),
+            miss_ppm,
+            message,
         });
     }
     None
@@ -2597,6 +2754,80 @@ mod tests {
             data: vec![0.0; 8],
         };
         assert!(check_spectrum3d_axis_ranges(&ok_cube, Some("Cccon3D")).is_empty());
+
+        // 173.cls:P1-8 (`IDPR1_MG_112019/10007` shape): `106.0..241.02 ppm` has zero overlap with
+        // `-5..90 ppm` and center `173.5 ppm` outside window, even though `gap = 16.0 < 0.5 * 135`.
+        let warn_10007 =
+            check_axis_shift_window(2, 3, "F1", "13C", 106.0, 241.02, "Cccon3D", Some(true))
+                .expect("106..241 ppm aliphatic axis must warn (zero overlap, center outside)");
+        assert!(
+            warn_10007.message.contains("16.0 ppm") && warn_10007.message.contains("SF == BF"),
+            "{}",
+            warn_10007.message
+        );
+
+        // Valid wide-sweep carbonyl axis (`091119/6` shape: `153.1..193.9 ppm` centered at `173.5 ppm`)
+        // fully encloses `[165..185 ppm]` with center inside -> must NOT false-warn.
+        assert!(
+            check_axis_shift_window(0, 2, "F2", "13C", 153.1, 193.9, "Con2D", Some(true)).is_none(),
+            "wide-sweep carbonyl axis enclosing [165..185] centered at 173.5 must not false-warn"
+        );
+
+        // Partial overlap (< 50% of observed span) with center outside window also warns.
+        let warn_partial =
+            check_axis_shift_window(2, 3, "F1", "13C", 60.0, 140.0, "HCCCON", Some(false))
+                .expect("60..140 ppm aliphatic axis has 37.5% overlap and center 100 > 90");
+        assert!(
+            warn_partial.message.contains("misaligned") && warn_partial.message.contains("38%"),
+            "{}",
+            warn_partial.message
+        );
+
+        // `read_bruker_pdata_3d_with_warnings` runs RD-9 axis checks directly on load.
+        let dir = env::temp_dir().join(format!("nmr_rd9_load_10007_{}", process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let pdata = dir.join("pdata").join("1");
+        fs::create_dir_all(&pdata).unwrap();
+        fs::write(
+            dir.join("acqus"),
+            "##$PULPROG= <c_hcccon_ia3d>\n##$NUC1= <13C>\n##$SFO1= 201.257935\n##$BF1= 201.223023\n##$SW= 6.901\n##$TD= 8\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("acqu2s"),
+            "##$NUC1= <15N>\n##$SFO1= 81.098602\n##$BF1= 81.088628\n##$SW= 34.006\n##$TD= 4\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("acqu3s"),
+            "##$NUC1= <13C>\n##$SFO1= 201.257935\n##$BF1= 201.223023\n##$SW= 135.020\n##$TD= 4\n",
+        )
+        .unwrap();
+        fs::write(
+            pdata.join("procs"),
+            "##$SI= 4\n##$XDIM= 4\n##$SW_p= 1388.89\n##$SF= 201.223023\n##$OFFSET= 176.95\n##$BYTORDP= 0\n##$DTYPP= 0\n##$NC_proc= 0\n##$AXNUC= <13C>\n",
+        )
+        .unwrap();
+        fs::write(
+            pdata.join("proc2s"),
+            "##$SI= 4\n##$XDIM= 4\n##$SW_p= 2757.86\n##$SF= 81.088628\n##$OFFSET= 140.01\n##$BYTORDP= 0\n##$DTYPP= 0\n##$NC_proc= 0\n##$AXNUC= <15N>\n",
+        )
+        .unwrap();
+        fs::write(
+            pdata.join("proc3s"),
+            "##$SI= 4\n##$XDIM= 4\n##$SW_p= 27173.91\n##$SF= 201.223023\n##$OFFSET= 241.02\n##$BYTORDP= 0\n##$DTYPP= 0\n##$NC_proc= 0\n##$AXNUC= <13C>\n",
+        )
+        .unwrap();
+        fs::write(pdata.join("3rrr"), vec![0u8; 4 * 4 * 4 * 4]).unwrap();
+        let (_spec_10007, load_warns) =
+            read_bruker_pdata_3d_with_warnings(&dir, "HCCCON").expect("load 10007 3rrr");
+        assert!(
+            load_warns
+                .iter()
+                .any(|w| w.contains("aliphatic 13C") && w.contains("SF == BF")),
+            "expected RD-9 load warning on 10007-shaped 3rrr, got {load_warns:?}"
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

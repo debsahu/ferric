@@ -2990,3 +2990,164 @@ fn test_rd6_and_rd9_nus_indirect_td_and_processed_axis_range_warnings() {
         inv_bad_ref.missing_input_hints
     );
 }
+
+#[test]
+fn test_v0173_r2_p1_8_proc_axes_swapped_2d_ucsf_and_unknown_conflict_note() {
+    // 1. Swapped 2D UCSF (`CACO` and `CON`): `parse_ucsf_header` puts direct 13C' first;
+    //    `append_processed_axis_warnings` must NOT reverse indices and emit spurious RD-9 warnings.
+    let build_ucsf_2d = |axes: [(&str, i32, f32, f32, f32); 2]| -> Vec<u8> {
+        let mut buf = vec![0u8; 180 + 2 * 128];
+        buf[0..10].copy_from_slice(b"UCSF NMR\0\0");
+        buf[10] = 2; // 2D
+        buf[11] = 1;
+        buf[13] = 2;
+        for (d, &(nuc, npts, obs, sw_hz, xmtr)) in axes.iter().enumerate() {
+            let off = 180 + d * 128;
+            let nb = nuc.as_bytes();
+            buf[off..off + nb.len().min(6)].copy_from_slice(&nb[..nb.len().min(6)]);
+            buf[off + 8..off + 12].copy_from_slice(&npts.to_be_bytes());
+            buf[off + 20..off + 24].copy_from_slice(&obs.to_be_bytes());
+            buf[off + 24..off + 28].copy_from_slice(&sw_hz.to_be_bytes());
+            buf[off + 28..off + 32].copy_from_slice(&xmtr.to_be_bytes());
+        }
+        buf
+    };
+    let caco_aliph_first = build_ucsf_2d([
+        ("13C", 256, 201.22, 16097.6, 45.0),
+        ("13C", 512, 201.22, 3018.3, 174.0),
+    ]);
+    let con_n_first = build_ucsf_2d([
+        ("15N", 128, 81.09, 2919.2, 122.0),
+        ("13C", 512, 201.22, 2414.6, 174.0),
+    ]);
+    let caco_bad_ref = build_ucsf_2d([
+        ("13C", 256, 201.22, 16097.6, 172.0),
+        ("13C", 512, 201.22, 3018.3, 174.0),
+    ]);
+    let inv_ucsf = classify_nmr_entries(&[
+        VirtualEntry::new("CACO_good.ucsf", caco_aliph_first),
+        VirtualEntry::new("CON_good.ucsf", con_n_first),
+        VirtualEntry::new("CACO_bad.ucsf", caco_bad_ref),
+    ]);
+    let caco_good = inv_ucsf
+        .experiments
+        .iter()
+        .find(|e| e.relative_path == "CACO_good.ucsf")
+        .expect("CACO_good");
+    assert_eq!(caco_good.pulse_class, PulseSequenceClass::Caco2D);
+    assert!(
+        caco_good.notes.iter().all(|n| !n.contains("Axis warning")),
+        "valid swapped 2D UCSF CACO must not emit spurious RD-9 warnings: {:?}",
+        caco_good.notes
+    );
+    let con_good = inv_ucsf
+        .experiments
+        .iter()
+        .find(|e| e.relative_path == "CON_good.ucsf")
+        .expect("CON_good");
+    assert_eq!(con_good.pulse_class, PulseSequenceClass::Con2D);
+    assert!(
+        con_good.notes.iter().all(|n| !n.contains("Axis warning")),
+        "valid swapped 2D UCSF CON must not emit spurious RD-9 warnings: {:?}",
+        con_good.notes
+    );
+    let caco_bad = inv_ucsf
+        .experiments
+        .iter()
+        .find(|e| e.relative_path == "CACO_bad.ucsf")
+        .expect("CACO_bad");
+    assert!(
+        caco_bad.notes.iter().any(|n| n.contains("Axis warning")),
+        "misreferenced 2D UCSF CACO must emit RD-9 warning: {:?}",
+        caco_bad.notes
+    );
+
+    // 2. `091119/8000` shape: `inspect` reports valid `proc3s` axis (3..83 ppm, carrier ~43 ppm),
+    //    not `acqu3s` (132..212 ppm), with zero RD-9 warnings.
+    let inv_8000 = classify_nmr_entries(&[
+        VirtualEntry::new(
+            "8000/acqus",
+            b"##$PULPROG= <c_hcccon_ia3d>\n##$FnTYPE= 2\n##$NUC1= <13C>\n##$SFO1= 201.257633\n##$BF1= 201.223023\n##$SW= 8.014\n##$TD= 1024\n".to_vec(),
+        ),
+        VirtualEntry::new(
+            "8000/acqu2s",
+            b"##$NUC1= <15N>\n##$SFO1= 81.098683\n##$BF1= 81.088628\n##$SW= 35.991\n##$TD= 1536\n##$NusTD= 128\n##$FnMODE= 5\n".to_vec(),
+        ),
+        VirtualEntry::new(
+            "8000/acqu3s",
+            b"##$NUC1= <13C>\n##$SFO1= 201.257633\n##$BF1= 201.223023\n##$SW= 79.884\n##$TD= 1\n##$NusTD= 48\n##$FnMODE= 5\n".to_vec(),
+        ),
+        VirtualEntry::new("8000/pdata/1/procs", b"##$SI= 1024\n##$XDIM= 4\n##$SW_p= 1612.90\n##$SF= 201.223023\n##$OFFSET= 176.008\n".to_vec()),
+        VirtualEntry::new("8000/pdata/1/proc2s", b"##$SI= 128\n##$XDIM= 8\n##$SW_p= 2918.86\n##$SF= 81.088628\n##$OFFSET= 141.998\n".to_vec()),
+        VirtualEntry::new("8000/pdata/1/proc3s", b"##$SI= 64\n##$XDIM= 8\n##$SW_p= 16077.17\n##$SF= 201.248968\n##$OFFSET= 83.0\n".to_vec()),
+        VirtualEntry::header_only("8000/pdata/1/3rrr", Vec::new(), 4096),
+    ]);
+    let exp_8000 = &inv_8000.experiments[0];
+    assert_eq!(exp_8000.pulse_class, PulseSequenceClass::Cccon3D);
+    let f1_car = exp_8000.axes[2].carrier_ppm.expect("F1 carrier");
+    assert!(
+        (f1_car - 43.06).abs() < 0.5,
+        "8000 F1 should display proc3s aliphatic carrier ~43 ppm, got {f1_car:.2}"
+    );
+    assert!(
+        exp_8000.notes.iter().all(|n| !n.contains("Axis warning")),
+        "8000 must have zero axis warnings: {:?}",
+        exp_8000.notes
+    );
+
+    // 3. `IDPR1_MG_112019/10007` shape (`106..241 ppm` vs `-5..90 ppm`) triggers RD-9 warning.
+    let inv_10007 = classify_nmr_entries(&[
+        VirtualEntry::new(
+            "10007/acqus",
+            b"##$PULPROG= <c_hcccon_ia3d>\n##$FnTYPE= 2\n##$NUC1= <13C>\n##$SFO1= 201.257935\n##$BF1= 201.223023\n##$SW= 6.901\n##$TD= 1024\n".to_vec(),
+        ),
+        VirtualEntry::new(
+            "10007/acqu2s",
+            b"##$NUC1= <15N>\n##$SFO1= 81.098602\n##$BF1= 81.088628\n##$SW= 34.006\n##$TD= 2048\n##$NusTD= 128\n##$FnMODE= 5\n".to_vec(),
+        ),
+        VirtualEntry::new(
+            "10007/acqu3s",
+            b"##$NUC1= <13C>\n##$SFO1= 201.257935\n##$BF1= 201.223023\n##$SW= 135.020\n##$TD= 1\n##$NusTD= 64\n##$FnMODE= 5\n".to_vec(),
+        ),
+        VirtualEntry::new("10007/pdata/1/procs", b"##$SI= 2048\n##$XDIM= 4\n##$SW_p= 1388.89\n##$SF= 201.223023\n##$OFFSET= 176.951\n".to_vec()),
+        VirtualEntry::new("10007/pdata/1/proc2s", b"##$SI= 256\n##$XDIM= 8\n##$SW_p= 2757.86\n##$SF= 81.088628\n##$OFFSET= 140.005\n".to_vec()),
+        VirtualEntry::new("10007/pdata/1/proc3s", b"##$SI= 256\n##$XDIM= 8\n##$SW_p= 27173.91\n##$SF= 201.223023\n##$OFFSET= 241.022\n".to_vec()),
+        VirtualEntry::header_only("10007/pdata/1/3rrr", Vec::new(), 4096),
+    ]);
+    assert!(
+        inv_10007.experiments[0]
+            .notes
+            .iter()
+            .any(|n| n.contains("Axis warning (F1)") && n.contains("SF == BF")),
+        "10007 must emit RD-9 warning: {:?}",
+        inv_10007.experiments[0].notes
+    );
+
+    // 4. `112019/100` shape (`c_hncacon_iare3d` with `13C,15N,1H` axes) explains why it is `Unknown`.
+    let inv_100 = classify_nmr_entries(&[
+        VirtualEntry::new(
+            "100/acqus",
+            b"##$PULPROG= <c_hncacon_iare3d>\n##$NUC1= <13C>\n##$SFO1= 201.258\n##$BF1= 201.223\n##$SW= 11.83\n##$TD= 1024\n".to_vec(),
+        ),
+        VirtualEntry::new(
+            "100/acqu2s",
+            b"##$NUC1= <15N>\n##$SFO1= 81.099\n##$BF1= 81.089\n##$SW= 35.99\n##$TD= 128\n##$FnMODE= 5\n".to_vec(),
+        ),
+        VirtualEntry::new(
+            "100/acqu3s",
+            b"##$NUC1= <1H>\n##$SFO1= 800.254\n##$BF1= 800.250\n##$SW= 10.24\n##$TD= 256\n##$FnMODE= 0\n".to_vec(),
+        ),
+    ]);
+    assert_eq!(
+        inv_100.experiments[0].pulse_class,
+        PulseSequenceClass::Unknown
+    );
+    assert!(
+        inv_100.experiments[0]
+            .notes
+            .iter()
+            .any(|n| n.contains("conflicts with axis nuclei")),
+        "expected PULPROG/axis conflict note: {:?}",
+        inv_100.experiments[0].notes
+    );
+}
