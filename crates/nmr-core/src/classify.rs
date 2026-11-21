@@ -269,6 +269,7 @@ pub enum PulseSequenceClass {
     Hetero2D,
     Hnco,
     Hncaco,
+    Hncaconh,
     Hnca,
     Hncoca,
     Hncacb,
@@ -279,9 +280,13 @@ pub enum PulseSequenceClass {
     N15Noesy,
     C13Noesy,
     Con2D,
+    CasCacon2D,
+    CasCanco2D,
     Caco2D,
     Canco3D,
     Cbcaco3D,
+    Hncacon3D,
+    Cccon3D,
     RelaxR1,
     RelaxR2,
     HetNoe,
@@ -317,6 +322,7 @@ impl PulseSequenceClass {
             Self::Hetero2D => "Hetero2D",
             Self::Hnco => "Hnco",
             Self::Hncaco => "Hncaco",
+            Self::Hncaconh => "Hncaconh",
             Self::Hnca => "Hnca",
             Self::Hncoca => "Hncoca",
             Self::Hncacb => "Hncacb",
@@ -327,9 +333,13 @@ impl PulseSequenceClass {
             Self::N15Noesy => "N15Noesy",
             Self::C13Noesy => "C13Noesy",
             Self::Con2D => "Con2D",
+            Self::CasCacon2D => "CasCacon2D",
+            Self::CasCanco2D => "CasCanco2D",
             Self::Caco2D => "Caco2D",
             Self::Canco3D => "Canco3D",
             Self::Cbcaco3D => "Cbcaco3D",
+            Self::Hncacon3D => "Hncacon3D",
+            Self::Cccon3D => "Cccon3D",
             Self::RelaxR1 => "RelaxR1",
             Self::RelaxR2 => "RelaxR2",
             Self::HetNoe => "HetNoe",
@@ -363,6 +373,7 @@ impl PulseSequenceClass {
             Self::HcchTocsy => Some("HCCH_TOCSY"),
             Self::N15Noesy => Some("N15_NOESY"),
             Self::C13Noesy => Some("C13_NOESY"),
+            Self::Cccon3D => Some("CCCON"),
             _ => None,
         }
     }
@@ -370,14 +381,27 @@ impl PulseSequenceClass {
     pub fn is_1h_backbone_triple(self) -> bool {
         matches!(
             self,
-            Self::Hnco | Self::Hncaco | Self::Hnca | Self::Hncoca | Self::Hncacb | Self::Cbcaconh
+            Self::Hnco
+                | Self::Hncaco
+                | Self::Hncaconh
+                | Self::Hnca
+                | Self::Hncoca
+                | Self::Hncacb
+                | Self::Cbcaconh
         )
     }
 
     pub fn is_13c_detected(self) -> bool {
         matches!(
             self,
-            Self::Con2D | Self::Caco2D | Self::Canco3D | Self::Cbcaco3D
+            Self::Con2D
+                | Self::CasCacon2D
+                | Self::CasCanco2D
+                | Self::Caco2D
+                | Self::Canco3D
+                | Self::Cbcaco3D
+                | Self::Hncacon3D
+                | Self::Cccon3D
         )
     }
 
@@ -508,6 +532,56 @@ pub struct ClassifiedExperiment {
     pub selected_by_default: bool,
     /// Diagnostic notes (e.g., `Pseudo3D` delay list kind, paramagnetic sweep hint, unacquired shell).
     pub notes: Vec<String>,
+}
+
+/// Correlation scope for amino-acid-selective 2D `13C`-detected CAS experiments.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum CasSelectionScope {
+    /// `CAS-CACON`: selects `C'(i-1)-N(i)` where residue `(i-1)` matches `residue_types`.
+    Predecessor,
+    /// `CAS-CANCO`: selects intra-residue `C'(i)-N(i)` and sequential `C'(i-1)-N(i)` correlations.
+    IntraAndPredecessor,
+}
+
+/// Residue-type filter metadata extracted from amino-acid-selective `CAS-CACON`/`CAS-CANCO` experiments.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CasResidueFilter {
+    pub scope: CasSelectionScope,
+    /// Short uppercase mnemonic parsed from pulse program or notes (e.g., `"SER"`, `"TAVI"`).
+    pub filter_tag: String,
+    /// Standard 3-letter uppercase amino acid codes selected by this experiment.
+    pub residue_types: Vec<String>,
+}
+
+impl ClassifiedExperiment {
+    /// Return structured amino-acid selectivity metadata when this experiment is `CasCacon2D` or `CasCanco2D`.
+    pub fn cas_residue_filter(&self) -> Option<CasResidueFilter> {
+        let scope = match self.pulse_class {
+            PulseSequenceClass::CasCacon2D => CasSelectionScope::Predecessor,
+            PulseSequenceClass::CasCanco2D => CasSelectionScope::IntraAndPredecessor,
+            _ => return None,
+        };
+        let from_notes = self
+            .notes
+            .iter()
+            .find(|n| n.starts_with("CAS-"))
+            .map(String::as_str);
+        let (filter_tag, residue_types) = [
+            self.pulse_program.as_deref(),
+            from_notes,
+            self.title.as_deref(),
+            Some(self.display_name.as_str()),
+            Some(self.relative_path.as_str()),
+        ]
+        .into_iter()
+        .flatten()
+        .find_map(extract_cas_aa_filter)?;
+        Some(CasResidueFilter {
+            scope,
+            filter_tag,
+            residue_types,
+        })
+    }
 }
 
 /// Auxiliary FASTA sequence or NMR-STAR / NEF file discovered in the workspace.
@@ -2529,8 +2603,41 @@ fn scan_pdata_procno_dir(
         procnos.into_iter().map(|(_, p)| p).collect()
     };
 
+    let push_proc_headers = |pdir: &Path, bin_name: &str, entries: &mut Vec<VirtualEntry>| {
+        let header_pairs: &[(&str, &str)] = match bin_name {
+            "1r" => &[("procs", "proc")],
+            "2rr" => &[("procs", "proc"), ("proc2s", "proc2")],
+            "3rrr" => &[("procs", "proc"), ("proc2s", "proc2"), ("proc3s", "proc3")],
+            _ => &[
+                ("procs", "proc"),
+                ("proc2s", "proc2"),
+                ("proc3s", "proc3"),
+                ("proc4s", "proc4"),
+            ],
+        };
+        for &(primary, fallback) in header_pairs {
+            let mut chosen = pdir.join(primary);
+            if !chosen.is_file() {
+                let fb = pdir.join(fallback);
+                if fb.is_file() {
+                    chosen = fb;
+                } else {
+                    continue;
+                }
+            }
+            if let Ok(rel_os) = chosen.strip_prefix(root) {
+                if let Ok(prefix) = read_prefix_from_disk(&chosen, MAX_TEXT_HEADER_BYTES) {
+                    let sz = prefix.len() as u64;
+                    let rel = normalize_rel_path(&rel_os.to_string_lossy());
+                    entries.push(VirtualEntry::header_only(rel, prefix, sz));
+                }
+            }
+        }
+    };
+
     // Ultra-fast path when `acqus` already exists in the parent Bruker experiment folder:
     // probe `pdata/1/{3rrr,2rr,1r,4rrrr}` directly via `fs::metadata` without `opendir`/`readdir`,
+    // reading only the matching `proc*s` parameter headers for processed `SI`/range checks,
     // and fall back to scanning other `pdata/<procno>` (`2`, `10`, `101`, ...) only if `pdata/1` lacks binary data!
     let proc1 = pdata_dir.join("1");
     if has_acqus_parent {
@@ -2542,6 +2649,7 @@ fn scan_pdata_procno_dir(
                         let rel = normalize_rel_path(&rel_os.to_string_lossy());
                         entries.push(VirtualEntry::header_only(rel, Vec::new(), meta.len()));
                     }
+                    push_proc_headers(&proc1, bin_name, entries);
                     return;
                 }
             }
@@ -2558,6 +2666,7 @@ fn scan_pdata_procno_dir(
                             let rel = normalize_rel_path(&rel_os.to_string_lossy());
                             entries.push(VirtualEntry::header_only(rel, Vec::new(), meta.len()));
                         }
+                        push_proc_headers(&pdir, bin_name, entries);
                         return;
                     }
                 }
@@ -2932,6 +3041,32 @@ fn count_nonempty_schedule_lines(bytes: &[u8]) -> usize {
         .map(str::trim)
         .filter(|l| !l.is_empty() && !l.starts_with('#') && !l.starts_with(';'))
         .count()
+}
+
+/// Infer per-indirect-axis real-equivalent grid extents (`2 * (max_col_idx + 1)`) from a Bruker `nuslist`.
+fn parse_nuslist_axis_extents(bytes: &[u8]) -> Vec<usize> {
+    let text = String::from_utf8_lossy(bytes);
+    let mut max_per_col: Vec<usize> = Vec::new();
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with(';') {
+            continue;
+        }
+        for (col, tok) in trimmed.split_whitespace().enumerate() {
+            if let Ok(idx) = tok.parse::<usize>() {
+                if col >= max_per_col.len() {
+                    max_per_col.resize(col + 1, 0);
+                }
+                if idx > max_per_col[col] {
+                    max_per_col[col] = idx;
+                }
+            }
+        }
+    }
+    max_per_col
+        .into_iter()
+        .map(|m| m.saturating_add(1).saturating_mul(2))
+        .collect()
 }
 
 /// Parse Varian / Agilent `procpar` text into `(name -> Vec<tokens>)`.
@@ -3484,24 +3619,79 @@ fn classify_pulse_token(
         return Some(PulseSequenceClass::RelaxR2);
     }
 
-    // 2. Protonless `13C`-detected suite (`CON`, `CACO`, `CANCO`, `CBCACO` — Bermel et al. 2009)
-    // Guard against `1H`-detected `CBCACONH` (whose compact token starts with `"cbcaco"` + `"nh"`).
+    // 2. Protonless `13C`-detected suite (`CON`, `CAS-CACON`/`CAS-CANCO`, `CACO`, `CANCO`, `CBCACO`, `(H)N(CA)CON`, `(H)CC(CO)N`)
+    // Validate axis nuclei strictly BEFORE trusting substrings (`RD-3`) and guard against `1H`-detected `*CONH`.
+    let indirect_n_count = axes.iter().skip(1).filter(|a| a.nucleus == "15N").count();
+    let indirect_c_count = axes.iter().skip(1).filter(|a| a.nucleus == "13C").count();
+    let has_full_3d_nuclei = dim == ExperimentDimensionality::Dim3D
+        && axes.len() >= 3
+        && axes.iter().take(3).all(|a| !a.nucleus.is_empty());
+    let has_full_2d_nuclei = dim == ExperimentDimensionality::Dim2D
+        && axes.len() >= 2
+        && axes.iter().take(2).all(|a| !a.nucleus.is_empty());
+    let is_c_nn_3d_axes = if has_full_3d_nuclei {
+        direct_nuc == "13C" && indirect_n_count == 2 && indirect_c_count == 0
+    } else {
+        direct_nuc != "1H" && (indirect_n_count >= 2 || (axes.len() < 3 && indirect_c_count == 0))
+    };
+    let is_c_nc_3d_axes = if has_full_3d_nuclei {
+        direct_nuc == "13C" && indirect_n_count == 1 && indirect_c_count == 1
+    } else {
+        direct_nuc != "1H" && !(indirect_n_count >= 2 && indirect_c_count == 0)
+    };
+    let is_c_cbcaco_3d_axes = if has_full_3d_nuclei {
+        direct_nuc == "13C" && indirect_n_count <= 1 && indirect_c_count >= 1
+    } else {
+        direct_nuc != "1H" && !(indirect_n_count >= 2 && indirect_c_count == 0)
+    };
     if matches!(
         dim,
         ExperimentDimensionality::Dim3D | ExperimentDimensionality::Dim4D
     ) && direct_nuc != "1H"
         && !compact.contains("cbcaconh")
         && !compact.contains("conh")
+        && !compact.contains("hncocanh")
     {
-        if compact.contains("cbcaco") || compact.contains("cbcanco") {
+        if is_c_nn_3d_axes
+            && (compact.contains("hncacon")
+                || compact.contains("ncacon")
+                || compact.contains("nnco"))
+        {
+            return Some(PulseSequenceClass::Hncacon3D);
+        }
+        if is_c_nc_3d_axes
+            && (compact.contains("hcccon")
+                || compact.contains("cccon")
+                || compact.contains("ccocon"))
+        {
+            return Some(PulseSequenceClass::Cccon3D);
+        }
+        if is_c_cbcaco_3d_axes && (compact.contains("cbcaco") || compact.contains("cbcanco")) {
             return Some(PulseSequenceClass::Cbcaco3D);
         }
-        if compact.contains("canco") || (direct_nuc == "13C" && compact.contains("ncaco")) {
+        if is_c_nc_3d_axes
+            && (compact.contains("canco") || (direct_nuc == "13C" && compact.contains("ncaco")))
+        {
             return Some(PulseSequenceClass::Canco3D);
         }
     }
     if dim == ExperimentDimensionality::Dim2D {
-        if !compact.contains("cbcaconh")
+        let is_c13_n15_2d = if has_full_2d_nuclei {
+            direct_nuc == "13C" && has_15N_only(axes)
+        } else {
+            (direct_nuc == "13C" && has_15N_only(axes)) || axes.len() < 2
+        };
+        if is_c13_n15_2d && !compact.contains("cbcaconh") && !compact.contains("conh") {
+            let cas_filter = extract_cas_aa_filter(base);
+            if compact.contains("cascanco") || (compact.contains("canco") && cas_filter.is_some()) {
+                return Some(PulseSequenceClass::CasCanco2D);
+            }
+            if compact.contains("cascacon") || (compact.contains("cacon") && cas_filter.is_some()) {
+                return Some(PulseSequenceClass::CasCacon2D);
+            }
+        }
+        if (!has_full_2d_nuclei || (direct_nuc == "13C" && has_15N_only(axes)))
+            && !compact.contains("cbcaconh")
             && !compact.contains("conh")
             && (compact.contains("hcacon")
                 || base.starts_with("c_hcacon")
@@ -3589,50 +3779,75 @@ fn classify_pulse_token(
     if compact.contains("hcchtocsy") || compact.contains("hcchcosy") || compact.contains("hcchdi") {
         return Some(PulseSequenceClass::HcchTocsy);
     }
-    if compact.contains("hccconh")
-        || compact.contains("hcconh")
-        || base.contains("ghc_co_nh")
-        || compact.contains("hcctocsy")
-        || compact.contains("hcccon")
+    if direct_nuc != "13C"
+        && (compact.contains("hccconh")
+            || compact.contains("hcconh")
+            || base.contains("ghc_co_nh")
+            || compact.contains("hcctocsy")
+            || compact.contains("hcccon"))
     {
         return Some(PulseSequenceClass::Hccconh);
     }
-    if compact.contains("ccconh")
-        || compact.contains("cconh")
-        || base.contains("gc_co_nh")
-        || compact.contains("ccctocsy")
-        || compact.contains("cccon")
+    if direct_nuc != "13C"
+        && (compact.contains("ccconh")
+            || compact.contains("cconh")
+            || base.contains("gc_co_nh")
+            || compact.contains("ccctocsy")
+            || compact.contains("cccon"))
     {
         return Some(PulseSequenceClass::Ccconh);
     }
 
-    // 5. 3D Backbone Triple-Resonance (specific multi-step transfers checked BEFORE shorter prefixes!)
+    // 5. 3D Backbone Triple-Resonance (axis-validated specific multi-step transfers checked BEFORE shorter prefixes!)
     if matches!(
         dim,
         ExperimentDimensionality::Dim3D | ExperimentDimensionality::Dim4D
     ) {
-        if compact.contains("cbcaconh")
-            || compact.contains("cbcaconnh")
-            || compact.contains("cbcacocanh")
-            || compact.contains("cbcacogp")
-            || compact.contains("hncocacb")
+        let is_hnn_axes = if has_full_3d_nuclei {
+            direct_nuc == "1H" && indirect_n_count == 2 && indirect_c_count == 0
+        } else {
+            direct_nuc != "13C"
+                && (indirect_n_count >= 2 || (axes.len() < 3 && indirect_c_count == 0))
+        };
+        let is_hnc_backbone_axes = if has_full_3d_nuclei {
+            direct_nuc == "1H" && indirect_n_count == 1 && indirect_c_count == 1
+        } else {
+            direct_nuc != "13C"
+        };
+        if is_hnn_axes
+            && (compact.contains("hncaconh")
+                || compact.contains("hncocanh")
+                || compact.contains("hncannh")
+                || compact == "hnn"
+                || base == "bt_hnn"
+                || base.ends_with("_hnn"))
         {
-            return Some(PulseSequenceClass::Cbcaconh);
+            return Some(PulseSequenceClass::Hncaconh);
         }
-        if compact.contains("hncacb") || compact.contains("cbcanh") {
-            return Some(PulseSequenceClass::Hncacb);
-        }
-        if compact.contains("hncaco") {
-            return Some(PulseSequenceClass::Hncaco);
-        }
-        if compact.contains("hncoca") {
-            return Some(PulseSequenceClass::Hncoca);
-        }
-        if compact.contains("hnca") && !compact.contains("hncannh") {
-            return Some(PulseSequenceClass::Hnca);
-        }
-        if compact.contains("hnco") {
-            return Some(PulseSequenceClass::Hnco);
+        if is_hnc_backbone_axes {
+            if compact.contains("cbcaconh")
+                || compact.contains("cbcaconnh")
+                || compact.contains("cbcacocanh")
+                || compact.contains("cbcacogp")
+                || compact.contains("hncocacb")
+            {
+                return Some(PulseSequenceClass::Cbcaconh);
+            }
+            if compact.contains("hncacb") || compact.contains("cbcanh") {
+                return Some(PulseSequenceClass::Hncacb);
+            }
+            if compact.contains("hncaco") {
+                return Some(PulseSequenceClass::Hncaco);
+            }
+            if compact.contains("hncoca") {
+                return Some(PulseSequenceClass::Hncoca);
+            }
+            if compact.contains("hnca") && !compact.contains("hncannh") {
+                return Some(PulseSequenceClass::Hnca);
+            }
+            if compact.contains("hnco") {
+                return Some(PulseSequenceClass::Hnco);
+            }
         }
     }
 
@@ -3783,6 +3998,223 @@ fn has_13C_only(axes: &[ClassifiedAxis]) -> bool {
         && !axes.iter().skip(1).any(|a| a.nucleus == "15N")
 }
 
+/// Extract amino-acid selectivity mnemonic and 3-letter residue codes from a token or comment.
+///
+/// Uses whole-token matching after splitting on non-alphanumeric separators so generic NMR words
+/// (`series`, `proton`, `user`) never trigger false positives.
+fn extract_cas_aa_filter(raw: &str) -> Option<(String, Vec<String>)> {
+    let tail = raw.rsplit(['/', '\\']).next().unwrap_or(raw);
+    let mut tags: Vec<&'static str> = Vec::new();
+    let mut residues: Vec<String> = Vec::new();
+
+    for tok in tail
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|t| !t.is_empty())
+    {
+        let low = tok.to_ascii_lowercase();
+        let mapped: Option<(&'static str, &[&'static str])> = match low.as_str() {
+            "ala" => Some(("ALA", &["ALA"])),
+            "arg" => Some(("ARG", &["ARG"])),
+            "asn" => Some(("ASN", &["ASN"])),
+            "asp" => Some(("ASP", &["ASP"])),
+            "cys" => Some(("CYS", &["CYS"])),
+            "gln" => Some(("GLN", &["GLN"])),
+            "glu" => Some(("GLU", &["GLU"])),
+            "gly" => Some(("GLY", &["GLY"])),
+            "his" => Some(("HIS", &["HIS"])),
+            "ile" => Some(("ILE", &["ILE"])),
+            "leu" => Some(("LEU", &["LEU"])),
+            "lys" => Some(("LYS", &["LYS"])),
+            "met" => Some(("MET", &["MET"])),
+            "phe" => Some(("PHE", &["PHE"])),
+            "pro" => Some(("PRO", &["PRO"])),
+            "ser" => Some(("SER", &["SER"])),
+            "thr" => Some(("THR", &["THR"])),
+            "trp" => Some(("TRP", &["TRP"])),
+            "tyr" => Some(("TYR", &["TYR"])),
+            "val" => Some(("VAL", &["VAL"])),
+            "tavi" => Some(("TAVI", &["THR", "ALA", "VAL", "ILE"])),
+            "asx" => Some(("ASX", &["ASN", "ASP"])),
+            "glx" => Some(("GLX", &["GLN", "GLU"])),
+            "aro" | "arom" | "fyw" => Some(("ARO", &["PHE", "TYR", "TRP"])),
+            "ilv" => Some(("ILV", &["ILE", "LEU", "VAL"])),
+            _ => None,
+        };
+        if let Some((tag, list)) = mapped {
+            if !tags.contains(&tag) {
+                tags.push(tag);
+            }
+            for &aa in list {
+                if !residues.iter().any(|r| r == aa) {
+                    residues.push(aa.to_string());
+                }
+            }
+        }
+    }
+
+    if residues.is_empty() {
+        None
+    } else {
+        Some((tags.join("+"), residues))
+    }
+}
+
+fn append_processed_axis_warnings(
+    pulse_class: PulseSequenceClass,
+    axes: &[ClassifiedAxis],
+    ucsf_direct_last: bool,
+    notes: &mut Vec<String>,
+) {
+    let total = axes.len();
+    for (i, ax) in axes.iter().enumerate() {
+        let (Some(car), Some(sw)) = (ax.carrier_ppm, ax.sw_ppm) else {
+            continue;
+        };
+        let logical_idx = if ucsf_direct_last && total >= 2 {
+            total - 1 - i
+        } else {
+            i
+        };
+        if let Some(warn) = crate::spectrum::check_axis_shift_window(
+            logical_idx,
+            total,
+            &ax.label,
+            &ax.nucleus,
+            car - 0.5 * sw,
+            car + 0.5 * sw,
+            pulse_class.as_str(),
+            None,
+        ) {
+            let note = format!("Axis warning ({}): {}", warn.axis_label, warn.message);
+            if !notes.iter().any(|n| n == &note) {
+                notes.push(note);
+            }
+        }
+    }
+}
+
+fn append_bruker_processed_axis_warnings(
+    pulse_class: PulseSequenceClass,
+    axes: &[ClassifiedAxis],
+    has_processed_payload: bool,
+    has_raw_only_acqu: bool,
+    amaps: &[&BTreeMap<String, String>],
+    pmaps: &[&BTreeMap<String, String>],
+    notes: &mut Vec<String>,
+) {
+    if !has_processed_payload && has_raw_only_acqu {
+        return;
+    }
+    let total = axes.len();
+    for (idx, ax) in axes.iter().enumerate() {
+        let Some(&pmap) = pmaps.get(idx) else {
+            continue;
+        };
+        if pmap.is_empty() {
+            continue;
+        }
+        // Only validate indirect 3D proc3s when it actually describes a 3D cube (`XDIM > 0`) or
+        // when there is no acquisition header overriding dimensionality.
+        if idx >= 2
+            && jcamp_usize(pmap, "XDIM").unwrap_or(0) == 0
+            && amaps.get(idx).is_some_and(|m| !m.is_empty())
+        {
+            continue;
+        }
+        let (Some(offset), Some(sw_p), Some(sf)) = (
+            jcamp_f64(pmap, "OFFSET"),
+            jcamp_f64(pmap, "SW_p"),
+            jcamp_f64(pmap, "SF"),
+        ) else {
+            continue;
+        };
+        let amap_opt = amaps.get(idx).copied();
+        let bf1_opt = amap_opt
+            .and_then(|m| jcamp_f64(m, "BF1").or_else(|| jcamp_f64(m, "SFO1")))
+            .filter(|&bf| bf > 1.0);
+        if let Some(bf1) = bf1_opt {
+            if !sf.is_finite() || sf <= 1.0 || (sf - bf1).abs() > 0.01 * bf1 {
+                let sfo1 = amap_opt
+                    .and_then(|m| jcamp_f64(m, "SFO1"))
+                    .filter(|&v| v > 1.0)
+                    .unwrap_or(bf1);
+                let carrier = (sfo1 - bf1) / bf1 * 1.0e6;
+                let acqu_sw = amap_opt
+                    .and_then(|m| jcamp_f64(m, "SW"))
+                    .filter(|&w| w.is_finite() && w > 0.0)
+                    .unwrap_or_else(|| sw_p / bf1);
+                let note = format!(
+                    "Axis warning ({}): RD-12 proc SF ({sf:.6} MHz, OFFSET={offset:.3}) deviates >1% from acqu BF1 ({bf1:.6} MHz); fallback to acquNs (carrier={carrier:.2} ppm, SW={acqu_sw:.2} ppm)",
+                    ax.label
+                );
+                if !notes.iter().any(|n| n == &note) {
+                    notes.push(note);
+                }
+                continue;
+            }
+        }
+        let (obs_min, obs_max) = if sf > 1e-6 && sw_p.is_finite() && offset.is_finite() {
+            let sw_ppm = sw_p / sf;
+            (offset - sw_ppm, offset)
+        } else {
+            (offset, offset)
+        };
+        let sf_equals_bf = bf1_opt.map(|bf| (sf - bf).abs() <= 1e-4 * bf);
+        if let Some(warn) = crate::spectrum::check_axis_shift_window(
+            idx,
+            total,
+            &ax.label,
+            &ax.nucleus,
+            obs_min,
+            obs_max,
+            pulse_class.as_str(),
+            sf_equals_bf,
+        ) {
+            let note = format!("Axis warning ({}): {}", warn.axis_label, warn.message);
+            if !notes.iter().any(|n| n == &note) {
+                notes.push(note);
+            }
+        }
+    }
+}
+
+fn append_cas_filter_note(
+    pulse_class: PulseSequenceClass,
+    pulse_program: Option<&str>,
+    title: Option<&str>,
+    display_name: &str,
+    relative_path: &str,
+    notes: &mut Vec<String>,
+) {
+    let prefix = match pulse_class {
+        PulseSequenceClass::CasCacon2D => "CAS-CACON filter (i-1)",
+        PulseSequenceClass::CasCanco2D => "CAS-CANCO filter (i,i-1)",
+        _ => return,
+    };
+    let extracted = [
+        pulse_program,
+        title,
+        Some(display_name),
+        Some(relative_path),
+    ]
+    .into_iter()
+    .flatten()
+    .find_map(extract_cas_aa_filter);
+    let note = match extracted {
+        Some((tag, residues)) => {
+            if residues.len() == 1 && residues[0] == tag {
+                format!("{prefix}: {tag}")
+            } else {
+                format!("{prefix}: {} [{tag}]", residues.join(","))
+            }
+        }
+        None => format!("{prefix}: amino-acid-selective"),
+    };
+    if !notes.iter().any(|n| n == &note) {
+        notes.push(note);
+    }
+}
+
 /// Pure axis-physics fallback when pulse program and title strings are absent or generic.
 ///
 /// Policy (`v0150:P1-9`): axes alone can positively identify only a few experiments (HSQC-type
@@ -3852,6 +4284,9 @@ fn infer_pulse_class_from_axis_physics(
     if dim == ExperimentDimensionality::Dim3D && axes.len() >= 3 {
         let ind1 = axes[1].nucleus.as_str();
         let ind2 = axes[2].nucleus.as_str();
+        if direct == "13C" && ind1 == "15N" && ind2 == "15N" {
+            return PulseSequenceClass::Hncacon3D;
+        }
         if direct == "13C" && ((ind1 == "15N" && ind2 == "13C") || (ind1 == "13C" && ind2 == "15N"))
         {
             let c_ax = if ind1 == "13C" { &axes[1] } else { &axes[2] };
@@ -4297,17 +4732,38 @@ fn build_bruker_experiment(
         .map(parse_jcamp_map)
         .unwrap_or_default();
 
-    let has_d4 = (!a4.is_empty() && jcamp_usize(&a4, "TD").unwrap_or(0) > 1)
+    // Detect NUS early so indirect `TD` derives from `NusTD` / `nuslist` / proc `SI` rather than
+    // Bruker NUS bookkeeping (`acqu2s TD = 4*nus_pts`, `acqu3s TD = 1`), and `has_d3`/`has_d4`
+    // recognize 3D/4D NUS folders even when `acqu3s` has `TD=1` and `NusTD=0`.
+    let fn_type = jcamp_usize(&a1, "FnTYPE").unwrap_or(0);
+    let nuslist_count = grp
+        .nuslist
+        .as_deref()
+        .map(count_nonempty_schedule_lines)
+        .unwrap_or(0);
+    let nuslist_extents = grp
+        .nuslist
+        .as_deref()
+        .map(parse_nuslist_axis_extents)
+        .unwrap_or_default();
+    let is_nus = fn_type == 2 || nuslist_count > 0;
+
+    let has_d4 = (!a4.is_empty()
+        && (jcamp_usize(&a4, "TD").unwrap_or(0) > 1
+            || jcamp_usize(&a4, "NusTD").unwrap_or(0) > 1
+            || (is_nus && nuslist_extents.len() >= 3)))
         || (!p4.is_empty() && jcamp_usize(&p4, "SI").unwrap_or(0) > 1);
     let has_d3 = has_d4
         || (!a3.is_empty()
             && (jcamp_usize(&a3, "TD").unwrap_or(0) > 1
-                || jcamp_usize(&a3, "NusTD").unwrap_or(0) > 1))
+                || jcamp_usize(&a3, "NusTD").unwrap_or(0) > 1
+                || (is_nus && nuslist_extents.len() >= 2)))
         || (!p3.is_empty() && jcamp_usize(&p3, "SI").unwrap_or(0) > 1);
     let has_d2 = has_d3
         || (!a2.is_empty()
             && (jcamp_usize(&a2, "TD").unwrap_or(0) > 1
-                || jcamp_usize(&a2, "NusTD").unwrap_or(0) > 1))
+                || jcamp_usize(&a2, "NusTD").unwrap_or(0) > 1
+                || (is_nus && !nuslist_extents.is_empty())))
         || (!p2.is_empty() && jcamp_usize(&p2, "SI").unwrap_or(0) > 1);
 
     let ndim_raw: usize = if has_d4 {
@@ -4319,6 +4775,9 @@ fn build_bruker_experiment(
     } else {
         1
     };
+
+    let acqu3_td_collapsed =
+        ndim_raw >= 3 && !a3.is_empty() && jcamp_usize(&a3, "TD").unwrap_or(0) <= 1;
 
     let build_axis = |idx: usize,
                       amap: &BTreeMap<String, String>,
@@ -4354,22 +4813,40 @@ fn build_bruker_experiment(
             None
         };
 
+        let quad = if !amap.is_empty() {
+            bruker_fnmode_quadrature(jcamp_usize(amap, "FnMODE"), is_direct)
+        } else {
+            QuadratureKind::Processed
+        };
+
         let pts = if !amap.is_empty() {
             let td = jcamp_usize(amap, "TD").unwrap_or(0);
-            let nustd = jcamp_usize(amap, "NusTD").unwrap_or(0);
-            if td <= 1 && nustd > 1 {
+            let nustd = jcamp_usize(amap, "NusTD").filter(|&v| v > 1);
+            let nl_pts = idx
+                .checked_sub(1)
+                .and_then(|k| nuslist_extents.get(k).copied())
+                .filter(|&v| v > 1);
+            let si = jcamp_usize(pmap, "SI").filter(|&v| v > 1);
+            if is_nus && !is_direct && quad != QuadratureKind::Qf {
+                let is_bookkeeping_td = td <= 1
+                    || acqu3_td_collapsed
+                    || (nuslist_count > 0 && (td == 2 * nuslist_count || td == 4 * nuslist_count));
                 nustd
+                    .or_else(|| {
+                        if is_bookkeeping_td {
+                            nl_pts.or(si)
+                        } else {
+                            Some(td).filter(|&v| v > 1).or(nl_pts).or(si)
+                        }
+                    })
+                    .unwrap_or(td)
+            } else if td <= 1 {
+                nustd.or(si).unwrap_or(td)
             } else {
                 td
             }
         } else {
             jcamp_usize(pmap, "SI").unwrap_or(0)
-        };
-
-        let quad = if !amap.is_empty() {
-            bruker_fnmode_quadrature(jcamp_usize(amap, "FnMODE"), is_direct)
-        } else {
-            QuadratureKind::Processed
         };
         if nuc.is_empty() && quad == QuadratureKind::Qf && !is_direct {
             nuc = "Delay".to_string();
@@ -4871,14 +5348,7 @@ fn build_bruker_experiment(
         }
     }
 
-    // NUS detection: strictly `FnTYPE == 2` or `nuslist` present (avoids TopSpin `FnTYPE=0` template false positives!)
-    let fn_type = jcamp_usize(&a1, "FnTYPE").unwrap_or(0);
-    let nuslist_count = grp
-        .nuslist
-        .as_deref()
-        .map(count_nonempty_schedule_lines)
-        .unwrap_or(0);
-    let is_nus = fn_type == 2 || nuslist_count > 0;
+    // NUS grid summary (uses early `is_nus`, `nuslist_count`, `nuslist_extents` & resolved `axes[idx].points`)
     let nus = if is_nus {
         let mut full_grid = 1usize;
         let mut have_grid = false;
@@ -5024,6 +5494,47 @@ fn build_bruker_experiment(
             }
         }
     };
+
+    append_cas_filter_note(
+        pulse_class,
+        pulprog.as_deref(),
+        title.as_deref(),
+        &disp,
+        rel_root,
+        &mut notes,
+    );
+    if is_nus && axes.len() >= 2 {
+        let pmaps = [&p1, &p2, &p3, &p4];
+        let mut parts = Vec::new();
+        for (idx, ax) in axes.iter().enumerate().skip(1) {
+            if ax.quadrature == QuadratureKind::Qf {
+                continue;
+            }
+            let si = pmaps
+                .get(idx)
+                .and_then(|m| jcamp_usize(m, "SI"))
+                .filter(|&v| v > 1);
+            match si {
+                Some(si_val) => parts.push(format!(
+                    "{}(NusTD/grid={},procSI={si_val})",
+                    ax.label, ax.points
+                )),
+                None => parts.push(format!("{}(NusTD/grid={})", ax.label, ax.points)),
+            }
+        }
+        if !parts.is_empty() {
+            notes.push(format!("NUS indirect sizes: {}", parts.join(", ")));
+        }
+    }
+    append_bruker_processed_axis_warnings(
+        pulse_class,
+        &axes,
+        grp.processed_bytes > 0,
+        grp.acqus.is_some(),
+        &[&a1, &a2, &a3, &a4],
+        &[&p1, &p2, &p3, &p4],
+        &mut notes,
+    );
 
     let quadrature_badge = format_quadrature_badge(&axes);
     let selected_by_default = pulse_class != PulseSequenceClass::Unknown;
@@ -5496,6 +6007,15 @@ fn build_varian_experiment(
         _ => DataState::RawFid,
     };
 
+    append_cas_filter_note(
+        pulse_class,
+        seqfil.as_deref(),
+        title.as_deref(),
+        &disp,
+        rel_root,
+        &mut notes,
+    );
+
     let quadrature_badge = format_quadrature_badge(&axes);
     let selected_by_default = pulse_class != PulseSequenceClass::Unknown;
 
@@ -5736,6 +6256,13 @@ fn infer_regime_and_hints(
             "3D 13C-detected CANCO/CBCACO spectra found without a 2D CON root spectrum."
                 .to_string(),
         );
+    }
+    for exp in experiments.iter() {
+        for note in &exp.notes {
+            if note.starts_with("Axis warning (") {
+                hints.push(format!("{}: {note}", exp.relative_path));
+            }
+        }
     }
 
     (primary, secondary, hints)
@@ -6042,6 +6569,9 @@ fn classify_nmr_entries_named(root_name: &str, raw_entries: &[VirtualEntry]) -> 
                     })
                     .unwrap_or_else(|| infer_pulse_class_from_axis_physics(dim, &axes, None));
                 let quadrature_badge = format_quadrature_badge(&axes);
+                let mut notes = Vec::new();
+                append_cas_filter_note(pulse_class, None, None, &disp, &rel, &mut notes);
+                append_processed_axis_warnings(pulse_class, &axes, true, &mut notes);
                 experiments.push(ClassifiedExperiment {
                     relative_path: rel,
                     display_name: disp,
@@ -6058,7 +6588,7 @@ fn classify_nmr_entries_named(root_name: &str, raw_entries: &[VirtualEntry]) -> 
                     raw_signal_bytes: 0,
                     processed_bytes: total_bytes,
                     selected_by_default: pulse_class != PulseSequenceClass::Unknown,
-                    notes: Vec::new(),
+                    notes,
                 });
             }
         }
@@ -6072,6 +6602,16 @@ fn classify_nmr_entries_named(root_name: &str, raw_entries: &[VirtualEntry]) -> 
                     .filter(|&c| c != PulseSequenceClass::Unknown)
                     .unwrap_or_else(|| infer_pulse_class_from_axis_physics(dim, &axes, None));
                 let quadrature_badge = format_quadrature_badge(&axes);
+                let mut notes = vec![format!("NMRPipe {} plane stack", pgrp.plane_count)];
+                append_cas_filter_note(
+                    pulse_class,
+                    None,
+                    None,
+                    &disp,
+                    &pgrp.representative_path,
+                    &mut notes,
+                );
+                append_processed_axis_warnings(pulse_class, &axes, false, &mut notes);
                 experiments.push(ClassifiedExperiment {
                     relative_path: pgrp.representative_path,
                     display_name: disp,
@@ -6088,7 +6628,7 @@ fn classify_nmr_entries_named(root_name: &str, raw_entries: &[VirtualEntry]) -> 
                     raw_signal_bytes: 0,
                     processed_bytes: pgrp.total_bytes,
                     selected_by_default: pulse_class != PulseSequenceClass::Unknown,
-                    notes: vec![format!("NMRPipe {} plane stack", pgrp.plane_count)],
+                    notes,
                 });
             }
         }
@@ -6110,6 +6650,9 @@ fn classify_nmr_entries_named(root_name: &str, raw_entries: &[VirtualEntry]) -> 
                     })
                     .unwrap_or_else(|| infer_pulse_class_from_axis_physics(dim, &axes, None));
                 let quadrature_badge = format_quadrature_badge(&axes);
+                let mut notes = Vec::new();
+                append_cas_filter_note(pulse_class, None, None, &disp, &rel, &mut notes);
+                append_processed_axis_warnings(pulse_class, &axes, false, &mut notes);
                 experiments.push(ClassifiedExperiment {
                     relative_path: rel,
                     display_name: disp,
@@ -6126,7 +6669,7 @@ fn classify_nmr_entries_named(root_name: &str, raw_entries: &[VirtualEntry]) -> 
                     raw_signal_bytes: 0,
                     processed_bytes: total_bytes,
                     selected_by_default: pulse_class != PulseSequenceClass::Unknown,
-                    notes: Vec::new(),
+                    notes,
                 });
             }
         }

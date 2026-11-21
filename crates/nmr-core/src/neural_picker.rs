@@ -154,7 +154,11 @@ pub fn estimate_thermal_noise_haar(data: &[f32], nx: usize) -> f32 {
         let x_stride = (nx / 128).max(1);
         let mut ix = 0usize;
         while ix + 1 < nx {
-            diffs.push((row[ix + 1] - row[ix]).abs() * inv_sqrt2);
+            let a = row[ix];
+            let b = row[ix + 1];
+            if a.is_finite() && b.is_finite() {
+                diffs.push((b - a).abs() * inv_sqrt2);
+            }
             ix += x_stride;
         }
     }
@@ -176,13 +180,36 @@ pub fn normalize_spectrum_data_with_nx(data: &[f32], nx: usize) -> (Vec<f32>, f3
         return (Vec::new(), 0.0, 1.0);
     }
     let stride = (data.len() / 32_768).max(1);
-    let mut sample: Vec<f32> = data.iter().step_by(stride).copied().collect();
-    let med = median_f32_local(&mut sample);
+    let mut sample: Vec<f32> = data
+        .iter()
+        .step_by(stride)
+        .copied()
+        .filter(|v| v.is_finite())
+        .collect();
+    if sample.len() < 16 {
+        sample = data
+            .iter()
+            .copied()
+            .filter(|v| v.is_finite())
+            .take(32_768)
+            .collect();
+    }
+    let med = if sample.is_empty() {
+        0.0
+    } else {
+        median_f32_local(&mut sample)
+    };
     let noise = estimate_thermal_noise_haar(data, nx);
     let inv = 1.0 / (NORM_SIGMA_DIV * noise);
     let norm = data
         .iter()
-        .map(|&v| ((v - med) * inv).clamp(-NORM_CLAMP, NORM_CLAMP))
+        .map(|&v| {
+            if v.is_finite() {
+                ((v - med) * inv).clamp(-NORM_CLAMP, NORM_CLAMP)
+            } else {
+                0.0
+            }
+        })
         .collect();
     (norm, med, noise)
 }

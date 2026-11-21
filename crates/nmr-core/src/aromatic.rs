@@ -1694,8 +1694,10 @@ fn column_trimmed_mad_and_max(
     let mut max_abs = 0.0f32;
     for iy in 0..ny {
         let v = spec.get(ix, iy);
-        max_abs = max_abs.max(v.abs());
-        scratch.push(v);
+        if v.is_finite() {
+            max_abs = max_abs.max(v.abs());
+            scratch.push(v);
+        }
     }
     if scratch.len() < 16 {
         return (fallback_mad, max_abs);
@@ -1708,7 +1710,7 @@ fn column_trimmed_mad_and_max(
     scratch.clear();
     for iy in 0..ny {
         let v = spec.get(ix, iy);
-        if (v - med0).abs() <= 3.5 * mad0 {
+        if v.is_finite() && (v - med0).abs() <= 3.5 * mad0 {
             scratch.push((v - med0).abs());
         }
     }

@@ -322,6 +322,7 @@ pub enum PulprogSequenceFamily {
     C13Hmqc,
     Hnco,
     Hncaco,
+    Hncaconh,
     Hnca,
     Hncoca,
     Hncacb,
@@ -336,6 +337,8 @@ pub enum PulprogSequenceFamily {
     Caco2D,
     Canco3D,
     Cbcaco3D,
+    Hncacon3D,
+    Cccon3D,
     RelaxR1,
     RelaxR2,
     HetNoe,
@@ -356,6 +359,7 @@ impl PulprogSequenceFamily {
             Self::C13Hmqc => PulseSequenceClass::C13Hmqc,
             Self::Hnco => PulseSequenceClass::Hnco,
             Self::Hncaco => PulseSequenceClass::Hncaco,
+            Self::Hncaconh => PulseSequenceClass::Hncaconh,
             Self::Hnca => PulseSequenceClass::Hnca,
             Self::Hncoca => PulseSequenceClass::Hncoca,
             Self::Hncacb => PulseSequenceClass::Hncacb,
@@ -369,6 +373,8 @@ impl PulprogSequenceFamily {
             Self::Caco2D => PulseSequenceClass::Caco2D,
             Self::Canco3D => PulseSequenceClass::Canco3D,
             Self::Cbcaco3D => PulseSequenceClass::Cbcaco3D,
+            Self::Hncacon3D => PulseSequenceClass::Hncacon3D,
+            Self::Cccon3D => PulseSequenceClass::Cccon3D,
             Self::RelaxR1 => PulseSequenceClass::RelaxR1,
             Self::RelaxR2 => PulseSequenceClass::RelaxR2,
             Self::HetNoe => PulseSequenceClass::HetNoe,
@@ -4327,7 +4333,7 @@ fn deduce_family_from_graph(
         return PulprogSequenceFamily::HetNoe;
     }
 
-    // 13C-detected protonless experiments (`CON`, `CACO`, `CANCO`, `CBCACO`)
+    // 13C-detected protonless experiments (`CON`, `CACO`, `(H)N(CA)CON`, `(H)CC(CO)N`, `CANCO`, `CBCACO`)
     if direct_nucleus == "13C" {
         if evolved_pools.len() == 1 {
             return match evolved_pools[0].1 {
@@ -4336,6 +4342,16 @@ fn deduce_family_from_graph(
             };
         }
         if evolved_pools.len() == 2 {
+            let n_count = evolved_pools
+                .iter()
+                .filter(|(_, p)| *p == SpinPoolNode::NAmide)
+                .count();
+            if n_count == 2 {
+                return PulprogSequenceFamily::Hncacon3D;
+            }
+            if has_tocsy_spinlock && n_count >= 1 {
+                return PulprogSequenceFamily::Cccon3D;
+            }
             let has_cacb = evolved_pools
                 .iter()
                 .any(|(_, p)| *p == SpinPoolNode::CAliphatic);
@@ -4385,9 +4401,14 @@ fn deduce_family_from_graph(
 
     // 3D 1H-detected experiments (`evolved_pools.len() == 2`)
     if evolved_pools.len() == 2 {
-        let has_n = evolved_pools
+        let n_count = evolved_pools
             .iter()
-            .any(|(_, p)| *p == SpinPoolNode::NAmide);
+            .filter(|(_, p)| *p == SpinPoolNode::NAmide)
+            .count();
+        if n_count == 2 {
+            return PulprogSequenceFamily::Hncaconh;
+        }
+        let has_n = n_count > 0;
         let has_h_ind = evolved_pools
             .iter()
             .any(|(_, p)| *p == SpinPoolNode::HAliphatic);
@@ -5164,9 +5185,17 @@ fn deduce_varian_family(
     {
         return PulprogSequenceFamily::Unknown;
     }
-    let has_ind_n = evolved_pools
+    let n_ind_count = evolved_pools
         .iter()
-        .any(|(_, p)| *p == SpinPoolNode::NAmide);
+        .filter(|(_, p)| *p == SpinPoolNode::NAmide)
+        .count();
+    if tn == "1H"
+        && n_ind_count == 2
+        && (seq_low.contains("hncaconh") || seq_low.contains("hncocanh") || seq_low.contains("hnn"))
+    {
+        return PulprogSequenceFamily::Hncaconh;
+    }
+    let has_ind_n = n_ind_count > 0;
     let has_ind_c = evolved_pools.iter().any(|(_, p)| {
         matches!(
             *p,

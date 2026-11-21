@@ -68,14 +68,32 @@ fn median_f32(vals: &mut [f32]) -> f32 {
     *m
 }
 
-/// Robust MAD noise estimate (`1.4826 * median(|x - median(x)|)`) after trimming signal outliers.
+/// Robust MAD noise estimate (`1.4826 * median(|x - median(x)|)`) after filtering non-finite
+/// (`NaN`/`Inf`) samples and trimming signal outliers.
 pub fn estimate_noise_mad(data: &[f32]) -> f32 {
     if data.is_empty() {
         return 1.0;
     }
     // Stride large 3D arrays for fast deterministic O(N/stride) noise estimation
     let stride = (data.len() / 65_536).max(1);
-    let mut sample: Vec<f32> = data.iter().step_by(stride).copied().collect();
+    let mut sample: Vec<f32> = data
+        .iter()
+        .step_by(stride)
+        .copied()
+        .filter(|v| v.is_finite())
+        .collect();
+    // If >=50% NaN/Inf leaves too few strided samples, fall back to a bounded full-array finite scan.
+    if sample.len() < 16 {
+        sample = data
+            .iter()
+            .copied()
+            .filter(|v| v.is_finite())
+            .take(65_536)
+            .collect();
+    }
+    if sample.is_empty() {
+        return 1.0;
+    }
     let med0 = median_f32(&mut sample);
 
     let mut dev0: Vec<f32> = sample.iter().map(|&v| (v - med0).abs()).collect();
@@ -120,14 +138,60 @@ fn auto_snr_from_stats(max_abs: f32, noise: f32, contour_base: Option<f32>) -> f
     }
 }
 
+/// Resolve canonical axis nuclei `(nuc_x, nuc_y)` for a 2D spectrum using Larmor frequency ratios
+/// (when both `obs_mhz` are populated and not confused by a `13C-13C` plane spanning `>25 ppm`)
+/// and fallback explicit axis labels.
+fn spec_2d_axis_nuclei(spec: &Spectrum2D) -> (&'static str, &'static str) {
+    let lx = nucleus_from_axis_label(&spec.axis_x);
+    let ly = nucleus_from_axis_label(&spec.axis_y);
+    let sx = spec.axis_x.obs_mhz;
+    let sy = spec.axis_y.obs_mhz;
+    if sx.is_finite() && sy.is_finite() && sx > 50.0 && sy > 50.0 {
+        let top = sx.max(sy);
+        let homonuclear_c13 = (sx - sy).abs() / top.max(1e-9) < 0.05
+            && (spec.axis_x.max_ppm() > 25.0
+                || spec.axis_x.min_ppm() < -10.0
+                || spec.axis_y.max_ppm() > 25.0
+                || spec.axis_y.min_ppm() < -10.0
+                || lx == "13C"
+                || ly == "13C"
+                || top <= 330.0);
+        if homonuclear_c13 {
+            return ("13C", "13C");
+        }
+        let ratio = sy / sx;
+        if let Some(ry) = nucleus_from_larmor_ratio(ratio) {
+            if ry != "1H" && ry != "2H" {
+                return ("1H", ry);
+            }
+        }
+        let inv_ratio = sx / sy;
+        if let Some(rx) = nucleus_from_larmor_ratio(inv_ratio) {
+            if rx != "1H" && rx != "2H" {
+                return (rx, "1H");
+            }
+        }
+        // Check 13C-15N heteronuclear (`C-N` CON / `N-C`) pairs when `obs_mhz` differ without `1H`
+        if (ratio - 0.40298).abs() < 0.025 && sx <= 330.0 && sy <= 134.0 {
+            return ("13C", "15N");
+        }
+        if (inv_ratio - 0.40298).abs() < 0.025 && sy <= 330.0 && sx <= 134.0 {
+            return ("15N", "13C");
+        }
+    }
+    (lx, ly)
+}
+
 /// Original clean-room automatic SNR threshold estimator for 2D NMR spectra.
 ///
 /// Combines two-pass outlier-trimmed MAD noise ([`estimate_noise_mad`]), dynamic-range scaling
 /// (`0.015 * max_snr` above `120 sigma`, clamped to `[5.5, 45.0]`), and optional visible
-/// contour-floor coupling (`contour_base / noise` clamped to `[3.0, 200.0]`). When `axis_x`
-/// spans beyond the amide region (`min_ppm < 4.5 && max_ppm > 5.5`), `max_abs` is restricted to
-/// the `5.5..=11.5 ppm` amide `${}^{1}\text{H}$ window so residual water or aliphatic signals do
-/// not inflate the dynamic-range threshold.
+/// contour-floor coupling (`contour_base / noise` clamped to `[3.0, 200.0]`). When the 2D spectrum
+/// is a `${}^{1}\text{H}$–${}^{15}\text{N}$` plane whose `${}^{1}\text{H}$` axis spans beyond the
+/// amide region (`min_ppm < 4.5 && max_ppm > 5.5`), `max_abs` is restricted to the `5.5..=11.5 ppm`
+/// amide `${}^{1}\text{H}$ window so residual water or aliphatic signals do not inflate the
+/// dynamic-range threshold. Non-amide (`13C-13C`, `1H-13C`, `13C-15N`) spectra always scan the full
+/// plane (`auto_snr_from_stats` without amide gating).
 pub fn estimate_auto_snr_2d(spec: &Spectrum2D, contour_base: Option<f32>) -> f32 {
     if spec.data.is_empty() {
         return 5.5;
@@ -135,13 +199,20 @@ pub fn estimate_auto_snr_2d(spec: &Spectrum2D, contour_base: Option<f32>) -> f32
     let noise = estimate_noise_mad(&spec.data).max(1e-12);
     let nx = spec.nx();
     let ny = spec.ny();
-    let use_amide_window = spec.axis_x.min_ppm() < 4.5
-        && spec.axis_x.max_ppm() > 5.5
-        && nx > 0
-        && ny > 0
-        && spec.data.len() >= nx * ny;
+    let (nuc_x, nuc_y) = spec_2d_axis_nuclei(spec);
+    let has_plane = nx > 0 && ny > 0 && spec.data.len() >= nx * ny;
+    let amide_on_x = has_plane
+        && nuc_x == "1H"
+        && nuc_y == "15N"
+        && spec.axis_x.min_ppm() < 4.5
+        && spec.axis_x.max_ppm() > 5.5;
+    let amide_on_y = has_plane
+        && nuc_y == "1H"
+        && nuc_x == "15N"
+        && spec.axis_y.min_ppm() < 4.5
+        && spec.axis_y.max_ppm() > 5.5;
     let mut max_abs = 0.0_f32;
-    if use_amide_window {
+    if amide_on_x {
         let active_cols: Vec<usize> = (0..nx)
             .filter(|&ix| {
                 let hp = spec.axis_x.index_to_ppm(ix as f64);
@@ -152,6 +223,19 @@ pub fn estimate_auto_snr_2d(spec: &Spectrum2D, contour_base: Option<f32>) -> f32
             let row = &spec.data[iy * nx..(iy + 1) * nx];
             for &ix in &active_cols {
                 let v = row[ix];
+                if v.is_finite() {
+                    max_abs = max_abs.max(v.abs());
+                }
+            }
+        }
+    } else if amide_on_y {
+        for iy in 0..ny {
+            let hp = spec.axis_y.index_to_ppm(iy as f64);
+            if !(5.5..=11.5).contains(&hp) {
+                continue;
+            }
+            let row = &spec.data[iy * nx..(iy + 1) * nx];
+            for &v in row {
                 if v.is_finite() {
                     max_abs = max_abs.max(v.abs());
                 }
@@ -194,23 +278,26 @@ fn slice_trimmed_median_mad_and_max(
     fallback_mad: f32,
 ) -> (f32, f32, f32) {
     let mut max_abs = 0.0f32;
+    scratch.clear();
     for &v in vals {
-        let a = v.abs();
-        if a > max_abs {
-            max_abs = a;
+        if v.is_finite() {
+            scratch.push(v);
+            let a = v.abs();
+            if a > max_abs {
+                max_abs = a;
+            }
         }
     }
-    if vals.len() < 8 {
+    if scratch.len() < 8 {
         return (0.0, fallback_mad, max_abs);
     }
-    scratch.clear();
-    scratch.extend_from_slice(vals);
+    let n_fin = scratch.len();
     let med0 = median_f32(scratch);
     for x in scratch.iter_mut() {
         *x = (*x - med0).abs();
     }
     let mad0 = (1.4826 * median_f32(scratch)).max(1e-12);
-    if vals.len() < 24 {
+    if n_fin < 24 {
         return (med0, fallback_mad, max_abs);
     }
 
@@ -218,7 +305,7 @@ fn slice_trimmed_median_mad_and_max(
     scratch.extend(
         vals.iter()
             .copied()
-            .filter(|&v| (v - med0).abs() <= 3.5 * mad0),
+            .filter(|&v| v.is_finite() && (v - med0).abs() <= 3.5 * mad0),
     );
     if scratch.len() < 12 {
         return (med0, mad0.max(fallback_mad), max_abs);
@@ -418,7 +505,7 @@ pub fn pick_hsqc_2d(spec: &Spectrum2D, cfg: &PickerConfig) -> Vec<Peak> {
         for &ix in &active_ix_list {
             let v = spec.get(ix, iy);
             let loc_thr = col_thresh[ix].max(r_thr);
-            if v.abs() < loc_thr || (!cfg.allow_negative && v < 0.0) {
+            if !v.is_finite() || v.abs() < loc_thr || (!cfg.allow_negative && v < 0.0) {
                 continue;
             }
             let sign = if v >= 0.0 { 1 } else { -1 };
@@ -429,7 +516,7 @@ pub fn pick_hsqc_2d(spec: &Spectrum2D, cfg: &PickerConfig) -> Vec<Peak> {
                         continue;
                     }
                     let nv = spec.get((ix as isize + dx) as usize, (iy as isize + dy) as usize);
-                    if (sign > 0 && nv >= v) || (sign < 0 && nv <= v) {
+                    if !nv.is_finite() || (sign > 0 && nv >= v) || (sign < 0 && nv <= v) {
                         is_extremum = false;
                         break 'nbr;
                     }
@@ -3270,5 +3357,103 @@ mod tests {
             "expected ~85.0 with contour floor on 3D cube, got {est_cb}"
         );
         assert!((estimate_auto_snr_3d(&cube, Some(500.0 * noise)) - 200.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn test_auto_snr_2d_gates_amide_window_by_nucleus() {
+        // 1. 13C-13C plane spanning [-10..70] x [-10..70] with generic labels ("w1"/"w2"):
+        // must NOT apply 5.5..=11.5 ppm 1H amide window (signal at 2.0/20.0 ppm gives ~45.0, not 5.5).
+        let base_noise_spec = make_noisy_2d(64, 64, 70.0, -10.0);
+        let noise = estimate_noise_mad(&base_noise_spec.data);
+        let mut cc = Spectrum2D {
+            name: "CC_DARR".to_string(),
+            axis_x: AxisPpm::from_bounds("w2", 64, 70.0, -10.0, 201.2),
+            axis_y: AxisPpm::from_bounds("w1", 64, 70.0, -10.0, 201.2),
+            data: base_noise_spec.data.clone(),
+        };
+        let ix_c = cc.axis_x.ppm_to_index(22.0).round() as usize;
+        let iy_c = cc.axis_y.ppm_to_index(45.0).round() as usize;
+        cc.data[iy_c * 64 + ix_c] = 10_000.0 * noise;
+        let snr_cc = estimate_auto_snr_2d(&cc, None);
+        assert!(
+            (snr_cc - 45.0).abs() < 1e-4,
+            "13C-13C plane must scan full range -> 45.0, got {snr_cc}"
+        );
+
+        // Even a 13C-13C methyl sub-plane where F2 is 5..24 ppm and F1 is 10..70 ppm at 201 MHz
+        let mut cc_methyl = Spectrum2D {
+            name: "CC_METHYL".to_string(),
+            axis_x: AxisPpm::from_bounds("w2", 64, 24.0, 5.0, 201.2),
+            axis_y: AxisPpm::from_bounds("w1", 64, 70.0, 10.0, 201.2),
+            data: base_noise_spec.data.clone(),
+        };
+        cc_methyl.data[32 * 64 + 32] = 10_000.0 * noise;
+        let snr_cc_m = estimate_auto_snr_2d(&cc_methyl, None);
+        assert!(
+            (snr_cc_m - 45.0).abs() < 1e-4,
+            "13C-13C 5..24 ppm axis must not look like 1H amide -> 45.0, got {snr_cc_m}"
+        );
+
+        // 2. 1H-13C HSQC spanning [-1..11] x [10..70] with intense aliphatic peaks at 1.2 ppm:
+        // must NOT mask <5.5 ppm with amide window!
+        let mut hchsqc = Spectrum2D {
+            name: "C13HSQC".to_string(),
+            axis_x: AxisPpm::from_bounds("1H", 64, 11.0, -1.0, 800.13),
+            axis_y: AxisPpm::from_bounds("13C", 64, 70.0, 10.0, 201.2),
+            data: base_noise_spec.data,
+        };
+        let ix_me = hchsqc.axis_x.ppm_to_index(1.2).round() as usize;
+        hchsqc.data[32 * 64 + ix_me] = 10_000.0 * noise;
+        let snr_hc = estimate_auto_snr_2d(&hchsqc, None);
+        assert!(
+            (snr_hc - 45.0).abs() < 1e-4,
+            "1H-13C HSQC must keep <5.5 ppm signals -> 45.0, got {snr_hc}"
+        );
+    }
+
+    #[test]
+    fn test_estimate_noise_mad_robust_on_majority_and_all_nan_planes() {
+        // Construct baseline deterministic noise, then corrupt 75% of voxels with NaN/Inf.
+        let clean: Vec<f32> = (0..4096)
+            .map(|i| (((i * 7919) % 1000) as f32 / 1000.0 - 0.5) * 2.0)
+            .collect();
+        let clean_mad = estimate_noise_mad(&clean);
+        assert!(clean_mad > 0.3 && clean_mad < 1.5, "clean_mad={clean_mad}");
+
+        let mut mostly_nan: Vec<f32> = clean
+            .iter()
+            .enumerate()
+            .map(|(i, &v)| {
+                if i % 4 == 0 {
+                    v
+                } else if i % 8 == 1 {
+                    f32::INFINITY
+                } else {
+                    f32::NAN
+                }
+            })
+            .collect();
+        let mad_75_nan = estimate_noise_mad(&mostly_nan);
+        assert!(
+            mad_75_nan > 0.1 && (mad_75_nan - clean_mad).abs() < 0.25,
+            "75% NaN plane must not collapse MAD to 1e-12: clean={clean_mad}, nan75={mad_75_nan}"
+        );
+
+        // Even with >=99.7% NaN leaving only 12 finite values in a large buffer, fallback recovers > 0.1
+        mostly_nan.fill(f32::NAN);
+        for (k, slot) in mostly_nan.iter_mut().step_by(341).take(12).enumerate() {
+            *slot = clean[k * 10];
+        }
+        let mad_sparse = estimate_noise_mad(&mostly_nan);
+        assert!(
+            mad_sparse > 1e-3,
+            "sparse finite fallback collapsed: {mad_sparse}"
+        );
+
+        // 100% NaN/Inf returns finite safe default 1.0 (never NaN or 1e-12)
+        let all_nan = vec![f32::NAN; 512];
+        assert_eq!(estimate_noise_mad(&all_nan), 1.0);
+        let all_inf = vec![f32::NEG_INFINITY; 256];
+        assert_eq!(estimate_noise_mad(&all_inf), 1.0);
     }
 }
