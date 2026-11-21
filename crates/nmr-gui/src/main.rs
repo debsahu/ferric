@@ -17102,9 +17102,17 @@ impl NmrWorkbenchApp {
                 } => {
                     #[cfg(not(target_arch = "wasm32"))]
                     {
-                        let cleaned = sanitize_user_path_input(&path);
-                        match IngestPanelState::from_native_path(Path::new(&cleaned)) {
+                        let resolved =
+                            match self.mcp_bridge.resolve_sandboxed_read_path(&path, true) {
+                                Ok(p) => p,
+                                Err(e) => {
+                                    self.status_msg = format!("MCP load_study_folder denied: {e}");
+                                    continue;
+                                }
+                            };
+                        match IngestPanelState::from_native_path(&resolved) {
                             Ok(panel) => {
+                                self.mcp_bridge.set_last_mcp_loaded_path(Some(&resolved));
                                 self.ingest_panel = panel;
                                 let plan = self.ingest_panel.build_execution_plan();
                                 self.ingest_panel.open = false;
@@ -17134,8 +17142,15 @@ impl NmrWorkbenchApp {
                     let mut raw_seq = sequence;
                     #[cfg(not(target_arch = "wasm32"))]
                     if let Some(ref seq_p) = sequence_path {
-                        let cleaned = sanitize_user_path_input(seq_p);
-                        match std::fs::read_to_string(Path::new(&cleaned)) {
+                        let resolved =
+                            match self.mcp_bridge.resolve_sandboxed_read_path(seq_p, false) {
+                                Ok(p) => p,
+                                Err(e) => {
+                                    self.status_msg = format!("MCP set_sequence denied: {e}");
+                                    continue;
+                                }
+                            };
+                        match std::fs::read_to_string(&resolved) {
                             Ok(contents) => raw_seq = contents,
                             Err(e) => {
                                 self.status_msg = format!("MCP set_sequence read error: {e}");
@@ -17283,37 +17298,64 @@ impl NmrWorkbenchApp {
                         );
                     }
                 }
-                McpUiCommand::ExportResults { prefix, format } => {
+                McpUiCommand::ExportResults {
+                    prefix,
+                    format,
+                    overwrite,
+                } => {
                     #[cfg(not(target_arch = "wasm32"))]
                     {
-                        if !prefix.trim().is_empty() {
-                            self.export_prefix = prefix.trim().to_string();
-                        }
-                        let base_p = Path::new(self.export_prefix.trim());
-                        match format.trim().to_ascii_lowercase().as_str() {
-                            "peaks" => {
-                                let out_p = base_p.with_extension("tsv");
-                                match write_peaks(&out_p, &self.peaks) {
-                                    Ok(()) => {
-                                        self.exported_in_session = true;
-                                        self.status_msg = format!(
-                                            "MCP exported {} peaks to {}",
-                                            self.peaks.len(),
-                                            out_p.display()
-                                        );
-                                    }
-                                    Err(e) => {
-                                        self.status_msg = format!("MCP peak export failed: {e}")
-                                    }
+                        let fmt_lower = format.trim().to_ascii_lowercase();
+                        let ext = match fmt_lower.as_str() {
+                            "peaks" => "tsv",
+                            "nef" => "nef",
+                            "html" => "html",
+                            _ => "str",
+                        };
+                        let target_prefix = if prefix.trim().is_empty() {
+                            self.export_prefix.trim().to_string()
+                        } else {
+                            prefix.trim().to_string()
+                        };
+                        let resolved_targets =
+                            match self.mcp_bridge.resolve_sandboxed_export_targets(
+                                &target_prefix,
+                                &[ext],
+                                overwrite,
+                                false,
+                            ) {
+                                Ok(t) => t,
+                                Err(e) => {
+                                    self.status_msg = format!("MCP export_results denied: {e}");
+                                    continue;
                                 }
-                            }
+                            };
+                        let out_p = &resolved_targets[0];
+                        let canonical_prefix = out_p.with_extension("").display().to_string();
+                        match fmt_lower.as_str() {
+                            "peaks" => match write_peaks(out_p, &self.peaks) {
+                                Ok(()) => {
+                                    self.export_prefix = canonical_prefix;
+                                    self.mcp_bridge
+                                        .set_current_export_prefix(&self.export_prefix);
+                                    self.exported_in_session = true;
+                                    self.status_msg = format!(
+                                        "MCP exported {} peaks to {}",
+                                        self.peaks.len(),
+                                        out_p.display()
+                                    );
+                                }
+                                Err(e) => self.status_msg = format!("MCP peak export failed: {e}"),
+                            },
                             "nef" => {
                                 self.session.state.sequence = self.sequence.clone();
                                 self.session.state.seq_ids = self.seq_ids.clone();
                                 self.session.state.peaks = self.peaks.clone();
-                                let out_p = base_p.with_extension("nef");
-                                match self.session.save_to_path(&out_p) {
+                                match self.session.save_to_path(out_p) {
                                     Ok(msg) => {
+                                        self.export_prefix = canonical_prefix;
+                                        self.mcp_bridge
+                                            .set_current_export_prefix(&self.export_prefix);
                                         self.exported_in_session = true;
                                         self.status_msg = format!("MCP exported NEF: {msg}");
                                     }
@@ -17340,9 +17382,11 @@ impl NmrWorkbenchApp {
                                     }
                                     inp.engine_label = Some(self.solver_kind.label().to_string());
                                     let html = generate_quality_report_html(&inp);
-                                    let out_p = base_p.with_extension("html");
-                                    match std::fs::write(&out_p, &html) {
+                                    match std::fs::write(out_p, &html) {
                                         Ok(()) => {
+                                            self.export_prefix = canonical_prefix;
+                                            self.mcp_bridge
+                                                .set_current_export_prefix(&self.export_prefix);
                                             self.exported_in_session = true;
                                             self.status_msg = format!(
                                                 "MCP exported HTML report to {}",
@@ -17362,9 +17406,11 @@ impl NmrWorkbenchApp {
                             }
                             _ => {
                                 if let Some(pred) = &self.pred_ref {
-                                    let out_p = base_p.with_extension("str");
-                                    match write_star(&out_p, pred, Some(&self.pred_conf)) {
+                                    match write_star(out_p, pred, Some(&self.pred_conf)) {
                                         Ok(()) => {
+                                            self.export_prefix = canonical_prefix;
+                                            self.mcp_bridge
+                                                .set_current_export_prefix(&self.export_prefix);
                                             self.exported_in_session = true;
                                             self.status_msg = format!(
                                                 "MCP exported NMR-STAR to {}",
@@ -17386,7 +17432,7 @@ impl NmrWorkbenchApp {
                     }
                     #[cfg(target_arch = "wasm32")]
                     {
-                        let _ = (prefix, format);
+                        let _ = (prefix, format, overwrite);
                         self.status_msg =
                             "MCP export_results files require native desktop".to_string();
                     }
@@ -17425,16 +17471,130 @@ impl NmrWorkbenchApp {
                     }
                 }
                 McpUiCommand::DispatchWorkbenchAction { action } => {
-                    if action == WorkbenchAction::LoadPathOrSpectrum {
-                        self.status_msg = "Use run_workbench_workflow(action='load_study_folder', path=...) to load datasets via MCP".to_string();
-                    } else if let Some(ctx) = ctx_opt {
-                        self.dispatch_workbench_action(ctx, action);
-                    } else {
-                        let fallback_ctx = egui::Context::default();
-                        self.dispatch_workbench_action(&fallback_ctx, action);
+                    self.execute_mcp_dispatched_action(ctx_opt, action, false, false);
+                }
+                McpUiCommand::DispatchGuardedWorkbenchAction {
+                    action,
+                    overwrite,
+                    confirm,
+                } => {
+                    self.execute_mcp_dispatched_action(ctx_opt, action, overwrite, confirm);
+                }
+            }
+        }
+    }
+
+    fn execute_mcp_dispatched_action(
+        &mut self,
+        ctx_opt: Option<&egui::Context>,
+        action: WorkbenchAction,
+        overwrite: bool,
+        confirm: bool,
+    ) {
+        if action == WorkbenchAction::LoadPathOrSpectrum {
+            self.status_msg =
+                "Use run_workbench_workflow(action='load_study_folder', path=...) to load datasets via MCP"
+                    .to_string();
+            return;
+        }
+        if action == WorkbenchAction::ResetWorkspace
+            && (!self.mcp_bridge.destructive_actions_allowed() || !confirm)
+        {
+            self.status_msg = "MCP destructive action 'ResetWorkspace' denied".to_string();
+            return;
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        match action {
+            WorkbenchAction::SaveSessionNef | WorkbenchAction::SaveSessionNefAs => {
+                match self.mcp_bridge.resolve_sandboxed_export_targets(
+                    &self.export_prefix,
+                    &["nef"],
+                    overwrite,
+                    true,
+                ) {
+                    Ok(targets) => {
+                        self.export_prefix = targets[0].with_extension("").display().to_string();
+                        self.mcp_bridge
+                            .set_current_export_prefix(&self.export_prefix);
+                    }
+                    Err(e) => {
+                        self.status_msg = format!("MCP SaveSessionNef denied: {e}");
+                        return;
                     }
                 }
             }
+            WorkbenchAction::ExportNmrStar | WorkbenchAction::ExportPeaksTsv => {
+                match self.mcp_bridge.resolve_sandboxed_export_targets(
+                    &self.export_prefix,
+                    &["str", "tsv"],
+                    overwrite,
+                    true,
+                ) {
+                    Ok(targets) => {
+                        self.export_prefix = targets[0].with_extension("").display().to_string();
+                        self.mcp_bridge
+                            .set_current_export_prefix(&self.export_prefix);
+                    }
+                    Err(e) => {
+                        self.status_msg = format!("MCP ExportNmrStar/Peaks denied: {e}");
+                        return;
+                    }
+                }
+            }
+            WorkbenchAction::ExportQualityReportHtml => {
+                match self.mcp_bridge.resolve_sandboxed_export_targets(
+                    &self.export_prefix,
+                    &["html"],
+                    overwrite,
+                    true,
+                ) {
+                    Ok(targets) => {
+                        self.export_prefix = targets[0].with_extension("").display().to_string();
+                        self.mcp_bridge
+                            .set_current_export_prefix(&self.export_prefix);
+                    }
+                    Err(e) => {
+                        self.status_msg = format!("MCP ExportQualityReportHtml denied: {e}");
+                        return;
+                    }
+                }
+            }
+            WorkbenchAction::LoadSessionNef => {
+                match self
+                    .mcp_bridge
+                    .resolve_sandboxed_session_load_path(&self.export_prefix)
+                {
+                    Ok(target) => {
+                        self.export_prefix = target.with_extension("").display().to_string();
+                        self.mcp_bridge
+                            .set_current_export_prefix(&self.export_prefix);
+                    }
+                    Err(e) => {
+                        self.status_msg = format!("MCP LoadSessionNef denied: {e}");
+                        return;
+                    }
+                }
+            }
+            WorkbenchAction::ProcessAllRawFids | WorkbenchAction::ReconstructNusIstFista => {
+                if let Some(ref rp) = self.ingest_panel.root_path {
+                    if let Err(e) = self
+                        .mcp_bridge
+                        .resolve_sandboxed_read_path(&rp.to_string_lossy(), true)
+                    {
+                        self.status_msg = format!("MCP FID processing denied: {e}");
+                        return;
+                    }
+                }
+            }
+            _ => {}
+        }
+        #[cfg(target_arch = "wasm32")]
+        let _ = overwrite;
+        if let Some(ctx) = ctx_opt {
+            self.dispatch_workbench_action(ctx, action);
+        } else {
+            let fallback_ctx = egui::Context::default();
+            self.dispatch_workbench_action(&fallback_ctx, action);
         }
     }
 
@@ -17560,6 +17720,14 @@ impl NmrWorkbenchApp {
             f64::from(self.view_n_bottom),
         ];
         let p_snr = f64::from(self.picker_snr);
+
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.mcp_bridge
+                .set_current_export_prefix(&self.export_prefix);
+            self.mcp_bridge
+                .sync_user_study_root(self.ingest_panel.root_path.as_deref());
+        }
 
         self.mcp_bridge.update_snapshot(|snap| {
             snap.active_residue_seq = active_seq;
@@ -22522,6 +22690,244 @@ CBCACON\t175.41\t122.09\t30.40\t1\t520.0
                 "section '{section}' must return non-empty items: {val}"
             );
         }
+    }
+
+    #[test]
+    fn test_mcp_e2e_path_sandboxing_overwrite_and_destructive_guards() {
+        use super::*;
+        use nmr_gui::mcp_bridge::McpBridgePermission;
+
+        struct TempDirGuard(std::path::PathBuf);
+        impl TempDirGuard {
+            fn new(tag: &str) -> Self {
+                static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let raw = std::env::temp_dir().join(format!(
+                    "ferric_gui_e2e_{tag}_{}_{}",
+                    std::process::id(),
+                    n
+                ));
+                std::fs::create_dir_all(&raw).expect("create temp test dir");
+                Self(std::fs::canonicalize(&raw).expect("canonicalize temp test dir"))
+            }
+        }
+        impl Drop for TempDirGuard {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        let study_guard = TempDirGuard::new("study");
+        let outside_guard = TempDirGuard::new("outside");
+        let study_dir = study_guard.0.clone();
+        let outside_dir = outside_guard.0.clone();
+
+        let in_fasta = study_dir.join("ubq10.fasta");
+        let out_fasta = outside_dir.join("evil.fasta");
+        std::fs::write(&in_fasta, ">UBQ10\nMQIFVKTLTG\n").expect("write in-root fasta");
+        std::fs::write(&out_fasta, ">EVIL\nAAAA\n").expect("write out-of-root fasta");
+
+        let mut app = make_headless_test_app();
+        app.load_builtin_demo_suite();
+        assert_eq!(app.sequence.len(), 76);
+        assert!(app.pred_ref.is_some());
+
+        // Active study directory automatically anchors the default approved root
+        app.ingest_panel.root_path = Some(study_dir.clone());
+        app.sync_mcp_bridge_snapshot_and_viewport();
+        assert_eq!(app.mcp_bridge.approved_roots(), vec![study_dir.clone()]);
+        app.mcp_bridge
+            .set_permission(McpBridgePermission::ReadWrite);
+
+        let call_mcp = |app: &mut NmrWorkbenchApp, id: u64, name: &str, args: serde_json::Value| {
+            let req = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "tools/call",
+                "params": { "name": name, "arguments": args }
+            });
+            app.mcp_bridge
+                .handle_jsonrpc_bytes(req.to_string().as_bytes())
+                .expect("JSON-RPC response")["result"]
+                .clone()
+        };
+
+        let state_res = call_mcp(&mut app, 1, "get_workbench_state", serde_json::json!({}));
+        let state_json: serde_json::Value =
+            serde_json::from_str(state_res["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(state_json["allow_destructive_actions"], false);
+        assert_eq!(
+            state_json["approved_roots"][0],
+            study_dir.to_string_lossy().as_ref()
+        );
+
+        // 1. Out-of-root workflow & dispatch operations are denied and write nothing
+        let bad_export = call_mcp(
+            &mut app,
+            2,
+            "run_workbench_workflow",
+            serde_json::json!({
+                "action": "export_results",
+                "prefix": outside_dir.join("leak_star").to_string_lossy(),
+                "format": "star"
+            }),
+        );
+        assert_eq!(bad_export["isError"], true);
+        app.apply_pending_mcp_bridge_commands();
+        assert!(!outside_dir.join("leak_star.str").exists());
+
+        let bad_seq = call_mcp(
+            &mut app,
+            3,
+            "run_workbench_workflow",
+            serde_json::json!({
+                "action": "set_sequence",
+                "sequence_path": out_fasta.to_string_lossy()
+            }),
+        );
+        assert_eq!(bad_seq["isError"], true);
+        app.apply_pending_mcp_bridge_commands();
+        assert_eq!(app.sequence.len(), 76);
+
+        let bad_study = call_mcp(
+            &mut app,
+            4,
+            "run_workbench_workflow",
+            serde_json::json!({
+                "action": "load_study_folder",
+                "path": outside_dir.to_string_lossy()
+            }),
+        );
+        assert_eq!(bad_study["isError"], true);
+
+        app.export_prefix = outside_dir.join("bad_sess").to_string_lossy().into_owned();
+        app.sync_mcp_bridge_snapshot_and_viewport();
+        let bad_save = call_mcp(
+            &mut app,
+            5,
+            "dispatch_workbench_action",
+            serde_json::json!({ "action": "save_session_nef", "overwrite": true }),
+        );
+        assert_eq!(bad_save["isError"], true);
+        app.apply_pending_mcp_bridge_commands();
+        assert!(!outside_dir.join("bad_sess.nef").exists());
+
+        // 2. In-root export succeeds, then silent overwrite is refused until overwrite=true
+        let clean_prefix = study_dir.join("ubq_out");
+        let nef_path = clean_prefix.with_extension("nef");
+        let ok_export = call_mcp(
+            &mut app,
+            6,
+            "run_workbench_workflow",
+            serde_json::json!({
+                "action": "export_results",
+                "prefix": clean_prefix.to_string_lossy(),
+                "format": "nef"
+            }),
+        );
+        assert_ne!(
+            ok_export["isError"], true,
+            "unexpected failure: {ok_export}"
+        );
+        app.apply_pending_mcp_bridge_commands();
+        assert!(nef_path.exists());
+
+        std::fs::write(&nef_path, "SENTINEL_KEEP").expect("seed sentinel file");
+        let denied_overwrite = call_mcp(
+            &mut app,
+            7,
+            "run_workbench_workflow",
+            serde_json::json!({
+                "action": "export_results",
+                "prefix": clean_prefix.to_string_lossy(),
+                "format": "nef"
+            }),
+        );
+        assert_eq!(denied_overwrite["isError"], true);
+        app.apply_pending_mcp_bridge_commands();
+        assert_eq!(std::fs::read_to_string(&nef_path).unwrap(), "SENTINEL_KEEP");
+
+        let ok_overwrite = call_mcp(
+            &mut app,
+            8,
+            "run_workbench_workflow",
+            serde_json::json!({
+                "action": "export_results",
+                "prefix": clean_prefix.to_string_lossy(),
+                "format": "nef",
+                "overwrite": true
+            }),
+        );
+        assert_ne!(ok_overwrite["isError"], true);
+        app.apply_pending_mcp_bridge_commands();
+        assert_ne!(std::fs::read_to_string(&nef_path).unwrap(), "SENTINEL_KEEP");
+
+        // Guarded SaveSessionNef honors overwrite flag against existing file
+        app.export_prefix = clean_prefix.to_string_lossy().into_owned();
+        app.sync_mcp_bridge_snapshot_and_viewport();
+        let save_refused = call_mcp(
+            &mut app,
+            9,
+            "dispatch_workbench_action",
+            serde_json::json!({ "action": "save_session_nef" }),
+        );
+        assert_eq!(save_refused["isError"], true);
+        let save_ok = call_mcp(
+            &mut app,
+            10,
+            "dispatch_workbench_action",
+            serde_json::json!({ "action": "save_session_nef", "overwrite": true }),
+        );
+        assert_ne!(save_ok["isError"], true);
+        app.apply_pending_mcp_bridge_commands();
+
+        // 3. In-root sequence read succeeds
+        let ok_seq = call_mcp(
+            &mut app,
+            11,
+            "run_workbench_workflow",
+            serde_json::json!({
+                "action": "set_sequence",
+                "sequence_path": in_fasta.to_string_lossy()
+            }),
+        );
+        assert_ne!(ok_seq["isError"], true);
+        app.apply_pending_mcp_bridge_commands();
+        assert_eq!(app.sequence.len(), 10);
+
+        // 4. ResetWorkspace denied unless both allow_destructive_actions=true and confirm=true
+        let reset_no_perm = call_mcp(
+            &mut app,
+            12,
+            "dispatch_workbench_action",
+            serde_json::json!({ "action": "reset_workspace", "confirm": true }),
+        );
+        assert_eq!(reset_no_perm["isError"], true);
+        app.apply_pending_mcp_bridge_commands();
+        assert_eq!(app.sequence.len(), 10);
+        assert!(!app.peaks.is_empty());
+
+        app.mcp_bridge.set_destructive_actions_allowed(true);
+        let reset_no_confirm = call_mcp(
+            &mut app,
+            13,
+            "dispatch_workbench_action",
+            serde_json::json!({ "action": "reset_workspace" }),
+        );
+        assert_eq!(reset_no_confirm["isError"], true);
+        app.apply_pending_mcp_bridge_commands();
+        assert_eq!(app.sequence.len(), 10);
+
+        let reset_confirmed = call_mcp(
+            &mut app,
+            14,
+            "dispatch_workbench_action",
+            serde_json::json!({ "action": "reset_workspace", "confirm": true }),
+        );
+        assert_ne!(reset_confirmed["isError"], true);
+        app.apply_pending_mcp_bridge_commands();
+        assert!(app.sequence.is_empty());
+        assert!(app.peaks.is_empty());
     }
 
     #[test]

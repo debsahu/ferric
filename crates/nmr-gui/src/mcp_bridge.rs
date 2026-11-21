@@ -23,22 +23,28 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 #[cfg(not(any(unix, windows)))]
 use std::hash::{BuildHasher, Hasher};
 #[cfg(not(target_arch = "wasm32"))]
-use std::io::{BufReader, Read, Write};
+use std::io::{ErrorKind, Read, Write};
 #[cfg(not(target_arch = "wasm32"))]
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener, TcpStream};
+use std::net::{Ipv4Addr, Shutdown, SocketAddr, SocketAddrV4, TcpListener, TcpStream};
+#[cfg(not(target_arch = "wasm32"))]
+use std::path::{Component, Path, PathBuf};
 #[cfg(not(target_arch = "wasm32"))]
 use std::sync::atomic::AtomicBool;
 #[cfg(not(any(unix, windows)))]
 use std::sync::atomic::AtomicU64;
 #[cfg(any(not(target_arch = "wasm32"), not(any(unix, windows))))]
 use std::sync::atomic::Ordering;
+#[cfg(not(target_arch = "wasm32"))]
+use std::sync::Condvar;
 use std::sync::{Arc, Mutex};
 #[cfg(not(target_arch = "wasm32"))]
 use std::thread::{self, JoinHandle};
 #[cfg(not(target_arch = "wasm32"))]
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use eframe::egui;
+#[cfg(not(target_arch = "wasm32"))]
+use nmr_core::mcp::{McpAccessMode, McpSecurityError, McpSecurityErrorKind, McpSecurityPolicy};
 use serde_json::{json, Value};
 
 use crate::contour_painter::SyncCrosshair;
@@ -63,6 +69,22 @@ pub const PNG_SIGNATURE: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x
 
 #[cfg(not(target_arch = "wasm32"))]
 const MAX_MCP_HTTP_BODY_BYTES: usize = 4 * 1024 * 1024; // 4 MiB
+
+/// Default total HTTP request read deadline (`2 s`) enforcing slow-loris protection.
+#[cfg(not(target_arch = "wasm32"))]
+pub const DEFAULT_MCP_HTTP_REQUEST_DEADLINE: Duration = Duration::from_secs(2);
+
+#[cfg(not(target_arch = "wasm32"))]
+const MCP_HTTP_SOCKET_READ_SLICE: Duration = Duration::from_millis(200);
+
+#[cfg(not(target_arch = "wasm32"))]
+const MCP_HTTP_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[cfg(not(target_arch = "wasm32"))]
+const MAX_MCP_CONCURRENT_CONNECTIONS: usize = 16;
+
+#[cfg(not(target_arch = "wasm32"))]
+const MAX_MCP_SEQUENCE_FILE_BYTES: u64 = 16 * 1024 * 1024;
 
 #[cfg(not(any(unix, windows)))]
 static TOKEN_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -440,11 +462,21 @@ pub enum McpUiCommand {
         n_bottom: f64,
     },
     /// Queue exporting workbench outputs (`"star"`, `"peaks"`, `"nef"`, or `"html"`) to `prefix`.
-    ExportResults { prefix: String, format: String },
+    ExportResults {
+        prefix: String,
+        format: String,
+        overwrite: bool,
+    },
     /// Queue locking or unlocking a 1-based residue assignment anchor.
     SetLockResidue { seq_id: i32, locked: bool },
     /// Queue dispatching any registered [`WorkbenchAction`] from the workbench action catalog.
     DispatchWorkbenchAction { action: WorkbenchAction },
+    /// Queue dispatching a [`WorkbenchAction`] carrying explicit overwrite/confirmation flags.
+    DispatchGuardedWorkbenchAction {
+        action: WorkbenchAction,
+        overwrite: bool,
+        confirm: bool,
+    },
 }
 
 impl McpUiCommand {
@@ -535,14 +567,27 @@ impl McpUiCommand {
             } => format!(
                 "SetViewportBounds(H=[{h_left:.2}, {h_right:.2}], N=[{n_top:.2}, {n_bottom:.2}])"
             ),
-            Self::ExportResults { prefix, format } => {
-                format!("ExportResults(prefix={prefix}, format={format})")
+            Self::ExportResults {
+                prefix,
+                format,
+                overwrite,
+            } => {
+                format!("ExportResults(prefix={prefix}, format={format}, overwrite={overwrite})")
             }
             Self::SetLockResidue { seq_id, locked } => {
                 format!("SetLockResidue(seq={seq_id}, locked={locked})")
             }
             Self::DispatchWorkbenchAction { action } => {
                 format!("DispatchWorkbenchAction({action:?})")
+            }
+            Self::DispatchGuardedWorkbenchAction {
+                action,
+                overwrite,
+                confirm,
+            } => {
+                format!(
+                    "DispatchGuardedWorkbenchAction({action:?}, overwrite={overwrite}, confirm={confirm})"
+                )
             }
         }
     }
@@ -599,6 +644,7 @@ pub enum McpAuditOutcome {
     Undone,
     Redone,
     BlockedReadOnly,
+    BlockedSecurity,
 }
 
 impl McpAuditOutcome {
@@ -609,6 +655,7 @@ impl McpAuditOutcome {
             Self::Undone => "UNDONE",
             Self::Redone => "REDONE",
             Self::BlockedReadOnly => "BLOCKED",
+            Self::BlockedSecurity => "DENIED",
         }
     }
 }
@@ -704,6 +751,11 @@ impl McpUndoLog {
     /// Record a `ReadOnly`-blocked mutation attempt in the live audit trail without mutating state.
     pub fn record_blocked_readonly(&mut self, summary: impl Into<String>) {
         self.push_audit(McpAuditOutcome::BlockedReadOnly, summary.into());
+    }
+
+    /// Record a security-sandbox, overwrite, or destructive-action refusal in the live audit trail.
+    pub fn record_blocked_security(&mut self, summary: impl Into<String>) {
+        self.push_audit(McpAuditOutcome::BlockedSecurity, summary.into());
     }
 
     /// Apply `command` to `snapshot`, push an exact inverse record onto the bounded Undo stack,
@@ -946,7 +998,11 @@ impl McpUndoLog {
                 );
                 delta
             }
-            McpUiCommand::ExportResults { prefix, format } => {
+            McpUiCommand::ExportResults {
+                prefix,
+                format,
+                overwrite: _,
+            } => {
                 let delta = Self::capture_workflow_undo(snapshot);
                 snapshot.status_msg = format!("Queued export ({format} -> {prefix})");
                 delta
@@ -959,7 +1015,8 @@ impl McpUndoLog {
                 );
                 delta
             }
-            McpUiCommand::DispatchWorkbenchAction { action } => {
+            McpUiCommand::DispatchWorkbenchAction { action }
+            | McpUiCommand::DispatchGuardedWorkbenchAction { action, .. } => {
                 let delta = Self::capture_workflow_undo(snapshot);
                 snapshot.status_msg =
                     format!("Queued workbench action: {}", action.metadata().title);
@@ -1634,12 +1691,219 @@ pub fn verify_bearer_authorization(auth_header: Option<&str>, expected_token: &s
     constant_time_eq(expected_token.as_bytes(), candidate.as_bytes())
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Clone, Debug)]
+enum SandboxedWriteCheckError {
+    Security(McpSecurityError),
+    OverwriteRefused { display_name: String },
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl SandboxedWriteCheckError {
+    fn error_kind(&self) -> &'static str {
+        match self {
+            Self::Security(sec) => sec.kind.as_str(),
+            Self::OverwriteRefused { .. } => "overwrite_refused",
+        }
+    }
+
+    fn rpc_code(&self) -> i32 {
+        match self {
+            Self::Security(sec) => sec.kind.rpc_code(),
+            Self::OverwriteRefused { .. } => nmr_core::mcp::ERR_SECURITY_VIOLATION,
+        }
+    }
+
+    fn message(&self) -> String {
+        match self {
+            Self::Security(sec) => sec.message.clone(),
+            Self::OverwriteRefused { display_name } => format!(
+                "refusing silent overwrite of existing file '{display_name}'; pass overwrite: true to replace it"
+            ),
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+const FORBIDDEN_CREDENTIAL_SEGMENTS: &[&str] = &[
+    ".ssh",
+    ".aws",
+    ".gnupg",
+    ".env",
+    ".netrc",
+    ".kube",
+    ".git-credentials",
+    ".docker",
+    ".npmrc",
+    ".pypirc",
+    "id_rsa",
+    "id_ed25519",
+    "id_ecdsa",
+    "id_dsa",
+];
+
+#[cfg(not(target_arch = "wasm32"))]
+fn is_forbidden_credential_seg(seg: &str) -> bool {
+    let lower = seg.to_ascii_lowercase();
+    FORBIDDEN_CREDENTIAL_SEGMENTS.contains(&lower.as_str()) || lower.starts_with(".env.")
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn has_forbidden_uri_scheme(raw: &str) -> bool {
+    let trimmed = raw.trim();
+    if trimmed.contains("://") {
+        return true;
+    }
+    if let Some((scheme, _rest)) = trimmed.split_once(':') {
+        if (2..=24).contains(&scheme.len()) {
+            let bytes = scheme.as_bytes();
+            if bytes[0].is_ascii_alphabetic()
+                && bytes
+                    .iter()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.'))
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn validate_raw_prefix(raw_prefix: &str) -> Result<PathBuf, McpSecurityError> {
+    if raw_prefix.contains('\0') {
+        return Err(McpSecurityError::new(
+            McpSecurityErrorKind::NullByteOrInvalidPath,
+            "export prefix contains a forbidden null byte",
+        ));
+    }
+    let trimmed = raw_prefix.trim();
+    if trimmed.is_empty() {
+        return Err(McpSecurityError::new(
+            McpSecurityErrorKind::NullByteOrInvalidPath,
+            "export prefix must not be empty",
+        ));
+    }
+    if has_forbidden_uri_scheme(trimmed) {
+        return Err(McpSecurityError::new(
+            McpSecurityErrorKind::NullByteOrInvalidPath,
+            "URI schemes are forbidden in MCP export paths",
+        ));
+    }
+    if trimmed.ends_with('/') || trimmed.ends_with('\\') {
+        return Err(McpSecurityError::new(
+            McpSecurityErrorKind::NullByteOrInvalidPath,
+            "export prefix must name a file prefix, not a directory",
+        ));
+    }
+    let path = Path::new(trimmed);
+    for comp in path.components() {
+        match comp {
+            Component::ParentDir => {
+                return Err(McpSecurityError::new(
+                    McpSecurityErrorKind::ParentTraversal,
+                    "relative parent traversal ('..') is forbidden in MCP export paths",
+                ));
+            }
+            Component::Normal(os) => {
+                let s = os.to_str().ok_or_else(|| {
+                    McpSecurityError::new(
+                        McpSecurityErrorKind::NullByteOrInvalidPath,
+                        "non-UTF-8 path segment is forbidden",
+                    )
+                })?;
+                if is_forbidden_credential_seg(s) {
+                    return Err(McpSecurityError::new(
+                        McpSecurityErrorKind::CredentialPathBlocked,
+                        format!("access to sensitive credential path segment '{s}' is forbidden"),
+                    ));
+                }
+            }
+            Component::CurDir | Component::RootDir | Component::Prefix(_) => {}
+        }
+    }
+    let Some(fname) = path.file_name().and_then(|s| s.to_str()) else {
+        return Err(McpSecurityError::new(
+            McpSecurityErrorKind::NullByteOrInvalidPath,
+            "export prefix must include a valid file stem",
+        ));
+    };
+    if fname.is_empty() || fname == "." || fname == ".." {
+        return Err(McpSecurityError::new(
+            McpSecurityErrorKind::NullByteOrInvalidPath,
+            "export prefix must include a valid file stem",
+        ));
+    }
+    Ok(path.to_path_buf())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn canonicalize_approved_root(raw: &Path) -> Result<PathBuf, String> {
+    let canon = std::fs::canonicalize(raw).map_err(|e| {
+        format!(
+            "failed to canonicalize root directory '{}': {e}",
+            raw.display()
+        )
+    })?;
+    if !canon.is_dir() {
+        return Err(format!(
+            "approved MCP root '{}' must be an existing directory",
+            canon.display()
+        ));
+    }
+    if canon.parent().is_none() {
+        return Err(
+            "refusing filesystem root ('/' or drive root) as an MCP sandbox root".to_string(),
+        );
+    }
+    Ok(canon)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn default_cwd_roots() -> Vec<PathBuf> {
+    let Ok(cwd) = std::env::current_dir() else {
+        return Vec::new();
+    };
+    match canonicalize_approved_root(&cwd) {
+        Ok(canon) => vec![canon],
+        Err(_) => Vec::new(),
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn absolutize_against_cwd(p: &Path) -> Result<PathBuf, McpSecurityError> {
+    if p.is_absolute() {
+        Ok(p.to_path_buf())
+    } else {
+        let cwd = std::env::current_dir().map_err(|e| {
+            McpSecurityError::new(
+                McpSecurityErrorKind::IoError,
+                format!("failed to determine current working directory: {e}"),
+            )
+        })?;
+        Ok(cwd.join(p))
+    }
+}
+
 struct SharedBridgeInner {
     snapshot: WorkbenchSnapshot,
     data_tables: WorkbenchDataTables,
     undo_log: McpUndoLog,
     viewport: ViewportFrameBuffer,
     permission: McpBridgePermission,
+    allow_destructive_actions: bool,
+    #[cfg(not(target_arch = "wasm32"))]
+    active_study_root: Option<PathBuf>,
+    #[cfg(not(target_arch = "wasm32"))]
+    approved_roots: Vec<PathBuf>,
+    #[cfg(not(target_arch = "wasm32"))]
+    roots_customized: bool,
+    #[cfg(not(target_arch = "wasm32"))]
+    last_mcp_loaded_path: Option<PathBuf>,
+    #[cfg(not(target_arch = "wasm32"))]
+    active_ingest_root: Option<PathBuf>,
+    #[cfg(not(target_arch = "wasm32"))]
+    current_export_prefix: String,
     bearer_token: String,
     bearer_token_csprng: bool,
     handled_requests: u64,
@@ -1663,6 +1927,19 @@ impl SharedBridgeInner {
             undo_log: McpUndoLog::new(),
             viewport: ViewportFrameBuffer::diagnostic_card(64, 48, xh),
             permission: McpBridgePermission::ReadOnly,
+            allow_destructive_actions: false,
+            #[cfg(not(target_arch = "wasm32"))]
+            active_study_root: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            approved_roots: Vec::new(),
+            #[cfg(not(target_arch = "wasm32"))]
+            roots_customized: false,
+            #[cfg(not(target_arch = "wasm32"))]
+            last_mcp_loaded_path: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            active_ingest_root: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            current_export_prefix: "result_gui".to_string(),
             bearer_token,
             bearer_token_csprng,
             handled_requests: 0,
@@ -1674,6 +1951,170 @@ impl SharedBridgeInner {
         if let Some(ctx) = &self.repaint_ctx {
             ctx.request_repaint();
         }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn effective_roots(&self) -> Vec<PathBuf> {
+        if self.roots_customized {
+            self.approved_roots.clone()
+        } else if let Some(ref study) = self.active_study_root {
+            vec![study.clone()]
+        } else {
+            default_cwd_roots()
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn security_policy(&self, effective_permission: McpBridgePermission) -> McpSecurityPolicy {
+        let mode = match effective_permission {
+            McpBridgePermission::ReadOnly => McpAccessMode::ReadOnly,
+            McpBridgePermission::ReadWrite => McpAccessMode::ReadWrite,
+        };
+        McpSecurityPolicy::new(self.effective_roots(), mode)
+            .unwrap_or_else(|_| McpSecurityPolicy::empty_read_only())
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn resolve_sandboxed_read_path(
+        &self,
+        raw_path: &str,
+        allow_dir: bool,
+    ) -> Result<PathBuf, McpSecurityError> {
+        let policy = self.security_policy(McpBridgePermission::ReadWrite);
+        let resolved = policy.resolve_sandboxed_path(raw_path)?;
+        let meta = std::fs::symlink_metadata(&resolved).map_err(|e| {
+            McpSecurityError::new(
+                McpSecurityErrorKind::IoError,
+                format!("failed to inspect sandboxed path metadata: {e}"),
+            )
+        })?;
+        if meta.file_type().is_symlink() {
+            return Err(McpSecurityError::new(
+                McpSecurityErrorKind::SymlinkEscape,
+                "symlink target is forbidden in sandboxed MCP paths",
+            ));
+        }
+        if allow_dir {
+            if !meta.is_file() && !meta.is_dir() {
+                return Err(McpSecurityError::new(
+                    McpSecurityErrorKind::NullByteOrInvalidPath,
+                    "sandboxed path must be a regular file or directory",
+                ));
+            }
+        } else {
+            if !meta.is_file() {
+                return Err(McpSecurityError::new(
+                    McpSecurityErrorKind::NullByteOrInvalidPath,
+                    "sandboxed path must be a regular file",
+                ));
+            }
+            if meta.len() > MAX_MCP_SEQUENCE_FILE_BYTES {
+                return Err(McpSecurityError::new(
+                    McpSecurityErrorKind::NullByteOrInvalidPath,
+                    format!(
+                        "file exceeds {} MiB MCP read limit",
+                        MAX_MCP_SEQUENCE_FILE_BYTES / (1024 * 1024)
+                    ),
+                ));
+            }
+        }
+        Ok(resolved)
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn resolve_sandboxed_export_targets(
+        &self,
+        raw_prefix: &str,
+        exts: &[&str],
+        overwrite: bool,
+        resolve_relative_against_cwd: bool,
+        tool_name: &str,
+    ) -> Result<Vec<PathBuf>, SandboxedWriteCheckError> {
+        let base_p = validate_raw_prefix(raw_prefix).map_err(SandboxedWriteCheckError::Security)?;
+        let policy = self.security_policy(McpBridgePermission::ReadWrite);
+        let mut resolved_targets = Vec::with_capacity(exts.len());
+        for ext in exts {
+            let mut target = base_p.with_extension(ext);
+            if resolve_relative_against_cwd && !target.is_absolute() {
+                target =
+                    absolutize_against_cwd(&target).map_err(SandboxedWriteCheckError::Security)?;
+            }
+            let target_str = target.to_str().ok_or_else(|| {
+                SandboxedWriteCheckError::Security(McpSecurityError::new(
+                    McpSecurityErrorKind::NullByteOrInvalidPath,
+                    "export path must be valid UTF-8",
+                ))
+            })?;
+            let resolved = policy
+                .resolve_sandboxed_write_path(target_str, tool_name)
+                .map_err(SandboxedWriteCheckError::Security)?;
+            match std::fs::symlink_metadata(&resolved) {
+                Ok(meta) => {
+                    if meta.file_type().is_symlink() {
+                        return Err(SandboxedWriteCheckError::Security(McpSecurityError::new(
+                            McpSecurityErrorKind::SymlinkEscape,
+                            "refusing to write through a symlink",
+                        )));
+                    }
+                    if !meta.is_file() {
+                        return Err(SandboxedWriteCheckError::Security(McpSecurityError::new(
+                            McpSecurityErrorKind::NullByteOrInvalidPath,
+                            "export destination exists and is not a regular file",
+                        )));
+                    }
+                    if !overwrite {
+                        return Err(SandboxedWriteCheckError::OverwriteRefused {
+                            display_name: policy.relativize_display_path(&resolved),
+                        });
+                    }
+                }
+                Err(e) if e.kind() == ErrorKind::NotFound => {}
+                Err(e) => {
+                    return Err(SandboxedWriteCheckError::Security(McpSecurityError::new(
+                        McpSecurityErrorKind::IoError,
+                        format!("failed to inspect destination metadata: {e}"),
+                    )));
+                }
+            }
+            resolved_targets.push(resolved);
+        }
+        Ok(resolved_targets)
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn resolve_sandboxed_session_load_path(
+        &self,
+        raw_prefix: &str,
+    ) -> Result<PathBuf, McpSecurityError> {
+        let base_p = validate_raw_prefix(raw_prefix)?;
+        let mut target = base_p.with_extension("nef");
+        if !target.is_absolute() {
+            target = absolutize_against_cwd(&target)?;
+        }
+        let target_str = target.to_str().ok_or_else(|| {
+            McpSecurityError::new(
+                McpSecurityErrorKind::NullByteOrInvalidPath,
+                "session path must be valid UTF-8",
+            )
+        })?;
+        let policy = self.security_policy(McpBridgePermission::ReadWrite);
+        // Validate containment even if the `.nef` file does not exist yet (prevents out-of-root probing).
+        let resolved = policy.resolve_sandboxed_write_path(target_str, "LoadSessionNef")?;
+        if let Ok(meta) = std::fs::symlink_metadata(&resolved) {
+            if meta.file_type().is_symlink() {
+                return Err(McpSecurityError::new(
+                    McpSecurityErrorKind::SymlinkEscape,
+                    "refusing to load session through a symlink",
+                ));
+            }
+            if !meta.is_file() {
+                return Err(McpSecurityError::new(
+                    McpSecurityErrorKind::NullByteOrInvalidPath,
+                    "session path exists and is not a regular file",
+                ));
+            }
+        }
+        Ok(resolved)
     }
 }
 
@@ -1757,7 +2198,7 @@ fn mcp_tool_schemas_json() -> Value {
         },
         {
             "name": "run_workbench_workflow",
-            "description": "Queue parameterized workbench workflows (`load_study_folder`, `set_sequence`, `pick_peaks`, `run_assignment`, `select_workbook_page`, `set_contour_level`, `set_viewport_bounds`, `export_results`, `set_lock_residue`). Requires ReadWrite permission.",
+            "description": "Queue parameterized workbench workflows (`load_study_folder`, `set_sequence`, `pick_peaks`, `run_assignment`, `select_workbook_page`, `set_contour_level`, `set_viewport_bounds`, `export_results`, `set_lock_residue`). Requires ReadWrite permission; filesystem paths are strictly sandboxed to user-approved roots and existing files are not overwritten unless `overwrite: true` is passed.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1807,6 +2248,10 @@ fn mcp_tool_schemas_json() -> Value {
                         "type": "string",
                         "enum": ["star", "peaks", "nef", "html"]
                     },
+                    "overwrite": {
+                        "type": "boolean",
+                        "description": "Explicitly allow overwriting an existing output file during export_results (default: false)."
+                    },
                     "seq_id": { "type": "integer" },
                     "locked": { "type": "boolean" }
                 },
@@ -1815,13 +2260,21 @@ fn mcp_tool_schemas_json() -> Value {
         },
         {
             "name": "dispatch_workbench_action",
-            "description": "Dispatch any registered WorkbenchAction (menu, workflow, view, picker, assignment, structure, dynamics, or mode switch) by PascalCase or snake_case name. Requires ReadWrite permission.",
+            "description": "Dispatch any registered WorkbenchAction (menu, workflow, view, picker, assignment, structure, dynamics, or mode switch) by PascalCase or snake_case name. Requires ReadWrite permission; file-backed actions obey approved-root sandboxing & overwrite refusal, and destructive actions (`ResetWorkspace`) are denied unless explicitly enabled in MCP settings and confirmed (`confirm: true`).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
                         "description": "WorkbenchAction variant name in PascalCase (e.g. 'SwitchModeAssign') or snake_case (e.g. 'switch_mode_assign'). Call inspect_workbench_data with section='actions' to list all valid names."
+                    },
+                    "overwrite": {
+                        "type": "boolean",
+                        "description": "Explicitly allow overwriting existing files for session/STAR/peaks/HTML export actions (default: false)."
+                    },
+                    "confirm": {
+                        "type": "boolean",
+                        "description": "Explicit confirmation flag required for destructive actions when enabled in GUI MCP settings (default: false)."
                     }
                 },
                 "required": ["action"]
@@ -2257,11 +2710,13 @@ fn parse_workflow_command(args: &Value) -> Result<(&'static str, McpUiCommand), 
                     "unknown export format '{format}'; expected 'star', 'peaks', 'nef', or 'html'"
                 ));
             }
+            let overwrite = parse_optional_bool(args, "overwrite", false)?;
             Ok((
                 "export_results",
                 McpUiCommand::ExportResults {
                     prefix,
                     format: format.to_string(),
+                    overwrite,
                 },
             ))
         }
@@ -2295,8 +2750,19 @@ fn parse_dispatch_action_command(args: &Value) -> Result<(String, McpUiCommand),
         })?;
     let action =
         parse_workbench_action(raw).ok_or_else(|| format!("unknown WorkbenchAction '{raw}'"))?;
+    let overwrite = parse_optional_bool(args, "overwrite", false)?;
+    let confirm = parse_optional_bool(args, "confirm", false)?;
     let canonical = workbench_action_canonical_name(action);
-    Ok((canonical, McpUiCommand::DispatchWorkbenchAction { action }))
+    let cmd = if overwrite || confirm {
+        McpUiCommand::DispatchGuardedWorkbenchAction {
+            action,
+            overwrite,
+            confirm,
+        }
+    } else {
+        McpUiCommand::DispatchWorkbenchAction { action }
+    };
+    Ok((canonical, cmd))
 }
 
 fn slice_paginated_items(items: Vec<Value>, offset: usize, limit: usize) -> Value {
@@ -2475,8 +2941,34 @@ fn execute_inspect_workbench_data(
     Ok(payload)
 }
 
-/// Execute a single JSON-RPC 2.0 MCP message against `inner`, returning `None` for one-way
-/// JSON-RPC notifications (`notifications/initialized`) and `Some(response_json)` for requests.
+fn mcp_security_denied_response(
+    id: Value,
+    action_name: &str,
+    permission: McpBridgePermission,
+    error_kind: &str,
+    rpc_code: i32,
+    reason: String,
+) -> Value {
+    jsonrpc_ok(
+        id,
+        mcp_text_result(
+            json!({
+                "status": "denied",
+                "queued": false,
+                "action": action_name,
+                "permission": permission.as_str(),
+                "error_kind": error_kind,
+                "rpc_code": rpc_code,
+                "reason": reason,
+            }),
+            true,
+        ),
+    )
+}
+
+/// Execute a JSON-RPC 2.0 MCP payload (single request, notification, or batch array) against
+/// `inner`, returning `None` for one-way notifications (or all-notification batches) and
+/// `Some(response_json)` for requests/batches.
 fn dispatch_mcp_jsonrpc(inner: &mut SharedBridgeInner, raw_body: &[u8]) -> Option<Value> {
     dispatch_mcp_jsonrpc_with_permission(inner, raw_body, None)
 }
@@ -2503,14 +2995,62 @@ fn dispatch_mcp_jsonrpc_with_permission(
             ))
         }
     };
-    let Some(obj) = parsed.as_object() else {
-        return Some(jsonrpc_err(
+    match parsed {
+        Value::Object(obj) => dispatch_mcp_jsonrpc_object(inner, &obj, effective_permission),
+        Value::Array(items) => {
+            if items.is_empty() {
+                return Some(jsonrpc_err(
+                    Value::Null,
+                    -32600,
+                    "Invalid Request: JSON-RPC batch array must not be empty",
+                ));
+            }
+            let mut responses = Vec::with_capacity(items.len());
+            for item in items {
+                match item {
+                    Value::Object(obj) => {
+                        if let Some(resp) =
+                            dispatch_mcp_jsonrpc_object(inner, &obj, effective_permission)
+                        {
+                            responses.push(resp);
+                        }
+                    }
+                    _ => responses.push(jsonrpc_err(
+                        Value::Null,
+                        -32600,
+                        "Invalid Request: batch item must be a JSON-RPC request object",
+                    )),
+                }
+            }
+            if responses.is_empty() {
+                None
+            } else {
+                Some(Value::Array(responses))
+            }
+        }
+        _ => Some(jsonrpc_err(
             Value::Null,
             -32600,
-            "Invalid Request: JSON-RPC payload must be an object",
-        ));
-    };
+            "Invalid Request: JSON-RPC payload must be an object or non-empty batch array",
+        )),
+    }
+}
+
+fn dispatch_mcp_jsonrpc_object(
+    inner: &mut SharedBridgeInner,
+    obj: &serde_json::Map<String, Value>,
+    effective_permission: McpBridgePermission,
+) -> Option<Value> {
     let id_opt = obj.get("id").cloned();
+    if let Some(ref id_val) = id_opt {
+        if !matches!(id_val, Value::Null | Value::Number(_) | Value::String(_)) {
+            return Some(jsonrpc_err(
+                Value::Null,
+                -32600,
+                "Invalid Request: JSON-RPC 'id' must be a string, number, or null",
+            ));
+        }
+    }
     if obj.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
         return Some(jsonrpc_err(
             id_opt.unwrap_or(Value::Null),
@@ -2576,6 +3116,19 @@ fn dispatch_mcp_jsonrpc_with_permission(
                             "permission".to_string(),
                             Value::String(effective_permission.as_str().to_string()),
                         );
+                        m.insert(
+                            "allow_destructive_actions".to_string(),
+                            Value::Bool(inner.allow_destructive_actions),
+                        );
+                        #[cfg(not(target_arch = "wasm32"))]
+                        {
+                            let roots: Vec<Value> = inner
+                                .effective_roots()
+                                .into_iter()
+                                .map(|p| Value::String(p.display().to_string()))
+                                .collect();
+                            m.insert("approved_roots".to_string(), Value::Array(roots));
+                        }
                     }
                     Some(jsonrpc_ok(id, mcp_text_result(snap, false)))
                 }
@@ -2777,6 +3330,77 @@ fn dispatch_mcp_jsonrpc_with_permission(
                             ),
                         ));
                     }
+                    #[cfg(not(target_arch = "wasm32"))]
+                    match &cmd {
+                        McpUiCommand::LoadStudyFolder { path, .. } => {
+                            if let Err(sec) = inner.resolve_sandboxed_read_path(path, true) {
+                                inner.undo_log.record_blocked_security(format!(
+                                    "run_workbench_workflow(load_study_folder): {}",
+                                    sec.message
+                                ));
+                                return Some(mcp_security_denied_response(
+                                    id,
+                                    action_name,
+                                    effective_permission,
+                                    sec.kind.as_str(),
+                                    sec.kind.rpc_code(),
+                                    sec.message,
+                                ));
+                            }
+                        }
+                        McpUiCommand::SetSequence {
+                            sequence_path: Some(seq_p),
+                            ..
+                        } => {
+                            if let Err(sec) = inner.resolve_sandboxed_read_path(seq_p, false) {
+                                inner.undo_log.record_blocked_security(format!(
+                                    "run_workbench_workflow(set_sequence): {}",
+                                    sec.message
+                                ));
+                                return Some(mcp_security_denied_response(
+                                    id,
+                                    action_name,
+                                    effective_permission,
+                                    sec.kind.as_str(),
+                                    sec.kind.rpc_code(),
+                                    sec.message,
+                                ));
+                            }
+                        }
+                        McpUiCommand::ExportResults {
+                            prefix,
+                            format,
+                            overwrite,
+                        } => {
+                            let ext = match format.trim().to_ascii_lowercase().as_str() {
+                                "peaks" => "tsv",
+                                "nef" => "nef",
+                                "html" => "html",
+                                _ => "str",
+                            };
+                            if let Err(err) = inner.resolve_sandboxed_export_targets(
+                                prefix,
+                                &[ext],
+                                *overwrite,
+                                false,
+                                "export_results",
+                            ) {
+                                let msg = err.message();
+                                inner.undo_log.record_blocked_security(format!(
+                                    "run_workbench_workflow(export_results): {msg}"
+                                ));
+                                return Some(mcp_security_denied_response(
+                                    id,
+                                    action_name,
+                                    effective_permission,
+                                    err.error_kind(),
+                                    err.rpc_code(),
+                                    msg,
+                                ));
+                            }
+                        }
+                        _ => {}
+                    }
                     let summary = cmd.summary();
                     let action_id = inner.undo_log.apply_command(&mut inner.snapshot, cmd);
                     inner.request_ui_repaint();
@@ -2820,10 +3444,172 @@ fn dispatch_mcp_jsonrpc_with_permission(
                             ),
                         ));
                     }
-                    let title = match &cmd {
-                        McpUiCommand::DispatchWorkbenchAction { action } => action.metadata().title,
-                        _ => "",
+                    let (wb_action, overwrite, confirm) = match &cmd {
+                        McpUiCommand::DispatchWorkbenchAction { action } => (*action, false, false),
+                        McpUiCommand::DispatchGuardedWorkbenchAction {
+                            action,
+                            overwrite,
+                            confirm,
+                        } => (*action, *overwrite, *confirm),
+                        _ => unreachable!(),
                     };
+                    if wb_action == WorkbenchAction::LoadPathOrSpectrum {
+                        let reason = "Use run_workbench_workflow(action='load_study_folder', path=...) to load sandboxed datasets via MCP".to_string();
+                        inner.undo_log.record_blocked_security(format!(
+                            "dispatch_workbench_action: {reason}"
+                        ));
+                        return Some(mcp_security_denied_response(
+                            id,
+                            &canonical_action,
+                            effective_permission,
+                            "sandbox_required",
+                            nmr_core::mcp::ERR_SECURITY_VIOLATION,
+                            reason,
+                        ));
+                    }
+                    if wb_action == WorkbenchAction::ResetWorkspace {
+                        if !inner.allow_destructive_actions {
+                            let reason = "destructive action 'ResetWorkspace' is denied via MCP (enable destructive actions in MCP Bridge settings and pass confirm: true, or reset manually in the GUI)".to_string();
+                            inner.undo_log.record_blocked_security(format!(
+                                "dispatch_workbench_action(ResetWorkspace): {reason}"
+                            ));
+                            return Some(mcp_security_denied_response(
+                                id,
+                                &canonical_action,
+                                effective_permission,
+                                "destructive_action_denied",
+                                nmr_core::mcp::ERR_SECURITY_VIOLATION,
+                                reason,
+                            ));
+                        }
+                        if !confirm {
+                            let reason = "destructive action 'ResetWorkspace' requires explicit confirm: true".to_string();
+                            inner.undo_log.record_blocked_security(format!(
+                                "dispatch_workbench_action(ResetWorkspace): {reason}"
+                            ));
+                            return Some(mcp_security_denied_response(
+                                id,
+                                &canonical_action,
+                                effective_permission,
+                                "confirmation_required",
+                                nmr_core::mcp::ERR_SECURITY_VIOLATION,
+                                reason,
+                            ));
+                        }
+                    }
+                    #[cfg(target_arch = "wasm32")]
+                    let _ = overwrite;
+                    #[cfg(not(target_arch = "wasm32"))]
+                    match wb_action {
+                        WorkbenchAction::SaveSessionNef | WorkbenchAction::SaveSessionNefAs => {
+                            if let Err(err) = inner.resolve_sandboxed_export_targets(
+                                &inner.current_export_prefix,
+                                &["nef"],
+                                overwrite,
+                                true,
+                                "dispatch_workbench_action",
+                            ) {
+                                let msg = err.message();
+                                inner.undo_log.record_blocked_security(format!(
+                                    "dispatch_workbench_action({canonical_action}): {msg}"
+                                ));
+                                return Some(mcp_security_denied_response(
+                                    id,
+                                    &canonical_action,
+                                    effective_permission,
+                                    err.error_kind(),
+                                    err.rpc_code(),
+                                    msg,
+                                ));
+                            }
+                        }
+                        WorkbenchAction::ExportNmrStar | WorkbenchAction::ExportPeaksTsv => {
+                            if let Err(err) = inner.resolve_sandboxed_export_targets(
+                                &inner.current_export_prefix,
+                                &["str", "tsv"],
+                                overwrite,
+                                true,
+                                "dispatch_workbench_action",
+                            ) {
+                                let msg = err.message();
+                                inner.undo_log.record_blocked_security(format!(
+                                    "dispatch_workbench_action({canonical_action}): {msg}"
+                                ));
+                                return Some(mcp_security_denied_response(
+                                    id,
+                                    &canonical_action,
+                                    effective_permission,
+                                    err.error_kind(),
+                                    err.rpc_code(),
+                                    msg,
+                                ));
+                            }
+                        }
+                        WorkbenchAction::ExportQualityReportHtml => {
+                            if let Err(err) = inner.resolve_sandboxed_export_targets(
+                                &inner.current_export_prefix,
+                                &["html"],
+                                overwrite,
+                                true,
+                                "dispatch_workbench_action",
+                            ) {
+                                let msg = err.message();
+                                inner.undo_log.record_blocked_security(format!(
+                                    "dispatch_workbench_action({canonical_action}): {msg}"
+                                ));
+                                return Some(mcp_security_denied_response(
+                                    id,
+                                    &canonical_action,
+                                    effective_permission,
+                                    err.error_kind(),
+                                    err.rpc_code(),
+                                    msg,
+                                ));
+                            }
+                        }
+                        WorkbenchAction::LoadSessionNef => {
+                            if let Err(sec) = inner
+                                .resolve_sandboxed_session_load_path(&inner.current_export_prefix)
+                            {
+                                inner.undo_log.record_blocked_security(format!(
+                                    "dispatch_workbench_action(LoadSessionNef): {}",
+                                    sec.message
+                                ));
+                                return Some(mcp_security_denied_response(
+                                    id,
+                                    &canonical_action,
+                                    effective_permission,
+                                    sec.kind.as_str(),
+                                    sec.kind.rpc_code(),
+                                    sec.message,
+                                ));
+                            }
+                        }
+                        WorkbenchAction::ProcessAllRawFids
+                        | WorkbenchAction::ReconstructNusIstFista => {
+                            if let Some(ref ingest_root) = inner.active_ingest_root {
+                                if let Err(sec) = inner.resolve_sandboxed_read_path(
+                                    &ingest_root.to_string_lossy(),
+                                    true,
+                                ) {
+                                    inner.undo_log.record_blocked_security(format!(
+                                        "dispatch_workbench_action({canonical_action}): {}",
+                                        sec.message
+                                    ));
+                                    return Some(mcp_security_denied_response(
+                                        id,
+                                        &canonical_action,
+                                        effective_permission,
+                                        sec.kind.as_str(),
+                                        sec.kind.rpc_code(),
+                                        sec.message,
+                                    ));
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                    let title = wb_action.metadata().title;
                     let summary = cmd.summary();
                     let action_id = inner.undo_log.apply_command(&mut inner.snapshot, cmd);
                     inner.request_ui_repaint();
@@ -2879,6 +3665,7 @@ fn dispatch_mcp_jsonrpc_with_permission(
 struct LoopbackServerHandle {
     bound_addr: SocketAddr,
     shutdown: Arc<AtomicBool>,
+    active_workers: Arc<(Mutex<usize>, Condvar)>,
     join_handle: Option<JoinHandle<()>>,
 }
 
@@ -2889,6 +3676,10 @@ impl LoopbackServerHandle {
         let _ = TcpStream::connect_timeout(&self.bound_addr, Duration::from_millis(100));
         if let Some(handle) = self.join_handle.take() {
             let _ = handle.join();
+        }
+        let (lock, cvar) = &*self.active_workers;
+        if let Ok(guard) = lock.lock() {
+            let _ = cvar.wait_timeout_while(guard, Duration::from_secs(2), |cnt| *cnt > 0);
         }
     }
 }
@@ -2916,35 +3707,259 @@ pub fn parse_strict_loopback_bind(bind_addr: &str) -> Result<SocketAddrV4, Strin
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-struct ParsedHttpRequest {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum McpHttpResponseFormat {
+    Json,
+    EventStream,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn negotiate_mcp_accept(accept_header: Option<&str>) -> Result<McpHttpResponseFormat, ()> {
+    let Some(raw) = accept_header.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(McpHttpResponseFormat::Json);
+    };
+
+    // Track (specificity, q) per RFC 9110 §12.5.1 so exact ranges override wildcards.
+    let mut best_json: Option<(u8, f64)> = None;
+    let mut best_sse: Option<(u8, f64)> = None;
+
+    let update_best = |slot: &mut Option<(u8, f64)>, spec: u8, q: f64| match *slot {
+        None => *slot = Some((spec, q)),
+        Some((prev_spec, prev_q)) => {
+            if spec > prev_spec || (spec == prev_spec && q > prev_q) {
+                *slot = Some((spec, q));
+            }
+        }
+    };
+
+    for range in raw.split(',') {
+        let mut parts = range.split(';');
+        let media = parts.next().unwrap_or("").trim().to_ascii_lowercase();
+        if media.is_empty() {
+            continue;
+        }
+        let mut q = 1.0_f64;
+        let mut valid_q = true;
+        for param in parts {
+            if let Some((k, v)) = param.trim().split_once('=') {
+                if k.trim().eq_ignore_ascii_case("q") {
+                    match v.trim().parse::<f64>() {
+                        Ok(parsed) if parsed.is_finite() && (0.0..=1.0).contains(&parsed) => {
+                            q = parsed;
+                        }
+                        _ => {
+                            valid_q = false;
+                        }
+                    }
+                }
+            }
+        }
+        if !valid_q {
+            continue;
+        }
+        match media.as_str() {
+            "application/json" => update_best(&mut best_json, 3, q),
+            "application/*" => update_best(&mut best_json, 2, q),
+            "text/event-stream" => update_best(&mut best_sse, 3, q),
+            "text/*" => update_best(&mut best_sse, 2, q),
+            "*/*" => {
+                update_best(&mut best_json, 1, q);
+                update_best(&mut best_sse, 1, q);
+            }
+            _ => {}
+        }
+    }
+
+    let q_json = best_json.map(|(_, q)| q).unwrap_or(0.0);
+    let q_sse = best_sse.map(|(_, q)| q).unwrap_or(0.0);
+    if q_json <= 0.0 && q_sse <= 0.0 {
+        return Err(());
+    }
+    if q_json >= q_sse {
+        Ok(McpHttpResponseFormat::Json)
+    } else {
+        Ok(McpHttpResponseFormat::EventStream)
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+enum HttpReadError {
+    Timeout,
+    Shutdown,
+    InvalidUtf8,
+    UnexpectedEof,
+    Io(String),
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+struct DeadlineReader<'a> {
+    stream: &'a TcpStream,
+    deadline: Instant,
+    shutdown: &'a AtomicBool,
+    buf: [u8; 4096],
+    pos: usize,
+    len: usize,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl<'a> DeadlineReader<'a> {
+    fn new(stream: &'a TcpStream, deadline: Instant, shutdown: &'a AtomicBool) -> Self {
+        Self {
+            stream,
+            deadline,
+            shutdown,
+            buf: [0u8; 4096],
+            pos: 0,
+            len: 0,
+        }
+    }
+
+    fn fill(&mut self) -> Result<usize, HttpReadError> {
+        loop {
+            let now = Instant::now();
+            if now >= self.deadline {
+                return Err(HttpReadError::Timeout);
+            }
+            if self.shutdown.load(Ordering::SeqCst) {
+                return Err(HttpReadError::Shutdown);
+            }
+            let slice = (self.deadline - now)
+                .min(MCP_HTTP_SOCKET_READ_SLICE)
+                .max(Duration::from_millis(1));
+            let _ = self.stream.set_read_timeout(Some(slice));
+            match (&*self.stream).read(&mut self.buf) {
+                Ok(n) => {
+                    self.pos = 0;
+                    self.len = n;
+                    return Ok(n);
+                }
+                Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+                Err(e) if matches!(e.kind(), ErrorKind::TimedOut | ErrorKind::WouldBlock) => {
+                    if Instant::now() >= self.deadline {
+                        return Err(HttpReadError::Timeout);
+                    }
+                    continue;
+                }
+                Err(e) => return Err(HttpReadError::Io(e.to_string())),
+            }
+        }
+    }
+
+    fn read_line_bounded(
+        &mut self,
+        max_bytes: usize,
+    ) -> Result<Option<(String, bool)>, HttpReadError> {
+        let mut raw = Vec::new();
+        let mut exceeded = false;
+        loop {
+            if Instant::now() >= self.deadline {
+                return Err(HttpReadError::Timeout);
+            }
+            if self.pos >= self.len {
+                let n = self.fill()?;
+                if n == 0 {
+                    if raw.is_empty() {
+                        return Ok(None);
+                    }
+                    break;
+                }
+            }
+            let slice = &self.buf[self.pos..self.len];
+            if let Some(nl_rel) = slice.iter().position(|&b| b == b'\n') {
+                let take = nl_rel + 1;
+                if !exceeded {
+                    if raw.len().saturating_add(take) > max_bytes {
+                        exceeded = true;
+                    } else {
+                        raw.extend_from_slice(&slice[..take]);
+                    }
+                }
+                self.pos += take;
+                break;
+            } else {
+                if !exceeded {
+                    if raw.len().saturating_add(slice.len()) > max_bytes {
+                        exceeded = true;
+                    } else {
+                        raw.extend_from_slice(slice);
+                    }
+                }
+                self.pos = self.len;
+            }
+        }
+        if exceeded {
+            return Ok(Some((String::new(), true)));
+        }
+        let s = String::from_utf8(raw).map_err(|_| HttpReadError::InvalidUtf8)?;
+        Ok(Some((s, false)))
+    }
+
+    fn read_exact_bounded(&mut self, exact_len: usize) -> Result<Vec<u8>, HttpReadError> {
+        let mut out = vec![0u8; exact_len];
+        let mut written = 0usize;
+        while written < exact_len {
+            if Instant::now() >= self.deadline {
+                return Err(HttpReadError::Timeout);
+            }
+            if self.pos < self.len {
+                let avail = (self.len - self.pos).min(exact_len - written);
+                out[written..written + avail]
+                    .copy_from_slice(&self.buf[self.pos..self.pos + avail]);
+                self.pos += avail;
+                written += avail;
+            } else {
+                let n = self.fill()?;
+                if n == 0 {
+                    return Err(HttpReadError::UnexpectedEof);
+                }
+            }
+        }
+        Ok(out)
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+struct ParsedHttpHeaders {
     method: String,
     path: String,
     host: String,
     duplicate_host: bool,
     origin: Option<String>,
+    duplicate_origin: bool,
     authorization: Option<String>,
+    accept: Option<String>,
     access_mode_readonly: bool,
-    body: Vec<u8>,
+    content_length: usize,
+    content_length_err: Option<(u16, String)>,
+    unsupported_transfer_encoding: bool,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn read_loopback_http_request(
-    stream: &mut TcpStream,
-) -> Result<Option<ParsedHttpRequest>, (u16, String)> {
+fn read_loopback_http_headers(
+    reader: &mut DeadlineReader<'_>,
+) -> Result<Option<ParsedHttpHeaders>, (u16, String)> {
     use nmr_core::mcp::{
-        parse_bounded_content_length, read_bounded_line, ContentLengthError, MAX_MCP_HEADER_COUNT,
+        parse_bounded_content_length, ContentLengthError, MAX_MCP_HEADER_COUNT,
         MAX_MCP_HEADER_LINE_BYTES,
     };
 
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
-    let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
+    let map_read_err = |err: HttpReadError| -> (u16, String) {
+        match err {
+            HttpReadError::Timeout => (408, "HTTP request read deadline exceeded".to_string()),
+            HttpReadError::Shutdown => (503, "MCP bridge shutting down".to_string()),
+            HttpReadError::InvalidUtf8 => (400, "invalid UTF-8 in HTTP headers".to_string()),
+            HttpReadError::UnexpectedEof => (400, "unexpected EOF in HTTP headers".to_string()),
+            HttpReadError::Io(e) => (400, format!("failed reading HTTP headers: {e}")),
+        }
+    };
 
-    let mut reader = BufReader::new(stream);
-    let mut req_line = String::new();
-    let (n, req_exceeded) =
-        read_bounded_line(&mut reader, &mut req_line, MAX_MCP_HEADER_LINE_BYTES)
-            .map_err(|e| (400, format!("failed reading HTTP request line: {e}")))?;
-    if n == 0 || req_line.trim().is_empty() {
+    let Some((req_line, req_exceeded)) = reader
+        .read_line_bounded(MAX_MCP_HEADER_LINE_BYTES)
+        .map_err(map_read_err)?
+    else {
+        return Ok(None);
+    };
+    if req_line.trim().is_empty() && !req_exceeded {
         return Ok(None);
     }
     if req_exceeded {
@@ -2953,16 +3968,24 @@ fn read_loopback_http_request(
 
     let mut parts = req_line.split_whitespace();
     let method = parts.next().unwrap_or("").to_ascii_uppercase();
-    let raw_target = parts.next().unwrap_or("/");
+    let raw_target = parts.next().unwrap_or("");
+    if method.is_empty() || raw_target.is_empty() {
+        return Err((400, "malformed HTTP request line".to_string()));
+    }
     let path = raw_target.split('?').next().unwrap_or("/").to_string();
 
     let mut content_length = 0usize;
+    let mut seen_content_length = false;
+    let mut content_length_err: Option<(u16, String)> = None;
     let mut host = String::new();
     let mut seen_host = false;
     let mut duplicate_host = false;
-    let mut origin = None;
+    let mut origin: Option<String> = None;
+    let mut duplicate_origin = false;
     let mut authorization = None;
+    let mut accept_parts: Vec<String> = Vec::new();
     let mut access_mode_readonly = false;
+    let mut unsupported_transfer_encoding = false;
     let mut header_count = 0usize;
 
     loop {
@@ -2970,28 +3993,41 @@ fn read_loopback_http_request(
         if header_count > MAX_MCP_HEADER_COUNT {
             return Err((400, "too many HTTP header lines".to_string()));
         }
-        let mut line = String::new();
-        let (bytes, hdr_exceeded) =
-            read_bounded_line(&mut reader, &mut line, MAX_MCP_HEADER_LINE_BYTES)
-                .map_err(|e| (400, format!("failed reading HTTP header: {e}")))?;
-        if bytes == 0 || line == "\r\n" || line == "\n" {
+        let Some((line, hdr_exceeded)) = reader
+            .read_line_bounded(MAX_MCP_HEADER_LINE_BYTES)
+            .map_err(map_read_err)?
+        else {
             break;
-        }
+        };
         if hdr_exceeded {
             return Err((413, "HTTP header line exceeds maximum length".to_string()));
+        }
+        if line == "\r\n" || line == "\n" || line.is_empty() {
+            break;
         }
         if let Some((k, v)) = line.split_once(':') {
             let key = k.trim();
             if key.eq_ignore_ascii_case("content-length") {
-                content_length = match parse_bounded_content_length(v, MAX_MCP_HTTP_BODY_BYTES) {
-                    Ok(len) => len,
-                    Err(ContentLengthError::Malformed) => {
-                        return Err((400, "invalid Content-Length".to_string()));
+                if seen_content_length {
+                    content_length_err = Some((400, "duplicate Content-Length header".to_string()));
+                } else {
+                    seen_content_length = true;
+                    match parse_bounded_content_length(v, MAX_MCP_HTTP_BODY_BYTES) {
+                        Ok(len) => content_length = len,
+                        Err(ContentLengthError::Malformed) => {
+                            content_length_err = Some((400, "invalid Content-Length".to_string()));
+                        }
+                        Err(ContentLengthError::ExceedsLimit { .. }) => {
+                            content_length_err =
+                                Some((413, "MCP HTTP payload exceeds 4 MiB limit".to_string()));
+                        }
                     }
-                    Err(ContentLengthError::ExceedsLimit { .. }) => {
-                        return Err((413, "MCP HTTP payload exceeds 4 MiB limit".to_string()));
-                    }
-                };
+                }
+            } else if key.eq_ignore_ascii_case("transfer-encoding") {
+                let te = v.trim();
+                if !te.is_empty() && !te.eq_ignore_ascii_case("identity") {
+                    unsupported_transfer_encoding = true;
+                }
             } else if key.eq_ignore_ascii_case("host") {
                 if seen_host {
                     duplicate_host = true;
@@ -2999,12 +4035,18 @@ fn read_loopback_http_request(
                 seen_host = true;
                 host = v.trim().to_string();
             } else if key.eq_ignore_ascii_case("origin") {
-                let trimmed = v.trim();
-                if !trimmed.is_empty() {
-                    origin = Some(trimmed.to_string());
+                if origin.is_some() {
+                    duplicate_origin = true;
                 }
+                let trimmed = v.trim();
+                origin = Some(trimmed.to_string());
             } else if key.eq_ignore_ascii_case("authorization") {
                 authorization = Some(v.trim().to_string());
+            } else if key.eq_ignore_ascii_case("accept") {
+                let trimmed = v.trim();
+                if !trimmed.is_empty() {
+                    accept_parts.push(trimmed.to_string());
+                }
             } else if key.eq_ignore_ascii_case("x-nmr-access-mode") {
                 let mode = v.trim();
                 if mode.eq_ignore_ascii_case("read-only") || mode.eq_ignore_ascii_case("readonly") {
@@ -3014,35 +4056,39 @@ fn read_loopback_http_request(
         }
     }
 
-    let mut body = vec![0u8; content_length];
-    if content_length > 0 {
-        reader
-            .read_exact(&mut body)
-            .map_err(|e| (400, format!("incomplete HTTP body: {e}")))?;
-    }
+    let accept = if accept_parts.is_empty() {
+        None
+    } else {
+        Some(accept_parts.join(", "))
+    };
 
-    Ok(Some(ParsedHttpRequest {
+    Ok(Some(ParsedHttpHeaders {
         method,
         path,
         host,
         duplicate_host,
         origin,
+        duplicate_origin,
         authorization,
+        accept,
         access_mode_readonly,
-        body,
+        content_length,
+        content_length_err,
+        unsupported_transfer_encoding,
     }))
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn write_http_json_response(
+fn write_http_response_with_type(
     stream: &mut TcpStream,
     status_code: u16,
     reason_phrase: &str,
+    content_type: &str,
     extra_headers: &[(&str, &str)],
     body_bytes: &[u8],
 ) {
     let mut header = format!(
-        "HTTP/1.1 {status_code} {reason_phrase}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n",
+        "HTTP/1.1 {status_code} {reason_phrase}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n",
         body_bytes.len()
     );
     for (k, v) in extra_headers {
@@ -3060,101 +4106,279 @@ fn write_http_json_response(
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+fn write_http_json_response(
+    stream: &mut TcpStream,
+    status_code: u16,
+    reason_phrase: &str,
+    extra_headers: &[(&str, &str)],
+    body_bytes: &[u8],
+) {
+    write_http_response_with_type(
+        stream,
+        status_code,
+        reason_phrase,
+        "application/json",
+        extra_headers,
+        body_bytes,
+    );
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn finish_rejected_http_response(
+    stream: &mut TcpStream,
+    status_code: u16,
+    reason_phrase: &str,
+    extra_headers: &[(&str, &str)],
+    msg: &str,
+    drain_already_buffered: bool,
+) {
+    let payload = json!({ "error": msg }).to_string();
+    write_http_json_response(
+        stream,
+        status_code,
+        reason_phrase,
+        extra_headers,
+        payload.as_bytes(),
+    );
+    let _ = stream.shutdown(Shutdown::Write);
+    if drain_already_buffered && stream.set_nonblocking(true).is_ok() {
+        let mut scratch = [0u8; 4096];
+        let mut drained = 0usize;
+        while drained < 64 * 1024 {
+            match (&*stream).read(&mut scratch) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => drained += n,
+            }
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn status_reason_phrase(code: u16) -> &'static str {
+    match code {
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        403 => "Forbidden",
+        404 => "Not Found",
+        405 => "Method Not Allowed",
+        406 => "Not Acceptable",
+        408 => "Request Timeout",
+        413 => "Payload Too Large",
+        500 => "Internal Server Error",
+        503 => "Service Unavailable",
+        _ => "Bad Request",
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 fn handle_loopback_connection(
     mut stream: TcpStream,
     shared: &Arc<Mutex<SharedBridgeInner>>,
     bound_port: u16,
+    shutdown: &AtomicBool,
+    request_deadline: Duration,
 ) {
-    let req = match read_loopback_http_request(&mut stream) {
-        Ok(Some(r)) => r,
+    let _ = stream.set_write_timeout(Some(MCP_HTTP_WRITE_TIMEOUT));
+    let deadline = Instant::now() + request_deadline;
+    let mut reader = DeadlineReader::new(&stream, deadline, shutdown);
+
+    // Step 0: Read request line and headers ONLY (do NOT read body before Host/Origin/Auth checks!)
+    let headers = match read_loopback_http_headers(&mut reader) {
+        Ok(Some(h)) => h,
         Ok(None) => return,
         Err((code, msg)) => {
-            let reason = if code == 413 {
-                "Payload Too Large"
-            } else {
-                "Bad Request"
-            };
-            let payload = json!({ "error": msg }).to_string();
-            write_http_json_response(&mut stream, code, reason, &[], payload.as_bytes());
+            finish_rejected_http_response(
+                &mut stream,
+                code,
+                status_reason_phrase(code),
+                &[],
+                &msg,
+                code != 408,
+            );
             return;
         }
     };
 
-    // Step 1: Enforce strict Host + cross-origin browser Origin guards FIRST (403 Forbidden)
+    // Step 1: Enforce strict Host + cross-origin browser Origin guards BEFORE reading body (403)
+    if headers.duplicate_origin {
+        finish_rejected_http_response(
+            &mut stream,
+            403,
+            "Forbidden",
+            &[],
+            "duplicate Origin header rejected",
+            true,
+        );
+        return;
+    }
     if let Err(reason) = validate_loopback_host_and_origin(
-        &req.host,
-        req.duplicate_host,
-        req.origin.as_deref(),
+        &headers.host,
+        headers.duplicate_host,
+        headers.origin.as_deref(),
         bound_port,
     ) {
-        let payload = json!({ "error": reason }).to_string();
-        write_http_json_response(&mut stream, 403, "Forbidden", &[], payload.as_bytes());
+        finish_rejected_http_response(&mut stream, 403, "Forbidden", &[], reason, true);
         return;
     }
 
-    // Step 2: Enforce constant-time Bearer token authentication (401 Unauthorized)
+    // Step 2: Enforce constant-time Bearer token authentication BEFORE reading body (401)
     let (expected_token, token_csprng) = match shared.lock() {
         Ok(guard) => (guard.bearer_token.clone(), guard.bearer_token_csprng),
         Err(_) => {
-            let payload = json!({ "error": "internal lock poisoned" }).to_string();
-            write_http_json_response(
+            finish_rejected_http_response(
                 &mut stream,
                 500,
                 "Internal Server Error",
                 &[],
-                payload.as_bytes(),
+                "internal lock poisoned",
+                false,
             );
             return;
         }
     };
     if !token_csprng
         || expected_token.len() < 32
-        || !verify_bearer_authorization(req.authorization.as_deref(), &expected_token)
+        || !verify_bearer_authorization(headers.authorization.as_deref(), &expected_token)
     {
-        let payload = json!({ "error": "missing or invalid Bearer token" }).to_string();
-        write_http_json_response(
+        finish_rejected_http_response(
             &mut stream,
             401,
             "Unauthorized",
             &[("WWW-Authenticate", "Bearer realm=\"nmr-gui-mcp\"")],
-            payload.as_bytes(),
+            "missing or invalid Bearer token",
+            true,
         );
         return;
     }
 
-    // Step 3: Route `/mcp` (and `/`) POST JSON-RPC 2.0 requests
-    if !matches!(req.path.as_str(), "/" | "/mcp") {
-        let payload = json!({ "error": "not found; POST JSON-RPC 2.0 to /mcp" }).to_string();
-        write_http_json_response(&mut stream, 404, "Not Found", &[], payload.as_bytes());
+    // Step 3: Route `/mcp` (and `/`), POST method, and `Accept` header BEFORE reading body
+    if !matches!(headers.path.as_str(), "/" | "/mcp") {
+        finish_rejected_http_response(
+            &mut stream,
+            404,
+            "Not Found",
+            &[],
+            "not found; POST JSON-RPC 2.0 to /mcp",
+            true,
+        );
         return;
     }
-    if req.method != "POST" {
-        let payload = json!({ "error": "method not allowed; expected POST" }).to_string();
-        write_http_json_response(
+    if headers.method != "POST" {
+        finish_rejected_http_response(
             &mut stream,
             405,
             "Method Not Allowed",
             &[("Allow", "POST")],
-            payload.as_bytes(),
+            "method not allowed; expected POST",
+            true,
+        );
+        return;
+    }
+    let Ok(resp_format) = negotiate_mcp_accept(headers.accept.as_deref()) else {
+        finish_rejected_http_response(
+            &mut stream,
+            406,
+            "Not Acceptable",
+            &[],
+            "Not Acceptable: Accept header must permit application/json or text/event-stream",
+            true,
+        );
+        return;
+    };
+
+    // Step 4: Validate bounded Content-Length / Transfer-Encoding BEFORE allocating or reading body
+    if headers.unsupported_transfer_encoding {
+        finish_rejected_http_response(
+            &mut stream,
+            400,
+            "Bad Request",
+            &[],
+            "unsupported Transfer-Encoding; send explicit Content-Length",
+            true,
+        );
+        return;
+    }
+    if let Some((code, ref msg)) = headers.content_length_err {
+        finish_rejected_http_response(
+            &mut stream,
+            code,
+            status_reason_phrase(code),
+            &[],
+            msg,
+            true,
         );
         return;
     }
 
-    let perm_override = if req.access_mode_readonly {
+    // Step 5: Read HTTP body strictly within total request deadline
+    let body = if headers.content_length > 0 {
+        match reader.read_exact_bounded(headers.content_length) {
+            Ok(b) => b,
+            Err(HttpReadError::Timeout) => {
+                finish_rejected_http_response(
+                    &mut stream,
+                    408,
+                    "Request Timeout",
+                    &[],
+                    "HTTP request body read deadline exceeded",
+                    false,
+                );
+                return;
+            }
+            Err(HttpReadError::Shutdown) => {
+                finish_rejected_http_response(
+                    &mut stream,
+                    503,
+                    "Service Unavailable",
+                    &[],
+                    "MCP bridge shutting down",
+                    false,
+                );
+                return;
+            }
+            Err(HttpReadError::UnexpectedEof) => {
+                finish_rejected_http_response(
+                    &mut stream,
+                    400,
+                    "Bad Request",
+                    &[],
+                    "incomplete HTTP body",
+                    false,
+                );
+                return;
+            }
+            Err(HttpReadError::Io(e)) => {
+                finish_rejected_http_response(
+                    &mut stream,
+                    400,
+                    "Bad Request",
+                    &[],
+                    &format!("failed reading HTTP body: {e}"),
+                    false,
+                );
+                return;
+            }
+            Err(HttpReadError::InvalidUtf8) => unreachable!(),
+        }
+    } else {
+        Vec::new()
+    };
+
+    let perm_override = if headers.access_mode_readonly {
         Some(McpBridgePermission::ReadOnly)
     } else {
         None
     };
     let response_opt = match shared.lock() {
-        Ok(mut guard) => dispatch_mcp_jsonrpc_with_permission(&mut guard, &req.body, perm_override),
+        Ok(mut guard) => dispatch_mcp_jsonrpc_with_permission(&mut guard, &body, perm_override),
         Err(_) => {
-            let payload = json!({ "error": "internal lock poisoned" }).to_string();
-            write_http_json_response(
+            finish_rejected_http_response(
                 &mut stream,
                 500,
                 "Internal Server Error",
                 &[],
-                payload.as_bytes(),
+                "internal lock poisoned",
+                false,
             );
             return;
         }
@@ -3162,13 +4386,30 @@ fn handle_loopback_connection(
 
     match response_opt {
         Some(resp_json) => {
-            let bytes = serde_json::to_vec(&resp_json).unwrap_or_else(|_| b"{}".to_vec());
-            write_http_json_response(&mut stream, 200, "OK", &[], &bytes);
+            let json_bytes = serde_json::to_vec(&resp_json).unwrap_or_else(|_| b"{}".to_vec());
+            match resp_format {
+                McpHttpResponseFormat::Json => {
+                    write_http_json_response(&mut stream, 200, "OK", &[], &json_bytes);
+                }
+                McpHttpResponseFormat::EventStream => {
+                    let json_str = String::from_utf8_lossy(&json_bytes);
+                    let sse_payload = format!("event: message\ndata: {json_str}\n\n");
+                    write_http_response_with_type(
+                        &mut stream,
+                        200,
+                        "OK",
+                        "text/event-stream",
+                        &[],
+                        sse_payload.as_bytes(),
+                    );
+                }
+            }
         }
         None => {
             write_http_json_response(&mut stream, 202, "Accepted", &[], b"");
         }
     }
+    let _ = stream.shutdown(Shutdown::Write);
 }
 
 // ============================================================================
@@ -3183,6 +4424,8 @@ pub struct McpBridgeController {
     server: Option<LoopbackServerHandle>,
     /// Bind address configured in the UI (`"127.0.0.1:0"` by default).
     pub bind_input: String,
+    /// Pending directory path typed into the GUI MCP settings "Add Root" input.
+    pub new_root_input: String,
     /// Selected target AI client preset for 1-click JSON config copy.
     pub selected_client: McpClientTarget,
     /// Whether the full bearer token is temporarily revealed in the UI panel.
@@ -3211,6 +4454,7 @@ impl McpBridgeController {
             #[cfg(not(target_arch = "wasm32"))]
             server: None,
             bind_input: DEFAULT_LOOPBACK_BIND.to_string(),
+            new_root_input: String::new(),
             selected_client: McpClientTarget::Antigravity,
             reveal_token: false,
             show_config_json: false,
@@ -3256,7 +4500,11 @@ impl McpBridgeController {
     pub fn start_bridge(&mut self, bind_addr: &str) -> Result<String, String> {
         #[cfg(not(target_arch = "wasm32"))]
         {
-            self.start_bridge_with_entropy(bind_addr, fill_os_entropy)
+            self.start_bridge_with_options(
+                bind_addr,
+                fill_os_entropy,
+                DEFAULT_MCP_HTTP_REQUEST_DEADLINE,
+            )
         }
         #[cfg(target_arch = "wasm32")]
         {
@@ -3277,22 +4525,7 @@ impl McpBridgeController {
     pub fn start_bridge_preferred(&mut self) -> Result<String, String> {
         #[cfg(not(target_arch = "wasm32"))]
         {
-            let target = self.bind_input.trim().to_string();
-            if target == DEFAULT_LOOPBACK_BIND {
-                let preferred = format!("127.0.0.1:{PREFERRED_LOOPBACK_PORT}");
-                match self.start_bridge(&preferred) {
-                    Ok(addr) => Ok(addr),
-                    Err(preferred_err) => {
-                        if preferred_err.contains("OS CSPRNG") {
-                            Err(preferred_err)
-                        } else {
-                            self.start_bridge(DEFAULT_LOOPBACK_BIND)
-                        }
-                    }
-                }
-            } else {
-                self.start_bridge(&target)
-            }
+            self.start_bridge_with_preferred_port(PREFERRED_LOOPBACK_PORT)
         }
         #[cfg(target_arch = "wasm32")]
         {
@@ -3302,10 +4535,40 @@ impl McpBridgeController {
     }
 
     #[cfg(not(target_arch = "wasm32"))]
+    fn start_bridge_with_preferred_port(&mut self, preferred_port: u16) -> Result<String, String> {
+        let target = self.bind_input.trim().to_string();
+        if target == DEFAULT_LOOPBACK_BIND {
+            let preferred = format!("127.0.0.1:{preferred_port}");
+            match self.start_bridge(&preferred) {
+                Ok(addr) => Ok(addr),
+                Err(preferred_err) => {
+                    if preferred_err.contains("OS CSPRNG") {
+                        Err(preferred_err)
+                    } else {
+                        self.start_bridge(DEFAULT_LOOPBACK_BIND)
+                    }
+                }
+            }
+        } else {
+            self.start_bridge(&target)
+        }
+    }
+
+    #[cfg(all(test, not(target_arch = "wasm32")))]
     fn start_bridge_with_entropy(
         &mut self,
         bind_addr: &str,
         fill_fn: fn(&mut [u8; 32]) -> bool,
+    ) -> Result<String, String> {
+        self.start_bridge_with_options(bind_addr, fill_fn, DEFAULT_MCP_HTTP_REQUEST_DEADLINE)
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn start_bridge_with_options(
+        &mut self,
+        bind_addr: &str,
+        fill_fn: fn(&mut [u8; 32]) -> bool,
+        request_deadline: Duration,
     ) -> Result<String, String> {
         self.stop_bridge();
         let needs_fresh_csprng = self
@@ -3337,7 +4600,20 @@ impl McpBridgeController {
         let bound_port = bound_addr.port();
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown_bg = Arc::clone(&shutdown);
+        let active_workers = Arc::new((Mutex::new(0usize), Condvar::new()));
+        let active_bg = Arc::clone(&active_workers);
         let shared_bg = Arc::clone(&self.shared);
+
+        struct WorkerSlotGuard(Arc<(Mutex<usize>, Condvar)>);
+        impl Drop for WorkerSlotGuard {
+            fn drop(&mut self) {
+                let (lock, cvar) = &*self.0;
+                if let Ok(mut cnt) = lock.lock() {
+                    *cnt = cnt.saturating_sub(1);
+                    cvar.notify_all();
+                }
+            }
+        }
 
         let join_handle = thread::Builder::new()
             .name("nmr-gui-mcp-loopback".to_string())
@@ -3346,13 +4622,58 @@ impl McpBridgeController {
                     if shutdown_bg.load(Ordering::SeqCst) {
                         break;
                     }
-                    let Ok(stream) = incoming else {
+                    let Ok(mut stream) = incoming else {
                         continue;
                     };
                     if shutdown_bg.load(Ordering::SeqCst) {
                         break;
                     }
-                    handle_loopback_connection(stream, &shared_bg, bound_port);
+                    let acquired = {
+                        let (lock, _) = &*active_bg;
+                        if let Ok(mut cnt) = lock.lock() {
+                            if *cnt < MAX_MCP_CONCURRENT_CONNECTIONS {
+                                *cnt += 1;
+                                true
+                            } else {
+                                false
+                            }
+                        } else {
+                            false
+                        }
+                    };
+                    if !acquired {
+                        finish_rejected_http_response(
+                            &mut stream,
+                            503,
+                            "Service Unavailable",
+                            &[],
+                            "too many concurrent MCP connections",
+                            false,
+                        );
+                        continue;
+                    }
+                    let worker_active = Arc::clone(&active_bg);
+                    let worker_shared = Arc::clone(&shared_bg);
+                    let worker_shutdown = Arc::clone(&shutdown_bg);
+                    let spawn_res = thread::Builder::new()
+                        .name("nmr-gui-mcp-worker".to_string())
+                        .spawn(move || {
+                            let _slot_guard = WorkerSlotGuard(worker_active);
+                            handle_loopback_connection(
+                                stream,
+                                &worker_shared,
+                                bound_port,
+                                &worker_shutdown,
+                                request_deadline,
+                            );
+                        });
+                    if spawn_res.is_err() {
+                        let (lock, cvar) = &*active_bg;
+                        if let Ok(mut cnt) = lock.lock() {
+                            *cnt = cnt.saturating_sub(1);
+                            cvar.notify_all();
+                        }
+                    }
                 }
             })
             .map_err(|e| format!("failed to spawn MCP loopback accept thread: {e}"))?;
@@ -3361,6 +4682,7 @@ impl McpBridgeController {
         self.server = Some(LoopbackServerHandle {
             bound_addr,
             shutdown,
+            active_workers,
             join_handle: Some(join_handle),
         });
         self.status_banner = format!("Listening on http://{addr_str}/mcp");
@@ -3389,6 +4711,209 @@ impl McpBridgeController {
         if let Ok(mut g) = self.shared.lock() {
             g.permission = perm;
         }
+    }
+
+    /// Whether destructive MCP actions (`ResetWorkspace`) are enabled (false by default).
+    pub fn destructive_actions_allowed(&self) -> bool {
+        self.shared
+            .lock()
+            .map(|g| g.allow_destructive_actions)
+            .unwrap_or(false)
+    }
+
+    /// Enable or disable destructive MCP actions (`ResetWorkspace`; still requires `confirm: true`).
+    pub fn set_destructive_actions_allowed(&self, allowed: bool) {
+        if let Ok(mut g) = self.shared.lock() {
+            g.allow_destructive_actions = allowed;
+        }
+    }
+
+    /// Current effective canonicalized sandbox root directories (native desktop only).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn approved_roots(&self) -> Vec<PathBuf> {
+        self.shared
+            .lock()
+            .map(|g| g.effective_roots())
+            .unwrap_or_default()
+    }
+
+    /// Return `true` when the user has explicitly customized approved MCP roots in GUI settings.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn roots_customized(&self) -> bool {
+        self.shared
+            .lock()
+            .map(|g| g.roots_customized)
+            .unwrap_or(false)
+    }
+
+    /// Replace approved sandbox root directories with canonicalized existing non-root directories.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn set_approved_roots<I, P>(&self, roots: I) -> Result<(), String>
+    where
+        I: IntoIterator<Item = P>,
+        P: AsRef<Path>,
+    {
+        let mut canon_roots = Vec::new();
+        for r in roots {
+            let canon = canonicalize_approved_root(r.as_ref())?;
+            if !canon_roots.contains(&canon) {
+                canon_roots.push(canon);
+            }
+        }
+        let mut g = self
+            .shared
+            .lock()
+            .map_err(|_| "MCP bridge state lock poisoned".to_string())?;
+        g.approved_roots = canon_roots;
+        g.roots_customized = true;
+        Ok(())
+    }
+
+    /// Canonicalize and append a user-approved sandbox root directory.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn add_approved_root(&self, raw_dir: &str) -> Result<PathBuf, String> {
+        let trimmed = raw_dir.trim();
+        if trimmed.is_empty() {
+            return Err("root directory path must not be empty".to_string());
+        }
+        let canon = canonicalize_approved_root(Path::new(trimmed))?;
+        let mut g = self
+            .shared
+            .lock()
+            .map_err(|_| "MCP bridge state lock poisoned".to_string())?;
+        if !g.roots_customized {
+            g.approved_roots = g.effective_roots();
+            g.roots_customized = true;
+        }
+        if !g.approved_roots.contains(&canon) {
+            g.approved_roots.push(canon.clone());
+        }
+        Ok(canon)
+    }
+
+    /// Remove an approved sandbox root directory by index (customizing the root list).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn remove_approved_root(&self, idx: usize) -> bool {
+        let Ok(mut g) = self.shared.lock() else {
+            return false;
+        };
+        if !g.roots_customized {
+            g.approved_roots = g.effective_roots();
+            g.roots_customized = true;
+        }
+        if idx < g.approved_roots.len() {
+            g.approved_roots.remove(idx);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Restore approved roots to the automatic default (active study or workspace directory).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn reset_approved_roots_to_default(&self) {
+        if let Ok(mut g) = self.shared.lock() {
+            g.roots_customized = false;
+            g.approved_roots.clear();
+        }
+    }
+
+    /// Synchronize the active user-opened study directory (ignoring paths loaded via MCP itself).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn sync_user_study_root(&self, root_path_opt: Option<&Path>) {
+        let Ok(mut g) = self.shared.lock() else {
+            return;
+        };
+        g.active_ingest_root = root_path_opt.map(Path::to_path_buf);
+        let Some(raw) = root_path_opt else {
+            return;
+        };
+        let dir_candidate = if raw.is_dir() {
+            raw.to_path_buf()
+        } else if let Some(parent) = raw.parent() {
+            parent.to_path_buf()
+        } else {
+            return;
+        };
+        if let Some(ref mcp_loaded) = g.last_mcp_loaded_path {
+            let same = std::fs::canonicalize(raw)
+                .ok()
+                .is_some_and(|c| &c == mcp_loaded)
+                || raw == mcp_loaded.as_path();
+            if same {
+                return;
+            }
+        }
+        g.last_mcp_loaded_path = None;
+        if let Ok(canon) = canonicalize_approved_root(&dir_candidate) {
+            g.active_study_root = Some(canon);
+        }
+    }
+
+    /// Record the canonical path loaded by an MCP `load_study_folder` call so GUI sync does not
+    /// reassign `active_study_root`.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn set_last_mcp_loaded_path(&self, path_opt: Option<&Path>) {
+        if let Ok(mut g) = self.shared.lock() {
+            g.last_mcp_loaded_path = path_opt.map(Path::to_path_buf);
+        }
+    }
+
+    /// Synchronize the workbench `export_prefix` used by `dispatch_workbench_action` export/save/load checks.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn set_current_export_prefix(&self, prefix: &str) {
+        if let Ok(mut g) = self.shared.lock() {
+            g.current_export_prefix = prefix.trim().to_string();
+        }
+    }
+
+    /// Validate and canonicalize an existing sandboxed file or directory inside approved roots.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn resolve_sandboxed_read_path(
+        &self,
+        raw_path: &str,
+        allow_dir: bool,
+    ) -> Result<PathBuf, String> {
+        let g = self
+            .shared
+            .lock()
+            .map_err(|_| "MCP bridge state lock poisoned".to_string())?;
+        g.resolve_sandboxed_read_path(raw_path, allow_dir)
+            .map_err(|e| e.message)
+    }
+
+    /// Validate, canonicalize, and check non-overwrite on export destination paths inside approved roots.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn resolve_sandboxed_export_targets(
+        &self,
+        raw_prefix: &str,
+        exts: &[&str],
+        overwrite: bool,
+        resolve_relative_against_cwd: bool,
+    ) -> Result<Vec<PathBuf>, String> {
+        let g = self
+            .shared
+            .lock()
+            .map_err(|_| "MCP bridge state lock poisoned".to_string())?;
+        g.resolve_sandboxed_export_targets(
+            raw_prefix,
+            exts,
+            overwrite,
+            resolve_relative_against_cwd,
+            "export_results",
+        )
+        .map_err(|e| e.message())
+    }
+
+    /// Validate containment of a `.nef` session path before `LoadSessionNef`.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn resolve_sandboxed_session_load_path(&self, raw_prefix: &str) -> Result<PathBuf, String> {
+        let g = self
+            .shared
+            .lock()
+            .map_err(|_| "MCP bridge state lock poisoned".to_string())?;
+        g.resolve_sandboxed_session_load_path(raw_prefix)
+            .map_err(|e| e.message)
     }
 
     /// Current secret bearer token required on `Authorization: Bearer <token>`.
@@ -3527,6 +5052,23 @@ impl McpBridgeController {
         )
     }
 
+    /// Build on-screen client MCP configuration JSON preview, keeping the bearer token masked
+    /// whenever [`Self::reveal_token`] is `false`.
+    pub fn build_client_config_json_preview(&self) -> String {
+        let raw_tok = self.bearer_token();
+        let preview_tok = if self.reveal_token {
+            raw_tok
+        } else {
+            mask_bearer_token(&raw_tok)
+        };
+        build_mcp_client_config_json_with_permission(
+            self.selected_client,
+            &self.endpoint_url(),
+            &preview_tok,
+            self.permission(),
+        )
+    }
+
     /// Dispatch a raw JSON-RPC 2.0 MCP request byte payload in-process (available on both native
     /// desktop and `wasm32` targets). Returns `None` for one-way JSON-RPC notifications.
     pub fn handle_jsonrpc_bytes(&self, raw_body: &[u8]) -> Option<Value> {
@@ -3596,10 +5138,11 @@ pub fn render_mcp_bridge_panel(
     ui.separator();
 
     // Snapshot shared state once for consistent panel rendering
-    let (mut perm, token, undo_depth, redo_depth, handled_reqs, audit_rows) =
+    let (mut perm, mut allow_destructive, token, undo_depth, redo_depth, handled_reqs, audit_rows) =
         match controller.shared.lock() {
             Ok(g) => (
                 g.permission,
+                g.allow_destructive_actions,
                 g.bearer_token.clone(),
                 g.undo_log.undo_depth(),
                 g.undo_log.redo_depth(),
@@ -3612,6 +5155,7 @@ pub fn render_mcp_bridge_panel(
             ),
             Err(_) => (
                 McpBridgePermission::ReadOnly,
+                false,
                 String::new(),
                 0,
                 0,
@@ -3620,7 +5164,7 @@ pub fn render_mcp_bridge_panel(
             ),
         };
 
-    // 2. Permission Tier Switch (`ReadOnly` vs `ReadWrite`)
+    // 2. Permission Tier Switch (`ReadOnly` vs `ReadWrite`) & Destructive Guard
     ui.horizontal_wrapped(|ui| {
         ui.label("Permission:");
         let prev_perm = perm;
@@ -3639,6 +5183,75 @@ pub fn render_mcp_bridge_panel(
         }
         ui.label(format!("| Requests: {handled_reqs}"));
     });
+    let prev_destructive = allow_destructive;
+    ui.checkbox(
+        &mut allow_destructive,
+        "Allow destructive MCP actions (ResetWorkspace; still requires confirm: true)",
+    );
+    if allow_destructive != prev_destructive {
+        controller.set_destructive_actions_allowed(allow_destructive);
+    }
+
+    // 2b. User-Approved Filesystem Sandbox Roots (native desktop)
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let roots = controller.approved_roots();
+        let customized = controller.roots_customized();
+        ui.horizontal_wrapped(|ui| {
+            ui.strong(if customized {
+                "Approved Filesystem Roots (Custom):"
+            } else {
+                "Approved Filesystem Roots (Default Study/Workspace):"
+            });
+            if customized && ui.small_button("Reset Default").clicked() {
+                controller.reset_approved_roots_to_default();
+                controller.status_banner =
+                    "Reset MCP sandbox roots to active study/workspace default".to_string();
+            }
+        });
+        if roots.is_empty() {
+            ui.colored_label(
+                egui::Color32::from_rgb(245, 180, 90),
+                "No approved roots configured — file read/write tools are blocked.",
+            );
+        } else {
+            let mut remove_idx = None;
+            for (idx, root) in roots.iter().enumerate() {
+                ui.horizontal(|ui| {
+                    ui.monospace(root.display().to_string());
+                    if ui.small_button("Remove").clicked() {
+                        remove_idx = Some(idx);
+                    }
+                });
+            }
+            if let Some(idx) = remove_idx {
+                if controller.remove_approved_root(idx) {
+                    controller.status_banner = "Removed MCP sandbox root".to_string();
+                }
+            }
+        }
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Add Root:");
+            ui.add(
+                egui::TextEdit::singleline(&mut controller.new_root_input)
+                    .hint_text("/path/to/approved_study_dir")
+                    .desired_width(240.0),
+            );
+            if ui.small_button("Add Root").clicked() {
+                let candidate = controller.new_root_input.clone();
+                match controller.add_approved_root(&candidate) {
+                    Ok(canon) => {
+                        controller.new_root_input.clear();
+                        controller.status_banner =
+                            format!("Added approved MCP root: {}", canon.display());
+                    }
+                    Err(err) => {
+                        controller.status_banner = format!("Invalid MCP root: {err}");
+                    }
+                }
+            }
+        });
+    }
 
     // 3. Masked Bearer Token & 1-Click Client Config Copy
     ui.horizontal_wrapped(|ui| {
@@ -3682,7 +5295,7 @@ pub fn render_mcp_bridge_panel(
             let cfg_json = controller.build_client_config_json();
             ui.ctx().copy_text(cfg_json);
             controller.status_banner = format!(
-                "Copied {} MCP JSON config to clipboard",
+                "Copied {} MCP JSON config to clipboard (includes live bearer token)",
                 controller.selected_client.label()
             );
             response.copied_config = true;
@@ -3698,7 +5311,10 @@ pub fn render_mcp_bridge_panel(
     });
 
     if controller.show_config_json {
-        let cfg_json = controller.build_client_config_json();
+        if !controller.reveal_token {
+            ui.weak("Config preview (bearer token masked; click Show above to reveal)");
+        }
+        let cfg_json = controller.build_client_config_json_preview();
         let mut preview = cfg_json.as_str();
         egui::ScrollArea::vertical()
             .id_salt("mcp_bridge_config_json_scroll")
@@ -3756,7 +5372,9 @@ pub fn render_mcp_bridge_panel(
                             egui::Color32::from_rgb(120, 220, 150)
                         }
                         McpAuditOutcome::Undone => egui::Color32::from_rgb(240, 200, 95),
-                        McpAuditOutcome::BlockedReadOnly => egui::Color32::from_rgb(245, 110, 110),
+                        McpAuditOutcome::BlockedReadOnly | McpAuditOutcome::BlockedSecurity => {
+                            egui::Color32::from_rgb(245, 110, 110)
+                        }
                     };
                     ui.horizontal(|ui| {
                         ui.colored_label(color, format!("[{}]", row.outcome.badge()));
@@ -3777,7 +5395,39 @@ pub fn render_mcp_bridge_panel(
 mod tests {
     use super::*;
     #[cfg(not(target_arch = "wasm32"))]
-    use std::io::BufRead;
+    use std::io::{BufRead, BufReader};
+
+    #[cfg(not(target_arch = "wasm32"))]
+    struct TempTestDir {
+        path: PathBuf,
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    impl TempTestDir {
+        fn new(tag: &str) -> Self {
+            static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let raw = std::env::temp_dir().join(format!(
+                "ferric_mcp_test_{tag}_{}_{}",
+                std::process::id(),
+                n
+            ));
+            std::fs::create_dir_all(&raw).expect("create temp test dir");
+            let canon = std::fs::canonicalize(&raw).expect("canonicalize temp test dir");
+            Self { path: canon }
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    impl Drop for TempTestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
 
     /// Parse an RFC 2083 PNG stream and verify its signature, `IHDR`, `IDAT` ZLIB/DEFLATE stored
     /// blocks + Adler-32, `IEND`, every chunk's IEEE CRC-32, and lossless RGBA pixel equality.
@@ -4572,7 +6222,7 @@ mod tests {
         for adv_len in ["67108864", "999999999999999999999999999999"] {
             let mut sock = TcpStream::connect(&addr).expect("connect loopback for 413 test");
             let req_413 = format!(
-                "POST /mcp HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer {bearer}\r\nContent-Length: {adv_len}\r\nConnection: close\r\n\r\n{{}}"
+                "POST /mcp HTTP/1.1\r\nHost: {addr}\r\nAuthorization: {bearer}\r\nContent-Length: {adv_len}\r\nConnection: close\r\n\r\n{{}}"
             );
             sock.write_all(req_413.as_bytes()).expect("send 413 header");
             let _ = sock.flush();
@@ -4589,7 +6239,7 @@ mod tests {
         {
             let mut sock = TcpStream::connect(&addr).expect("connect loopback for 400 test");
             let req_400 = format!(
-                "POST /mcp HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer {bearer}\r\nContent-Length: -42\r\nConnection: close\r\n\r\n"
+                "POST /mcp HTTP/1.1\r\nHost: {addr}\r\nAuthorization: {bearer}\r\nContent-Length: -42\r\nConnection: close\r\n\r\n"
             );
             sock.write_all(req_400.as_bytes()).expect("send 400 header");
             let _ = sock.flush();
@@ -4882,6 +6532,19 @@ mod tests {
         assert!(ctrl.drain_pending_ui_commands().is_empty());
 
         // 5. ReadWrite mode queues all 9 workflow actions + curation undo compatibility
+        let sandbox_dir = TempTestDir::new("workflow");
+        let study_dir = sandbox_dir.path().join("ubq_study");
+        std::fs::create_dir_all(&study_dir).expect("create study dir");
+        let fasta_path = sandbox_dir.path().join("ubq.fasta");
+        std::fs::write(&fasta_path, ">UBQ\nMQIFVKTLTG\n").expect("create fasta");
+        let export_prefix = sandbox_dir.path().join("ubq_export");
+        ctrl.set_approved_roots([sandbox_dir.path()])
+            .expect("register approved root");
+
+        let study_str = study_dir.to_string_lossy().into_owned();
+        let fasta_str = fasta_path.to_string_lossy().into_owned();
+        let export_str = export_prefix.to_string_lossy().into_owned();
+
         let _ = ctrl.apply_ui_command(McpUiCommand::AssignSpinSystemToResidue {
             cluster_id: 2,
             seq_id: 14,
@@ -4894,7 +6557,7 @@ mod tests {
                 "load_study_folder",
                 json!({
                     "action": "load_study_folder",
-                    "path": "/tmp/ubq_study",
+                    "path": study_str,
                     "run_full_pipeline": true
                 }),
             ),
@@ -4909,7 +6572,7 @@ mod tests {
                 "set_sequence",
                 json!({
                     "action": "set_sequence",
-                    "sequence_path": "/tmp/ubq.fasta"
+                    "sequence_path": fasta_str
                 }),
             ),
             (
@@ -4973,7 +6636,7 @@ mod tests {
                 "export_results",
                 json!({
                     "action": "export_results",
-                    "prefix": "/tmp/ubq_export",
+                    "prefix": export_str,
                     "format": "nef"
                 }),
             ),
@@ -4999,7 +6662,7 @@ mod tests {
             }))
             .unwrap();
             let resp = ctrl.handle_jsonrpc_bytes(&req).unwrap();
-            assert_eq!(resp["result"]["isError"], false);
+            assert_eq!(resp["result"]["isError"], false, "unexpected error: {resp}");
             let payload: Value =
                 serde_json::from_str(resp["result"]["content"][0]["text"].as_str().unwrap())
                     .unwrap();
@@ -5013,7 +6676,7 @@ mod tests {
             queued,
             vec![
                 McpUiCommand::LoadStudyFolder {
-                    path: "/tmp/ubq_study".to_string(),
+                    path: study_str,
                     run_full_pipeline: true,
                 },
                 McpUiCommand::SetSequence {
@@ -5022,7 +6685,7 @@ mod tests {
                 },
                 McpUiCommand::SetSequence {
                     sequence: String::new(),
-                    sequence_path: Some("/tmp/ubq.fasta".to_string()),
+                    sequence_path: Some(fasta_str),
                 },
                 McpUiCommand::PickAllSpectra {
                     snr_threshold: Some(7.5),
@@ -5058,8 +6721,9 @@ mod tests {
                     n_bottom: 133.0,
                 },
                 McpUiCommand::ExportResults {
-                    prefix: "/tmp/ubq_export".to_string(),
+                    prefix: export_str,
                     format: "nef".to_string(),
+                    overwrite: false,
                 },
                 McpUiCommand::SetLockResidue {
                     seq_id: 14,
@@ -5325,66 +6989,530 @@ mod tests {
         assert_eq!(custom_ctrl.bind_input, busy_addr_str);
         assert!(!custom_ctrl.is_running());
 
-        custom_ctrl.bind_input = "0.0.0.0:17420".to_string();
+        // Use an unbound host-invalid or occupied ephemeral bind address instead of hardcoded 17420
+        custom_ctrl.bind_input = busy_addr_str.clone();
         assert!(custom_ctrl.start_bridge_preferred().is_err());
-        assert_eq!(custom_ctrl.bind_input, "0.0.0.0:17420");
+        assert_eq!(custom_ctrl.bind_input, busy_addr_str);
         drop(busy_ephemeral);
 
-        // 2. When 17420 is held, start_bridge_preferred falls back silently to an ephemeral port
-        let preferred_addr = SocketAddr::V4(SocketAddrV4::new(
-            Ipv4Addr::LOCALHOST,
-            PREFERRED_LOOPBACK_PORT,
-        ));
-        match TcpListener::bind(preferred_addr) {
-            Ok(holder) => {
-                let mut fallback_ctrl = McpBridgeController::default();
-                let fb_addr = fallback_ctrl
-                    .start_bridge_preferred()
-                    .expect("fallback to ephemeral port while 17420 is held");
-                assert!(fallback_ctrl.is_running());
-                assert_ne!(
-                    fb_addr,
-                    format!("127.0.0.1:{PREFERRED_LOOPBACK_PORT}"),
-                    "must use ephemeral port when 17420 is held"
-                );
-                assert_eq!(fallback_ctrl.bind_input, DEFAULT_LOOPBACK_BIND);
-                fallback_ctrl.stop_bridge();
-                drop(holder);
+        // 2. When the preferred ephemeral port is held, start_bridge_with_preferred_port falls back
+        //    silently to another ephemeral port without ever touching hardcoded port 17420.
+        let holder = TcpListener::bind("127.0.0.1:0").expect("bind held ephemeral preferred port");
+        let held_port = holder.local_addr().unwrap().port();
+        let mut fallback_ctrl = McpBridgeController::default();
+        let fb_addr = fallback_ctrl
+            .start_bridge_with_preferred_port(held_port)
+            .expect("fallback to ephemeral port while held_port is occupied");
+        assert!(fallback_ctrl.is_running());
+        assert_ne!(
+            fb_addr,
+            format!("127.0.0.1:{held_port}"),
+            "must use a distinct ephemeral port when preferred port is held"
+        );
+        assert_eq!(fallback_ctrl.bind_input, DEFAULT_LOOPBACK_BIND);
+        fallback_ctrl.stop_bridge();
+        drop(holder);
 
-                // 3. Once 17420 is free, start_bridge_preferred claims 17420; a second controller
-                //    concurrently falls back to a distinct ephemeral port
-                let mut primary_ctrl = McpBridgeController::default();
-                let prim_addr = primary_ctrl
-                    .start_bridge_preferred()
-                    .expect("bind preferred port 17420 when free");
-                assert_eq!(prim_addr, format!("127.0.0.1:{PREFERRED_LOOPBACK_PORT}"));
-                assert_eq!(
-                    primary_ctrl.endpoint_url(),
-                    format!("http://127.0.0.1:{PREFERRED_LOOPBACK_PORT}/mcp")
-                );
-                assert_eq!(primary_ctrl.bind_input, DEFAULT_LOOPBACK_BIND);
+        // 3. Probe an open ephemeral preferred port: start_bridge_with_preferred_port binds it (or
+        //    falls back cleanly if concurrently claimed), and a second controller concurrently binds
+        //    a distinct ephemeral port.
+        let probe = TcpListener::bind("127.0.0.1:0").expect("probe free ephemeral port");
+        let free_port = probe.local_addr().unwrap().port();
+        drop(probe);
 
-                let mut second_ctrl = McpBridgeController::default();
-                let sec_addr = second_ctrl
-                    .start_bridge_preferred()
-                    .expect("second bridge falls back to ephemeral port");
-                assert_ne!(sec_addr, prim_addr);
-                assert!(second_ctrl.is_running());
+        let mut primary_ctrl = McpBridgeController::default();
+        let prim_addr = primary_ctrl
+            .start_bridge_with_preferred_port(free_port)
+            .expect("bind probed preferred port or ephemeral fallback");
+        assert!(primary_ctrl.is_running());
+        assert_eq!(
+            primary_ctrl.endpoint_url(),
+            format!("http://{prim_addr}/mcp")
+        );
+        assert_eq!(primary_ctrl.bind_input, DEFAULT_LOOPBACK_BIND);
 
-                second_ctrl.stop_bridge();
-                primary_ctrl.stop_bridge();
-            }
-            Err(_) => {
-                // External process on the host already holds 17420; verify fallback still succeeds
-                let mut fallback_ctrl = McpBridgeController::default();
-                let fb_addr = fallback_ctrl
-                    .start_bridge_preferred()
-                    .expect("fallback to ephemeral port when 17420 is externally held");
-                assert!(fallback_ctrl.is_running());
-                assert_ne!(fb_addr, format!("127.0.0.1:{PREFERRED_LOOPBACK_PORT}"));
-                assert_eq!(fallback_ctrl.bind_input, DEFAULT_LOOPBACK_BIND);
-                fallback_ctrl.stop_bridge();
-            }
+        let prim_port: u16 = prim_addr
+            .rsplit(':')
+            .next()
+            .and_then(|p| p.parse().ok())
+            .expect("valid bound port");
+        let mut second_ctrl = McpBridgeController::default();
+        let sec_addr = second_ctrl
+            .start_bridge_with_preferred_port(prim_port)
+            .expect("second bridge falls back to distinct ephemeral port");
+        assert_ne!(sec_addr, prim_addr);
+        assert!(second_ctrl.is_running());
+
+        second_ctrl.stop_bridge();
+        primary_ctrl.stop_bridge();
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn test_path_sandboxing_overwrite_refusal_and_destructive_guards() {
+        let sandbox = TempTestDir::new("sandbox_guards");
+        let outside = TempTestDir::new("outside_guards");
+        let study_dir = sandbox.path().join("study_ubq");
+        std::fs::create_dir_all(&study_dir).expect("create study dir");
+        let in_fasta = sandbox.path().join("seq.fasta");
+        std::fs::write(&in_fasta, ">UBQ\nMQIFVKTLTG\n").expect("write in-root fasta");
+        let out_fasta = outside.path().join("evil.fasta");
+        std::fs::write(&out_fasta, ">EVIL\nAAAA\n").expect("write out-of-root fasta");
+
+        let ctrl = McpBridgeController::default();
+        // Root "/" must never be accepted as an approved root
+        assert!(ctrl.add_approved_root("/").is_err());
+        assert!(ctrl
+            .add_approved_root("/nonexistent_ferric_dir_xyz")
+            .is_err());
+        ctrl.set_approved_roots([sandbox.path()])
+            .expect("approve sandbox dir");
+        assert_eq!(ctrl.approved_roots(), vec![sandbox.path().to_path_buf()]);
+        ctrl.set_permission(McpBridgePermission::ReadWrite);
+
+        let call_tool = |name: &str, args: Value| -> Value {
+            let req = serde_json::to_vec(&json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": { "name": name, "arguments": args }
+            }))
+            .unwrap();
+            ctrl.handle_jsonrpc_bytes(&req).unwrap()
+        };
+        let assert_denied = |resp: &Value, expected_kind: &str| {
+            assert_eq!(resp["result"]["isError"], true, "expected denial: {resp}");
+            let payload: Value =
+                serde_json::from_str(resp["result"]["content"][0]["text"].as_str().unwrap())
+                    .unwrap();
+            assert_eq!(payload["status"], "denied", "payload={payload}");
+            assert_eq!(payload["queued"], false, "payload={payload}");
+            assert_eq!(payload["error_kind"], expected_kind, "payload={payload}");
+        };
+
+        // 1. Out-of-root / traversal / file:// / sensitive file paths are refused pre-queue
+        let outside_study_resp = call_tool(
+            "run_workbench_workflow",
+            json!({ "action": "load_study_folder", "path": outside.path().to_string_lossy() }),
+        );
+        assert_denied(&outside_study_resp, "outside_allowed_roots");
+
+        let trav_study = format!(
+            "{}/../{}",
+            sandbox.path().display(),
+            outside.path().file_name().unwrap().to_string_lossy()
+        );
+        let trav_study_resp = call_tool(
+            "run_workbench_workflow",
+            json!({ "action": "load_study_folder", "path": trav_study }),
+        );
+        assert_denied(&trav_study_resp, "parent_traversal");
+
+        let out_fasta_resp = call_tool(
+            "run_workbench_workflow",
+            json!({ "action": "set_sequence", "sequence_path": out_fasta.to_string_lossy() }),
+        );
+        assert_denied(&out_fasta_resp, "outside_allowed_roots");
+
+        let file_url_resp = call_tool(
+            "run_workbench_workflow",
+            json!({ "action": "set_sequence", "sequence_path": format!("file://{}", in_fasta.display()) }),
+        );
+        assert_denied(&file_url_resp, "null_byte_or_invalid_path");
+
+        let dir_as_fasta_resp = call_tool(
+            "run_workbench_workflow",
+            json!({ "action": "set_sequence", "sequence_path": study_dir.to_string_lossy() }),
+        );
+        assert_denied(&dir_as_fasta_resp, "null_byte_or_invalid_path");
+
+        // Prefix equal to root itself becomes <root>.nef outside root -> must be refused!
+        let root_escape_prefix_resp = call_tool(
+            "run_workbench_workflow",
+            json!({
+                "action": "export_results",
+                "prefix": sandbox.path().to_string_lossy(),
+                "format": "nef"
+            }),
+        );
+        assert_denied(&root_escape_prefix_resp, "outside_allowed_roots");
+
+        // Symlink inside approved root pointing outside must be refused
+        #[cfg(unix)]
+        {
+            let link_path = sandbox.path().join("escape_link.fasta");
+            std::os::unix::fs::symlink(&out_fasta, &link_path).expect("create symlink");
+            let sym_resp = call_tool(
+                "run_workbench_workflow",
+                json!({
+                    "action": "set_sequence",
+                    "sequence_path": link_path.to_string_lossy()
+                }),
+            );
+            assert_eq!(sym_resp["result"]["isError"], true);
+            let link_dir = sandbox.path().join("escape_dir");
+            std::os::unix::fs::symlink(outside.path(), &link_dir).expect("create dir symlink");
+            let sym_dir_resp = call_tool(
+                "run_workbench_workflow",
+                json!({
+                    "action": "load_study_folder",
+                    "path": link_dir.to_string_lossy()
+                }),
+            );
+            assert_eq!(sym_dir_resp["result"]["isError"], true);
         }
+
+        // In-root reads succeed
+        let ok_study = call_tool(
+            "run_workbench_workflow",
+            json!({ "action": "load_study_folder", "path": study_dir.to_string_lossy() }),
+        );
+        assert_eq!(ok_study["result"]["isError"], false);
+        let ok_seq = call_tool(
+            "run_workbench_workflow",
+            json!({ "action": "set_sequence", "sequence_path": in_fasta.to_string_lossy() }),
+        );
+        assert_eq!(ok_seq["result"]["isError"], false);
+        let _ = ctrl.drain_pending_ui_commands();
+
+        // 2. Overwrite refusal vs overwrite: true
+        let existing_prefix = sandbox.path().join("existing_export");
+        let existing_nef = existing_prefix.with_extension("nef");
+        std::fs::write(&existing_nef, "existing-nef").expect("seed existing nef");
+
+        let ow_omitted = call_tool(
+            "run_workbench_workflow",
+            json!({
+                "action": "export_results",
+                "prefix": existing_prefix.to_string_lossy(),
+                "format": "nef"
+            }),
+        );
+        assert_denied(&ow_omitted, "overwrite_refused");
+
+        let ow_false = call_tool(
+            "run_workbench_workflow",
+            json!({
+                "action": "export_results",
+                "prefix": existing_prefix.to_string_lossy(),
+                "format": "nef",
+                "overwrite": false
+            }),
+        );
+        assert_denied(&ow_false, "overwrite_refused");
+
+        let ow_true = call_tool(
+            "run_workbench_workflow",
+            json!({
+                "action": "export_results",
+                "prefix": existing_prefix.to_string_lossy(),
+                "format": "nef",
+                "overwrite": true
+            }),
+        );
+        assert_eq!(ow_true["result"]["isError"], false);
+        assert_eq!(
+            ctrl.drain_pending_ui_commands(),
+            vec![McpUiCommand::ExportResults {
+                prefix: existing_prefix.to_string_lossy().into_owned(),
+                format: "nef".to_string(),
+                overwrite: true,
+            }]
+        );
+
+        // Guarded dispatch actions: SaveSessionNef, ExportNmrStar, LoadSessionNef
+        ctrl.set_current_export_prefix(&outside.path().join("bad_prefix").to_string_lossy());
+        let bad_save = call_tool(
+            "dispatch_workbench_action",
+            json!({ "action": "save_session_nef", "overwrite": true }),
+        );
+        assert_denied(&bad_save, "outside_allowed_roots");
+
+        ctrl.set_current_export_prefix(&existing_prefix.to_string_lossy());
+        let ow_save_denied = call_tool(
+            "dispatch_workbench_action",
+            json!({ "action": "save_session_nef" }),
+        );
+        assert_denied(&ow_save_denied, "overwrite_refused");
+
+        let ow_save_ok = call_tool(
+            "dispatch_workbench_action",
+            json!({ "action": "save_session_nef", "overwrite": true }),
+        );
+        assert_eq!(ow_save_ok["result"]["isError"], false);
+        assert_eq!(
+            ctrl.drain_pending_ui_commands(),
+            vec![McpUiCommand::DispatchGuardedWorkbenchAction {
+                action: WorkbenchAction::SaveSessionNef,
+                overwrite: true,
+                confirm: false,
+            }]
+        );
+
+        // 3. Destructive & interactive file-picker action guards
+        let picker_denied = call_tool(
+            "dispatch_workbench_action",
+            json!({ "action": "load_path_or_spectrum" }),
+        );
+        assert_denied(&picker_denied, "sandbox_required");
+
+        assert!(!ctrl.destructive_actions_allowed());
+        let reset_disabled = call_tool(
+            "dispatch_workbench_action",
+            json!({ "action": "reset_workspace", "confirm": true }),
+        );
+        assert_denied(&reset_disabled, "destructive_action_denied");
+
+        ctrl.set_destructive_actions_allowed(true);
+        let reset_unconfirmed = call_tool(
+            "dispatch_workbench_action",
+            json!({ "action": "reset_workspace" }),
+        );
+        assert_denied(&reset_unconfirmed, "confirmation_required");
+
+        let reset_ok = call_tool(
+            "dispatch_workbench_action",
+            json!({ "action": "reset_workspace", "confirm": true }),
+        );
+        assert_eq!(reset_ok["result"]["isError"], false);
+        assert_eq!(
+            ctrl.drain_pending_ui_commands(),
+            vec![McpUiCommand::DispatchGuardedWorkbenchAction {
+                action: WorkbenchAction::ResetWorkspace,
+                overwrite: false,
+                confirm: true,
+            }]
+        );
+        assert!(ctrl
+            .shared
+            .lock()
+            .unwrap()
+            .undo_log
+            .audit_records()
+            .iter()
+            .any(|r| r.outcome == McpAuditOutcome::BlockedSecurity));
+    }
+
+    #[test]
+    fn test_masked_json_preview_never_exposes_raw_bearer_token() {
+        let mut ctrl = McpBridgeController::default();
+        assert!(!ctrl.reveal_token);
+        let raw_token = ctrl.bearer_token();
+        assert!(!raw_token.is_empty());
+
+        let masked_preview = ctrl.build_client_config_json_preview();
+        assert!(
+            !masked_preview.contains(&raw_token),
+            "masked JSON preview must never expose the raw bearer token"
+        );
+        assert!(
+            masked_preview.contains(&mask_bearer_token(&raw_token)),
+            "masked JSON preview must contain masked token: {masked_preview}"
+        );
+        assert!(
+            masked_preview.contains("••••••••••••"),
+            "masked JSON preview must contain masked placeholder: {masked_preview}"
+        );
+
+        ctrl.reveal_token = true;
+        let revealed_preview = ctrl.build_client_config_json_preview();
+        assert!(
+            revealed_preview.contains(&raw_token),
+            "revealed JSON preview should expose raw bearer token when reveal_token=true"
+        );
+
+        ctrl.reveal_token = false;
+        assert!(!ctrl.build_client_config_json_preview().contains(&raw_token));
+
+        // Headless egui render check: panel with Show JSON open renders cleanly when masked
+        ctrl.show_config_json = true;
+        let ctx = egui::Context::default();
+        let raw_in = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(640.0, 900.0),
+            )),
+            ..Default::default()
+        };
+        let mut out = ctx.run_ui(raw_in, |ui| {
+            let _ = render_mcp_bridge_panel(ui, &mut ctrl);
+        });
+        out.textures_delta.clear();
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn test_http_prebody_host_origin_accept_batch_and_slow_loris_deadline() {
+        fn deterministic_csprng(buf: &mut [u8; 32]) -> bool {
+            for (i, b) in buf.iter_mut().enumerate() {
+                *b = (i as u8).wrapping_mul(17).wrapping_add(5);
+            }
+            true
+        }
+
+        let mut ctrl = McpBridgeController::default();
+        let addr = ctrl
+            .start_bridge_with_options(
+                "127.0.0.1:0",
+                deterministic_csprng,
+                Duration::from_millis(250),
+            )
+            .expect("start loopback bridge with 250ms deadline");
+        let bearer = ctrl.bearer_token();
+
+        let send_http_raw = |raw_req: &str| -> String {
+            let mut sock = TcpStream::connect(&addr).expect("connect loopback");
+            sock.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+            sock.write_all(raw_req.as_bytes()).expect("write request");
+            let _ = sock.flush();
+            let _ = sock.shutdown(std::net::Shutdown::Write);
+            let mut resp = String::new();
+            std::io::Read::read_to_string(&mut sock, &mut resp).expect("read response");
+            resp
+        };
+
+        // 1. Pre-body Host/Origin checks: write ONLY headers with large Content-Length and NO body,
+        //    keep write side OPEN! Server must reject immediately with 403 without waiting for body/deadline.
+        for bad_hdr in [
+            format!(
+                "POST /mcp HTTP/1.1\r\nHost: evil.example\r\nAuthorization: Bearer {bearer}\r\nContent-Length: 4000000\r\n\r\n"
+            ),
+            format!(
+                "POST /mcp HTTP/1.1\r\nHost: {addr}\r\nOrigin: https://evil.example\r\nAuthorization: Bearer {bearer}\r\nContent-Length: 4000000\r\n\r\n"
+            ),
+        ] {
+            let t0 = Instant::now();
+            let mut sock = TcpStream::connect(&addr).expect("connect pre-body check");
+            sock.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            sock.write_all(bad_hdr.as_bytes()).expect("send headers only");
+            let _ = sock.flush();
+            let mut status_line = String::new();
+            let mut rdr = BufReader::new(sock);
+            let _ = rdr.read_line(&mut status_line);
+            assert!(
+                status_line.contains(" 403 "),
+                "expected immediate 403 before reading body, got {status_line:?}"
+            );
+            assert!(
+                t0.elapsed() < Duration::from_millis(200),
+                "403 rejection should not wait for body or slow-loris deadline"
+            );
+        }
+
+        // 2. Accept header handling (checked before body, plus JSON vs SSE framing)
+        let r_406 = send_http_raw(&format!(
+            "POST /mcp HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer {bearer}\r\nAccept: text/plain\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}"
+        ));
+        assert!(r_406.contains("406 Not Acceptable"), "got {r_406:?}");
+
+        let r_406_q0 = send_http_raw(&format!(
+            "POST /mcp HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer {bearer}\r\nAccept: application/json;q=0\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}"
+        ));
+        assert!(r_406_q0.contains("406 Not Acceptable"), "got {r_406_q0:?}");
+
+        let ping_body = r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#;
+        let r_sse = send_http_raw(&format!(
+            "POST /mcp HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer {bearer}\r\nAccept: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{ping_body}",
+            ping_body.len()
+        ));
+        assert!(r_sse.contains("200 OK"), "got {r_sse:?}");
+        assert!(
+            r_sse.contains("Content-Type: text/event-stream"),
+            "got {r_sse:?}"
+        );
+        assert!(r_sse.contains("event: message\ndata: "), "got {r_sse:?}");
+
+        // 3. JSON-RPC batch arrays (mixed, empty [], notification-only -> 202)
+        let mixed_batch = r#"[{"jsonrpc":"2.0","id":10,"method":"ping"},{"jsonrpc":"2.0","method":"notifications/initialized"},42]"#;
+        let r_batch = send_http_raw(&format!(
+            "POST /mcp HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer {bearer}\r\nAccept: application/json, text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{mixed_batch}",
+            mixed_batch.len()
+        ));
+        assert!(r_batch.contains("200 OK"), "got {r_batch:?}");
+        assert!(
+            r_batch.contains("Content-Type: application/json"),
+            "got {r_batch:?}"
+        );
+        let body_part = r_batch.split("\r\n\r\n").nth(1).unwrap();
+        let batch_json: Value = serde_json::from_str(body_part).expect("batch json array");
+        let arr = batch_json.as_array().expect("batch array response");
+        assert_eq!(
+            arr.len(),
+            2,
+            "expected pong + invalid-item error: {batch_json}"
+        );
+        assert_eq!(arr[0]["id"], 10);
+        assert_eq!(arr[1]["error"]["code"], -32600);
+
+        let notif_batch = r#"[{"jsonrpc":"2.0","method":"notifications/initialized"}]"#;
+        let r_notif = send_http_raw(&format!(
+            "POST /mcp HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer {bearer}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{notif_batch}",
+            notif_batch.len()
+        ));
+        assert!(r_notif.contains("202 Accepted"), "got {r_notif:?}");
+
+        let empty_batch = r#"[]"#;
+        let r_empty = send_http_raw(&format!(
+            "POST /mcp HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer {bearer}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{empty_batch}",
+            empty_batch.len()
+        ));
+        let empty_json: Value =
+            serde_json::from_str(r_empty.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        assert_eq!(empty_json["error"]["code"], -32600);
+
+        // 4. Slow-loris deadline + concurrent unblocked healthy request
+        let mut slow_sock = TcpStream::connect(&addr).expect("connect slow-loris header socket");
+        slow_sock
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        slow_sock
+            .write_all(b"POST /mcp HTTP/1.1\r\nHo")
+            .expect("send partial header");
+        let _ = slow_sock.flush();
+
+        // While slow_sock stalls, a legitimate ping must succeed promptly via another worker thread
+        let t_fast = Instant::now();
+        let fast_resp = send_http_raw(&format!(
+            "POST /mcp HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer {bearer}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{ping_body}",
+            ping_body.len()
+        ));
+        assert!(
+            fast_resp.contains("200 OK"),
+            "fast resp failed: {fast_resp:?}"
+        );
+        assert!(
+            t_fast.elapsed() < Duration::from_secs(1),
+            "slow-loris client must not head-of-line block healthy client"
+        );
+
+        let mut slow_resp = String::new();
+        std::io::Read::read_to_string(&mut slow_sock, &mut slow_resp).expect("read 408");
+        assert!(
+            slow_resp.contains("408 Request Timeout"),
+            "expected 408 Request Timeout for stalled header, got {slow_resp:?}"
+        );
+
+        // Slow body drip even with periodic 1-byte writes exceeds total request deadline -> 408
+        let mut slow_body_sock = TcpStream::connect(&addr).expect("connect slow body socket");
+        slow_body_sock
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let hdr = format!(
+            "POST /mcp HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer {bearer}\r\nContent-Length: 100\r\n\r\n{{"
+        );
+        slow_body_sock.write_all(hdr.as_bytes()).unwrap();
+        let _ = slow_body_sock.flush();
+        std::thread::sleep(Duration::from_millis(120));
+        let _ = slow_body_sock.write_all(b"\"a\":");
+        let _ = slow_body_sock.flush();
+        let mut slow_body_resp = String::new();
+        std::io::Read::read_to_string(&mut slow_body_sock, &mut slow_body_resp)
+            .expect("read body 408");
+        assert!(
+            slow_body_resp.contains("408 Request Timeout"),
+            "expected 408 Request Timeout for slow-loris body, got {slow_body_resp:?}"
+        );
+
+        ctrl.stop_bridge();
     }
 }
