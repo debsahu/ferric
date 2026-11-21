@@ -1906,8 +1906,9 @@ fn is_cloud_storage_path(path: &Path) -> bool {
 }
 
 /// Pick 2D `1H–15N` HSQC peaks with the neural picker, enforcing a MAD SNR
-/// height floor (`picker_snr * noise`) and greedy non-maximum suppression
-/// within `(|dH| <= 0.025, |dN| <= 0.25)` keeping highest intensity.
+/// height floor (`picker_snr * noise`) and greedy same-sign non-maximum suppression
+/// within a tight grid-aware box (`dedup_h <= 0.010 ppm`, `dedup_n <= 0.10 ppm`)
+/// so distinct crowded IDP amides within `0.025 / 0.25 ppm` are preserved.
 fn pick_hsqc_2d_neural_hardened(
     spec: &Spectrum2D,
     cfg: &NeuralPickerConfig,
@@ -1923,11 +1924,15 @@ fn pick_hsqc_2d_neural_hardened(
             .abs()
             .total_cmp(&a.height.unwrap_or(0.0).abs())
     });
+    let dedup_h = (spec.axis_x.step_ppm.abs() * 0.9).clamp(0.005, 0.010);
+    let dedup_n = (spec.axis_y.step_ppm.abs() * 0.9).clamp(0.05, 0.10);
     let mut deduped: Vec<Peak> = Vec::with_capacity(peaks.len());
     for pk in peaks {
-        let dup = deduped
-            .iter()
-            .any(|kept| (kept.h - pk.h).abs() <= 0.025 && (kept.n - pk.n).abs() <= 0.25);
+        let dup = deduped.iter().any(|kept| {
+            kept.sign == pk.sign
+                && (kept.h - pk.h).abs() <= dedup_h
+                && (kept.n - pk.n).abs() <= dedup_n
+        });
         if !dup {
             deduped.push(pk);
         }
@@ -2706,6 +2711,9 @@ struct BackgroundIngestJob {
     current_size_bytes: u64,
     cloud_storage: bool,
     cancelling: bool,
+    launch_peaks_fp: u64,
+    launch_assign_fp: u64,
+    launch_peaks_3d_fp: u64,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -3383,24 +3391,63 @@ impl NmrWorkbenchApp {
 
     #[cfg(not(target_arch = "wasm32"))]
     fn infer_3d_exp_from_path(p: &Path) -> &'static str {
-        let up = p
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("")
-            .to_ascii_uppercase();
-        if up.contains("CBCACONH") || up.contains("CBCA(CO)NH") {
-            "CBCACONH"
-        } else if up.contains("HNCACO") || up.contains("HN(CA)CO") {
-            "HNCACO"
-        } else if up.contains("HNCO") {
-            "HNCO"
-        } else if up.contains("HNCOCA") || up.contains("HN(CO)CA") {
-            "HNCOCA"
-        } else if up.contains("HNCA") {
-            "HNCA"
-        } else {
-            "HNCACB"
+        const PATTERNS_BY_LEN: [(&str, &str); 26] = [
+            // Length 10
+            ("HACANCACON", "NCACON"),
+            ("CBCACOCANH", "CBCACONH"),
+            // Length 9
+            ("CBCACONNH", "CBCACONH"),
+            // Length 8
+            ("CBCACONH", "CBCACONH"),
+            ("HNCOCACB", "CBCACONH"),
+            ("HNCACONH", "HNCACONH"),
+            ("CBCACOGP", "CBCACONH"),
+            // Length 7
+            ("HCCCONH", "HCCCONH"),
+            ("HNCANNH", "HNCACONH"),
+            ("HNCACON", "NCACON"),
+            ("CBCACON", "CBCACON"),
+            ("CBCANCO", "CBCACON"),
+            // Length 6
+            ("HCCCON", "HCCCON"),
+            ("NCACON", "NCACON"),
+            ("CCCONH", "CCCONH"),
+            ("HNCACB", "HNCACB"),
+            ("CBCANH", "HNCACB"),
+            ("HNCACO", "HNCACO"),
+            ("HNCOCA", "HNCOCA"),
+            ("CBCACO", "CBCACON"),
+            // Length 5
+            ("CCCON", "CCCON"),
+            ("CANCO", "CANCO"),
+            ("NCACO", "NCACO"),
+            // Length 4
+            ("HNCA", "HNCA"),
+            ("HNCO", "HNCO"),
+            ("CACO", "CACO"),
+        ];
+        let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+        let tokens: Vec<String> = stem
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .filter(|t| !t.is_empty())
+            .map(|t| t.to_ascii_uppercase())
+            .collect();
+        for &(pat, canon) in &PATTERNS_BY_LEN {
+            if tokens.iter().any(|tok| tok == pat) {
+                return canon;
+            }
         }
+        let compact: String = stem
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric())
+            .map(|c| c.to_ascii_uppercase())
+            .collect();
+        for &(pat, canon) in &PATTERNS_BY_LEN {
+            if compact.contains(pat) {
+                return canon;
+            }
+        }
+        "HNCACB"
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -4173,6 +4220,7 @@ impl NmrWorkbenchApp {
             .iter()
             .map(|&(_, s)| s)
             .fold(f64::NEG_INFINITY, f64::max);
+        let has_competing_lower = raw.len() > 1 && raw.iter().any(|&(_, s)| s < max_s);
         let mut probs: Vec<(&'static str, f64)> = raw
             .into_iter()
             .map(|(aa, s)| (aa, (s - max_s).exp()))
@@ -4183,10 +4231,36 @@ impl NmrWorkbenchApp {
         }
         for (_, w) in &mut probs {
             *w /= sum_w;
+            if has_competing_lower && *w >= 1.0 {
+                *w = 1.0 - 1e-9;
+            }
         }
         probs.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(b.0)));
         probs.truncate(top_k);
         probs
+    }
+
+    fn is_con_rooted_idp(&self) -> bool {
+        self.regime_kind == GuiRegimeKind::Idp13C
+            || self.active_2d_nuclei() == ("13C", "15N")
+            || self
+                .c13_picked_dataset
+                .as_ref()
+                .is_some_and(|ds| !ds.con_roots.is_empty())
+            || self
+                .peaks
+                .iter()
+                .any(|p| Self::normalize_exp_key(&p.exp) == "CON")
+    }
+
+    fn predict_root_aa_types(
+        &self,
+        ca: Option<f64>,
+        cb: Option<f64>,
+        c: Option<f64>,
+        top_k: usize,
+    ) -> Vec<(&'static str, f64)> {
+        Self::predict_aa_types_from_shifts(&self.priors, ca, cb, c, self.is_con_rooted_idp(), top_k)
     }
 
     fn format_unassigned_type_tag(preds: &[(&'static str, f64)]) -> String {
@@ -4200,70 +4274,132 @@ impl NmrWorkbenchApp {
         }
     }
 
+    fn format_aa_prob_pct(p: f64) -> String {
+        if !p.is_finite() || p <= 0.0 {
+            return "0%".to_string();
+        }
+        if p >= 1.0 {
+            return "100%".to_string();
+        }
+        let pct = p * 100.0;
+        if pct.round() >= 100.0 {
+            format!("{:.1}%", pct.min(99.9))
+        } else {
+            format!("{pct:.0}%")
+        }
+    }
+
     fn format_aa_type_summary(preds: &[(&'static str, f64)]) -> String {
         preds
             .iter()
-            .map(|&(aa, p)| format!("{} {:.0}%", Self::title_case_aa(aa), p * 100.0))
+            .map(|&(aa, p)| {
+                format!(
+                    "{} {}",
+                    Self::title_case_aa(aa),
+                    Self::format_aa_prob_pct(p)
+                )
+            })
             .collect::<Vec<_>>()
             .join(" · ")
     }
 
+    fn compute_assign_score(u: &Matrix2D, p: &Matrix2D, position: &[i32]) -> f64 {
+        if u.rows == 0 || u.cols == 0 || position.len() != u.rows {
+            return 0.0;
+        }
+        let mut at = vec![-1i32; u.cols];
+        for (s, &k) in position.iter().enumerate() {
+            if k >= 0 && (k as usize) < u.cols {
+                at[k as usize] = s as i32;
+            }
+        }
+        let mut sc = 0.0;
+        for (k, &s) in at.iter().enumerate() {
+            if s >= 0 && (s as usize) < u.rows {
+                sc += u.get(s as usize, k);
+            }
+        }
+        for e in 0..u.cols.saturating_sub(1) {
+            let a = at[e];
+            let b = at[e + 1];
+            if a >= 0 && b >= 0 && (a as usize) < p.rows && (b as usize) < p.cols {
+                sc += p.get(a as usize, b as usize);
+            }
+        }
+        sc
+    }
+
     fn rebuild_systems_and_matrices(&mut self) {
-        let old_sel_coords = self
-            .selected_ss
-            .and_then(|s| self.systems.get(s))
-            .map(|ss| (ss.h, ss.n));
-        let old_locks: Vec<(f64, f64, usize)> = self
-            .session
-            .state
-            .locked_residues
-            .iter()
-            .filter_map(|(&ss_idx, &res_idx)| {
-                self.systems.get(ss_idx).map(|ss| (ss.h, ss.n, res_idx))
-            })
-            .collect();
-        let old_assign_coords = self.assign_res.as_ref().map(|ar| {
-            let entries: Vec<(f64, f64, i32, f64)> = ar
-                .position
-                .iter()
-                .enumerate()
-                .filter_map(|(s, &pos)| {
-                    if pos < 0 {
-                        return None;
-                    }
-                    let ss = self.systems.get(s)?;
-                    let conf = ar.confidence.get(s).copied().unwrap_or(0.0);
-                    Some((ss.h, ss.n, pos, conf))
-                })
-                .collect();
-            (entries, ar.score, ar.run_scores.clone())
-        });
+        if !self.peaks.iter().any(|p| p.exp == "HSQC") {
+            let had_systems = !self.systems.is_empty();
+            self.systems.clear();
+            self.selected_ss = None;
+            self.u_mat = None;
+            self.p_mat = None;
+            self.session.state.locked_residues.clear();
+            if had_systems && self.assign_res.is_some() {
+                self.assign_res = Some(AssignResult {
+                    position: Vec::new(),
+                    confidence: Vec::new(),
+                    score: 0.0,
+                    run_scores: Vec::new(),
+                });
+                let empty_ref = Reference::new(self.sequence.clone(), self.seq_ids.clone());
+                self.sidechain_ribbon_state
+                    .sync_inferred_variants_from_reference(&empty_ref);
+                self.pred_ref = Some(empty_ref);
+                self.pred_conf.clear();
+                self.refresh_propensity_report();
+                self.sync_session_assignments_from_solver();
+                self.relax_peaks_sync_key = (usize::MAX, usize::MAX, 0);
+                if self.truth.is_some() {
+                    self.metrics = None;
+                }
+            }
+            return;
+        }
 
         match build_spin_systems(&self.peaks, &Tolerances::default(), 3, false) {
             Ok(sys) => {
-                let find_nearest_new = |h: f64, n: f64, used: Option<&[bool]>| -> Option<usize> {
-                    sys.iter()
-                        .enumerate()
-                        .filter(|&(idx, cand)| {
-                            used.is_none_or(|u| !u[idx])
-                                && (cand.h - h).abs() <= 0.03
-                                && (cand.n - n).abs() <= 0.30
-                        })
-                        .min_by(|(_, a), (_, b)| {
-                            let da = ((a.h - h) / 0.03).hypot((a.n - n) / 0.30);
-                            let db = ((b.h - h) / 0.03).hypot((b.n - n) / 0.30);
-                            da.total_cmp(&db)
-                        })
-                        .map(|(idx, _)| idx)
-                };
+                // Global distance-sorted one-to-one matching between old and new spin systems
+                // within (|dH| <= 0.03 ppm, |dN| <= 0.30 ppm) so deleting one peak never lets
+                // its residue label or lock spill onto a nearby surviving neighbor.
+                let mut pairs: Vec<(f64, usize, usize)> = Vec::new();
+                for (oi, old_ss) in self.systems.iter().enumerate() {
+                    for (ni, new_ss) in sys.iter().enumerate() {
+                        let dh = (new_ss.h - old_ss.h).abs();
+                        let dn = (new_ss.n - old_ss.n).abs();
+                        if dh <= 0.03 && dn <= 0.30 {
+                            let d2 = (dh / 0.03).powi(2) + (dn / 0.30).powi(2);
+                            pairs.push((d2, oi, ni));
+                        }
+                    }
+                }
+                pairs.sort_by(|a, b| {
+                    a.0.total_cmp(&b.0)
+                        .then_with(|| a.1.cmp(&b.1))
+                        .then_with(|| a.2.cmp(&b.2))
+                });
+                let mut used_old = vec![false; self.systems.len()];
+                let mut used_new = vec![false; sys.len()];
+                let mut old_to_new: Vec<Option<usize>> = vec![None; self.systems.len()];
+                for (_, oi, ni) in pairs {
+                    if used_old[oi] || used_new[ni] {
+                        continue;
+                    }
+                    used_old[oi] = true;
+                    used_new[ni] = true;
+                    old_to_new[oi] = Some(ni);
+                }
 
-                let mut used_locks = vec![false; sys.len()];
                 let mut remapped_locks = BTreeMap::new();
-                for &(lh, ln, res_idx) in &old_locks {
+                let mut used_lock_res = BTreeSet::new();
+                for (&old_ss, &res_idx) in &self.session.state.locked_residues {
                     if res_idx < self.sequence.len() {
-                        if let Some(ns) = find_nearest_new(lh, ln, Some(&used_locks)) {
-                            used_locks[ns] = true;
-                            remapped_locks.insert(ns, res_idx);
+                        if let Some(ns) = old_to_new.get(old_ss).copied().flatten() {
+                            if used_lock_res.insert(res_idx) {
+                                remapped_locks.insert(ns, res_idx);
+                            }
                         }
                     }
                 }
@@ -4276,56 +4412,80 @@ impl NmrWorkbenchApp {
                     ..ScoreConfig::default()
                 };
                 let (u, p) = self.compute_matrices(&sys, &scfg);
-                self.u_mat = Some(u);
-                self.p_mat = Some(p);
 
-                if let Some((entries, old_score, old_run_scores)) = old_assign_coords {
+                if let Some(old_ar) = self.assign_res.take() {
                     let mut new_pos = vec![-1i32; sys.len()];
                     let mut new_conf = vec![0.0f64; sys.len()];
-                    let mut used_ss = vec![false; sys.len()];
-                    let mut new_session_assign: BTreeMap<usize, ResidueAssignmentState> =
-                        BTreeMap::new();
-                    for (oh, on, pos, conf) in entries {
+                    let mut used_res = BTreeSet::new();
+                    for (old_ss, &pos) in old_ar.position.iter().enumerate() {
+                        if pos < 0 {
+                            continue;
+                        }
                         let k = pos as usize;
-                        if k < self.sequence.len() {
-                            if let Some(ns) = find_nearest_new(oh, on, Some(&used_ss)) {
-                                used_ss[ns] = true;
+                        if k >= self.sequence.len() {
+                            continue;
+                        }
+                        if let Some(ns) = old_to_new.get(old_ss).copied().flatten() {
+                            if used_res.insert(k) {
                                 new_pos[ns] = pos;
-                                new_conf[ns] = conf;
-                                let shifts = self
-                                    .session
-                                    .state
-                                    .assignments
-                                    .get(&k)
-                                    .map(|st| st.shifts.clone())
-                                    .unwrap_or_default();
-                                new_session_assign.insert(
-                                    k,
-                                    ResidueAssignmentState {
-                                        spin_system: Some(ns),
-                                        shifts,
-                                        confidence: conf,
-                                    },
-                                );
+                                new_conf[ns] =
+                                    old_ar.confidence.get(old_ss).copied().unwrap_or(0.0);
                             }
                         }
                     }
-                    self.assign_res = Some(AssignResult {
+                    let new_score = Self::compute_assign_score(&u, &p, &new_pos);
+                    let new_ar = AssignResult {
                         position: new_pos,
                         confidence: new_conf,
-                        score: old_score,
-                        run_scores: old_run_scores,
-                    });
-                    self.session.state.assignments = new_session_assign;
+                        score: new_score,
+                        run_scores: Vec::new(),
+                    };
+                    let (mut pred, conf) = to_reference(
+                        &new_ar,
+                        &sys,
+                        &self.sequence,
+                        &self.seq_ids,
+                        0.0,
+                        Some(&self.priors),
+                    );
+                    for (&k, st) in &self.session.state.assignments {
+                        if used_res.contains(&k) {
+                            for (atom, &val) in &st.shifts {
+                                if !matches!(atom.as_str(), "H" | "N" | "CA" | "CB" | "C") {
+                                    pred.shifts.entry((k, atom.clone())).or_insert(val);
+                                }
+                            }
+                        }
+                    }
+                    if let Some(truth) = &self.truth {
+                        if truth.len() == new_ar.position.len() {
+                            self.metrics = Some(score(&new_ar, truth, 0.8));
+                        } else {
+                            self.metrics = None;
+                        }
+                    }
+                    self.sidechain_ribbon_state
+                        .sync_inferred_variants_from_reference(&pred);
+                    self.pred_ref = Some(pred);
+                    self.pred_conf = conf;
+                    self.assign_res = Some(new_ar);
                 }
+                self.u_mat = Some(u);
+                self.p_mat = Some(p);
 
-                let remapped_sel =
-                    old_sel_coords.and_then(|(sh, sn)| find_nearest_new(sh, sn, None));
+                let remapped_sel = self
+                    .selected_ss
+                    .and_then(|old_s| old_to_new.get(old_s).copied().flatten());
                 self.systems = sys;
                 self.selected_ss = remapped_sel.or_else(|| match self.selected_ss {
                     Some(s) if s < self.systems.len() => Some(s),
                     _ => (!self.systems.is_empty()).then_some(0),
                 });
+                if self.assign_res.is_some() {
+                    self.refresh_propensity_report();
+                    self.sync_session_assignments_from_solver();
+                }
+                self.relax_peaks_sync_key = (usize::MAX, usize::MAX, 0);
             }
             Err(e) => {
                 self.status_msg = format!("Spin system build error: {e}");
@@ -4452,6 +4612,9 @@ impl NmrWorkbenchApp {
                 &self.priors,
                 &scfg,
             ));
+            if self.p_mat.is_none() {
+                self.p_mat = Some(pair_matrix(&self.systems, &scfg));
+            }
         }
 
         if let Some(hsqc_layer) = self
@@ -4485,9 +4648,13 @@ impl NmrWorkbenchApp {
         }
         let (mut pred, mut conf) = self.session.state.to_reference_and_confidences();
         if n_sys > 0 {
+            let computed_score = match (&self.u_mat, &self.p_mat) {
+                (Some(u), Some(p)) => Self::compute_assign_score(u, p, &position),
+                _ => self.assign_res.as_ref().map_or(0.0, |r| r.score),
+            };
             let synth_res = AssignResult {
                 position: position.clone(),
-                score: self.assign_res.as_ref().map_or(0.0, |r| r.score),
+                score: computed_score,
                 confidence: confidence.clone(),
                 run_scores: Vec::new(),
             };
@@ -7609,15 +7776,14 @@ impl NmrWorkbenchApp {
                     if ui
                         .button("Auto")
                         .on_hover_text(
-                            "Auto-estimate 3D SNR threshold from cube MAD noise, dynamic range & contour floor",
+                            "Auto-estimate 3D SNR threshold from cube MAD noise & dynamic range",
                         )
                         .clicked()
                     {
                         if let Some(cube) =
                             self.active_cube_idx.and_then(|idx| self.cubes_3d.get(idx))
                         {
-                            self.cube_slice.snr_threshold =
-                                estimate_auto_snr_3d(cube, Some(self.contour_base));
+                            self.cube_slice.snr_threshold = estimate_auto_snr_3d(cube, None);
                             repick_cube = true;
                         }
                     }
@@ -7892,12 +8058,12 @@ impl NmrWorkbenchApp {
                     if ui
                         .button("Auto")
                         .on_hover_text(
-                            "Auto-estimate 2D SNR threshold from MAD noise, dynamic range & contour floor",
+                            "Auto-estimate 2D SNR threshold from MAD noise & dynamic range",
                         )
                         .clicked()
                     {
                         if let Some(ref hsqc) = self.hsqc_spec {
-                            let auto_snr = estimate_auto_snr_2d(hsqc, Some(self.contour_base));
+                            let auto_snr = estimate_auto_snr_2d(hsqc, None);
                             self.picker_snr = auto_snr;
                             self.assign_setup_drawer.snr_threshold = f64::from(auto_snr);
                             repick = true;
@@ -8072,12 +8238,10 @@ impl NmrWorkbenchApp {
                                                 ))
                                             } else {
                                                 let sh = self.systems[best_ss].shifts();
-                                                let preds = Self::predict_aa_types_from_shifts(
-                                                    &self.priors,
+                                                let preds = self.predict_root_aa_types(
                                                     sh.get(&("CA".to_string(), 0)).copied(),
                                                     sh.get(&("CB".to_string(), 0)).copied(),
                                                     sh.get(&("C".to_string(), 0)).copied(),
-                                                    false,
                                                     3,
                                                 );
                                                 if preds.is_empty() {
@@ -11217,12 +11381,10 @@ impl NmrWorkbenchApp {
                         }
                     } else {
                         let sh = ss.shifts();
-                        let preds = Self::predict_aa_types_from_shifts(
-                            &self.priors,
+                        let preds = self.predict_root_aa_types(
                             sh.get(&("CA".to_string(), 0)).copied(),
                             sh.get(&("CB".to_string(), 0)).copied(),
                             sh.get(&("C".to_string(), 0)).copied(),
-                            false,
                             2,
                         );
                         format!("#{s}{}", Self::format_unassigned_type_tag(&preds))
@@ -13355,6 +13517,134 @@ impl NmrWorkbenchApp {
     }
 
     fn apply_loaded_ingest_payload(&mut self, payload: IngestLoadedPayload) {
+        self.apply_loaded_ingest_payload_with_edits(payload, false, false, false);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn hash_fnv1a_bytes(acc: &mut u64, bytes: &[u8]) {
+        for &b in bytes {
+            *acc ^= u64::from(b);
+            *acc = acc.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn hash_fnv1a_u64(acc: &mut u64, v: u64) {
+        Self::hash_fnv1a_bytes(acc, &v.to_le_bytes());
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn peaks_curation_fingerprint(&self) -> u64 {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        Self::hash_fnv1a_u64(&mut h, self.peaks.len() as u64);
+        for p in &self.peaks {
+            Self::hash_fnv1a_bytes(&mut h, p.exp.as_bytes());
+            Self::hash_fnv1a_u64(&mut h, p.h.to_bits());
+            Self::hash_fnv1a_u64(&mut h, p.n.to_bits());
+            Self::hash_fnv1a_u64(&mut h, p.c.map_or(u64::MAX, f64::to_bits));
+            Self::hash_fnv1a_u64(&mut h, (p.sign as i64) as u64);
+            Self::hash_fnv1a_u64(&mut h, p.height.map_or(u64::MAX, f64::to_bits));
+        }
+        Self::hash_fnv1a_u64(&mut h, self.peak_2d_labels.len() as u64);
+        for (k, lbl) in &self.peak_2d_labels {
+            Self::hash_fnv1a_u64(&mut h, k.0 as u64);
+            Self::hash_fnv1a_u64(&mut h, k.1 as u64);
+            Self::hash_fnv1a_bytes(&mut h, lbl.as_bytes());
+        }
+        if let Some(ref ds) = self.c13_picked_dataset {
+            Self::hash_fnv1a_u64(&mut h, 1);
+            Self::hash_fnv1a_u64(&mut h, ds.con_roots.len() as u64);
+            Self::hash_fnv1a_u64(&mut h, ds.caco_peaks.len() as u64);
+            Self::hash_fnv1a_u64(&mut h, ds.strip_peaks.len() as u64);
+        } else {
+            Self::hash_fnv1a_u64(&mut h, 0);
+        }
+        h
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn assign_curation_fingerprint(&self) -> u64 {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        Self::hash_fnv1a_u64(&mut h, self.sequence.len() as u64);
+        for r in &self.sequence {
+            Self::hash_fnv1a_bytes(&mut h, r.as_bytes());
+        }
+        Self::hash_fnv1a_u64(&mut h, self.seq_ids.len() as u64);
+        for &sid in &self.seq_ids {
+            Self::hash_fnv1a_u64(&mut h, sid as i64 as u64);
+        }
+        Self::hash_fnv1a_u64(&mut h, self.assign_res_fingerprint());
+        if let Some(ref ar) = self.assign_res {
+            Self::hash_fnv1a_u64(&mut h, ar.score.to_bits());
+        }
+        if let Some(ref pred) = self.pred_ref {
+            Self::hash_fnv1a_u64(&mut h, pred.shifts.len() as u64);
+            for ((k, atom), v) in &pred.shifts {
+                Self::hash_fnv1a_u64(&mut h, *k as u64);
+                Self::hash_fnv1a_bytes(&mut h, atom.as_bytes());
+                Self::hash_fnv1a_u64(&mut h, v.to_bits());
+            }
+        }
+        Self::hash_fnv1a_u64(&mut h, self.pred_conf.len() as u64);
+        for (&k, &c) in &self.pred_conf {
+            Self::hash_fnv1a_u64(&mut h, k as u64);
+            Self::hash_fnv1a_u64(&mut h, c.to_bits());
+        }
+        Self::hash_fnv1a_u64(&mut h, self.session.state.locked_residues.len() as u64);
+        for (&ss, &res) in &self.session.state.locked_residues {
+            Self::hash_fnv1a_u64(&mut h, ss as u64);
+            Self::hash_fnv1a_u64(&mut h, res as u64);
+        }
+        Self::hash_fnv1a_u64(&mut h, self.session.state.assignments.len() as u64);
+        for (&k, st) in &self.session.state.assignments {
+            Self::hash_fnv1a_u64(&mut h, k as u64);
+            Self::hash_fnv1a_u64(&mut h, st.spin_system.map_or(u64::MAX, |s| s as u64));
+            Self::hash_fnv1a_u64(&mut h, st.confidence.to_bits());
+            Self::hash_fnv1a_u64(&mut h, st.shifts.len() as u64);
+            for (atom, &v) in &st.shifts {
+                Self::hash_fnv1a_bytes(&mut h, atom.as_bytes());
+                Self::hash_fnv1a_u64(&mut h, v.to_bits());
+            }
+        }
+        Self::hash_fnv1a_u64(&mut h, self.session.state.confirmed_links.len() as u64);
+        for &(a, b) in &self.session.state.confirmed_links {
+            Self::hash_fnv1a_u64(&mut h, a as u64);
+            Self::hash_fnv1a_u64(&mut h, b as u64);
+        }
+        h
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn peaks_3d_curation_fingerprint(&self) -> u64 {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        Self::hash_fnv1a_u64(&mut h, self.peaks_3d.len() as u64);
+        for pk in &self.peaks_3d {
+            Self::hash_fnv1a_bytes(&mut h, pk.exp.as_bytes());
+            Self::hash_fnv1a_u64(&mut h, pk.f3_ppm.to_bits());
+            Self::hash_fnv1a_u64(&mut h, pk.f2_ppm.to_bits());
+            Self::hash_fnv1a_u64(&mut h, pk.f1_ppm.to_bits());
+            Self::hash_fnv1a_bytes(&mut h, pk.label.as_bytes());
+        }
+        Self::hash_fnv1a_u64(&mut h, self.workbook.pages_2d.len() as u64);
+        for pg in &self.workbook.pages_2d {
+            Self::hash_fnv1a_u64(&mut h, pg.peaks_3d.len() as u64);
+            for pk in &pg.peaks_3d {
+                Self::hash_fnv1a_u64(&mut h, pk.f3_ppm.to_bits());
+                Self::hash_fnv1a_u64(&mut h, pk.f2_ppm.to_bits());
+                Self::hash_fnv1a_u64(&mut h, pk.f1_ppm.to_bits());
+                Self::hash_fnv1a_bytes(&mut h, pk.label.as_bytes());
+            }
+        }
+        h
+    }
+
+    fn apply_loaded_ingest_payload_with_edits(
+        &mut self,
+        payload: IngestLoadedPayload,
+        preserve_peaks_during_load: bool,
+        preserve_assign_during_load: bool,
+        preserve_3d_peaks_during_load: bool,
+    ) {
         let IngestLoadedPayload {
             plan,
             run_full_pipeline,
@@ -13372,9 +13662,35 @@ impl NmrWorkbenchApp {
         self.show_relax_panel = false;
         self.show_dynamics_panel = false;
 
+        let has_existing_non_demo_2d = self.workbook.pages_2d.iter().any(|pg| !pg.is_cube_3d());
+        let is_3d_append_onto_existing_2d =
+            loaded_2d_list.is_empty() && !cubes_3d.is_empty() && has_existing_non_demo_2d;
+        let keep_existing_peaks = preserve_peaks_during_load
+            || (is_3d_append_onto_existing_2d
+                && (!self.peaks.is_empty() || !self.peak_2d_labels.is_empty()));
+        let keep_existing_assign = preserve_assign_during_load
+            || (is_3d_append_onto_existing_2d
+                && (self.assign_res.is_some()
+                    || !self.session.state.assignments.is_empty()
+                    || !self.session.state.locked_residues.is_empty()
+                    || !self.sequence.is_empty()));
+        let keep_existing_3d_peaks = preserve_3d_peaks_during_load || is_3d_append_onto_existing_2d;
+        let had_in_flight_edits = preserve_peaks_during_load
+            || preserve_assign_during_load
+            || preserve_3d_peaks_during_load;
+
         let has_user_seq = !plan.sequence_three_letter.is_empty();
-        self.clear_stale_protein_demo_state(has_user_seq, false);
-        if has_user_seq {
+        if !keep_existing_peaks && !keep_existing_assign {
+            self.clear_stale_protein_demo_state(has_user_seq, false);
+            if has_user_seq {
+                self.sequence = plan.sequence_three_letter.clone();
+                self.seq_ids = (1..=(self.sequence.len() as i32)).collect();
+                self.octet_app
+                    .set_loaded_protein_sequence(self.sequence.clone());
+            }
+            self.peak_2d_labels.clear();
+            self.water_undo_2d = None;
+        } else if has_user_seq && self.sequence.is_empty() {
             self.sequence = plan.sequence_three_letter.clone();
             self.seq_ids = (1..=(self.sequence.len() as i32)).collect();
             self.octet_app
@@ -13389,11 +13705,10 @@ impl NmrWorkbenchApp {
 
         self.axis_rescue_notices.clear();
         self.axis_rescue_audits.clear();
-        self.peak_2d_labels.clear();
-        self.water_undo_2d = None;
         self.bare_bruker_hint = None;
 
         let mut primary_cls: Option<PulseSequenceClass> = None;
+        let added_primary_2d = !loaded_2d_list.is_empty();
         {
             let any_1d_loaded = !loaded_1d_specs.is_empty();
             if any_1d_loaded {
@@ -13402,7 +13717,6 @@ impl NmrWorkbenchApp {
 
             // Promote primary_2d by priority: N15Hsqc -> Con2D -> C13Hsqc/C13Hmqc -> first loaded Dim2D
             let mut caco_2d_specs: Vec<Spectrum2D> = Vec::new();
-            let added_primary_2d = !loaded_2d_list.is_empty();
             if added_primary_2d {
                 let rank_2d = |cls: PulseSequenceClass, tok: Option<&'static str>| -> u8 {
                     if cls == PulseSequenceClass::N15Hsqc || tok == Some("HSQC") {
@@ -13465,8 +13779,10 @@ impl NmrWorkbenchApp {
                     caco_2d_specs.push(hsqc.clone());
                 }
                 self.active_cube_idx = None;
-                self.peaks_3d.clear();
-                self.water_undo_3d = None;
+                if !keep_existing_3d_peaks {
+                    self.peaks_3d.clear();
+                    self.water_undo_3d = None;
+                }
                 self.primary_2d_label = prim_lbl.clone();
                 self.primary_2d_visible = true;
                 self.primary_ppm_nudge = [0.0, 0.0];
@@ -13544,45 +13860,48 @@ impl NmrWorkbenchApp {
                 || self.active_2d_nuclei() == ("13C", "15N");
             if is_idp_13c {
                 self.regime_kind = GuiRegimeKind::Idp13C;
-                let c13_cfg = C13PickerConfig {
-                    snr_2d: self.picker_snr,
-                    ..C13PickerConfig::default()
-                };
-                let con_roots = if self.active_2d_nuclei() == ("13C", "15N") {
-                    self.hsqc_spec
-                        .as_ref()
-                        .map(|sp| pick_con_2d(sp, &c13_cfg))
-                        .unwrap_or_default()
-                } else {
-                    Vec::new()
-                };
-                let mut caco_peaks = Vec::new();
-                for caco_sp in &caco_2d_specs {
-                    caco_peaks.extend(pick_caco_2d(caco_sp, &c13_cfg));
-                }
-                let mut strip_peaks = Vec::new();
-                if !con_roots.is_empty() {
-                    for (_, cls3, ref sp3) in &cubes_3d {
-                        let exp_opt = match cls3 {
-                            PulseSequenceClass::Canco3D => Some(C13DetectedExp::Canco3D),
-                            PulseSequenceClass::Cbcaco3D => Some(C13DetectedExp::Cbcaco3D),
-                            _ => C13DetectedExp::from_name(&sp3.exp),
-                        };
-                        if let Some(c13_exp) = exp_opt {
-                            strip_peaks
-                                .extend(pick_con_anchored_3d(sp3, c13_exp, &con_roots, &c13_cfg));
+                if !keep_existing_peaks {
+                    let c13_cfg = C13PickerConfig {
+                        snr_2d: self.picker_snr,
+                        ..C13PickerConfig::default()
+                    };
+                    let con_roots = if self.active_2d_nuclei() == ("13C", "15N") {
+                        self.hsqc_spec
+                            .as_ref()
+                            .map(|sp| pick_con_2d(sp, &c13_cfg))
+                            .unwrap_or_default()
+                    } else {
+                        Vec::new()
+                    };
+                    let mut caco_peaks = Vec::new();
+                    for caco_sp in &caco_2d_specs {
+                        caco_peaks.extend(pick_caco_2d(caco_sp, &c13_cfg));
+                    }
+                    let mut strip_peaks = Vec::new();
+                    if !con_roots.is_empty() {
+                        for (_, cls3, ref sp3) in &cubes_3d {
+                            let exp_opt = match cls3 {
+                                PulseSequenceClass::Canco3D => Some(C13DetectedExp::Canco3D),
+                                PulseSequenceClass::Cbcaco3D => Some(C13DetectedExp::Cbcaco3D),
+                                _ => C13DetectedExp::from_name(&sp3.exp),
+                            };
+                            if let Some(c13_exp) = exp_opt {
+                                strip_peaks.extend(pick_con_anchored_3d(
+                                    sp3, c13_exp, &con_roots, &c13_cfg,
+                                ));
+                            }
                         }
                     }
+                    self.c13_picked_dataset = Some(C13PickedDataset {
+                        con_roots,
+                        caco_peaks,
+                        strip_peaks,
+                    });
+                    self.sync_con_roots_to_peaks();
                 }
-                self.c13_picked_dataset = Some(C13PickedDataset {
-                    con_roots,
-                    caco_peaks,
-                    strip_peaks,
-                });
-                self.sync_con_roots_to_peaks();
             } else if plan.problem_regime == ProblemRegime::Paramagnetic {
                 self.regime_kind = GuiRegimeKind::Paramagnetic;
-            } else {
+            } else if !keep_existing_assign {
                 self.regime_kind = GuiRegimeKind::Globular;
             }
 
@@ -13591,29 +13910,20 @@ impl NmrWorkbenchApp {
                 self.show_strips_dock = true;
             }
 
-            if run_full_pipeline && !is_idp_13c {
+            if run_full_pipeline && !is_idp_13c && !preserve_peaks_during_load {
                 let pcfg = PickerConfig {
                     snr_threshold: self.picker_snr,
                     ..PickerConfig::default()
                 };
-                let mut all_peaks = Vec::new();
-                if let Some(ref hsqc) = self.hsqc_spec {
+                if keep_existing_peaks {
+                    // Append corroborated 3D peaks onto the user's existing 2D roots without discarding 2D edits
+                    let roots: Vec<Peak> = self
+                        .peaks
+                        .iter()
+                        .filter(|p| Self::normalize_exp_key(&p.exp) == "HSQC")
+                        .cloned()
+                        .collect();
                     let (nx, ny) = self.active_2d_nuclei();
-                    let roots = if nx == "1H" && ny == "13C" {
-                        pick_c13_hsqc_2d(hsqc, &pcfg)
-                    } else if nx == "1H" && ny == "15N" {
-                        if self.use_neural_picker {
-                            pick_hsqc_2d_neural_hardened(
-                                hsqc,
-                                &NeuralPickerConfig::default(),
-                                self.picker_snr,
-                            )
-                        } else {
-                            pick_hsqc_2d(hsqc, &pcfg)
-                        }
-                    } else {
-                        self.pick_generic_2d_crosspeaks(hsqc, self.picker_snr)
-                    };
                     let c_refs: Vec<&Spectrum3D> = cubes_3d.iter().map(|(_, _, s)| s).collect();
                     if !c_refs.is_empty() && !roots.is_empty() && nx == "1H" && ny == "15N" {
                         let p3 = pick_triple_3d_two_pass(
@@ -13622,14 +13932,44 @@ impl NmrWorkbenchApp {
                             &pcfg,
                             &CorroboratedRepickConfig::default(),
                         );
-                        all_peaks.extend(roots);
-                        all_peaks.extend(p3);
-                    } else {
-                        all_peaks.extend(roots);
+                        self.peaks.extend(p3);
                     }
-                }
-                if !all_peaks.is_empty() {
-                    self.peaks = all_peaks;
+                } else {
+                    let mut all_peaks = Vec::new();
+                    if let Some(ref hsqc) = self.hsqc_spec {
+                        let (nx, ny) = self.active_2d_nuclei();
+                        let roots = if nx == "1H" && ny == "13C" {
+                            pick_c13_hsqc_2d(hsqc, &pcfg)
+                        } else if nx == "1H" && ny == "15N" {
+                            if self.use_neural_picker {
+                                pick_hsqc_2d_neural_hardened(
+                                    hsqc,
+                                    &NeuralPickerConfig::default(),
+                                    self.picker_snr,
+                                )
+                            } else {
+                                pick_hsqc_2d(hsqc, &pcfg)
+                            }
+                        } else {
+                            self.pick_generic_2d_crosspeaks(hsqc, self.picker_snr)
+                        };
+                        let c_refs: Vec<&Spectrum3D> = cubes_3d.iter().map(|(_, _, s)| s).collect();
+                        if !c_refs.is_empty() && !roots.is_empty() && nx == "1H" && ny == "15N" {
+                            let p3 = pick_triple_3d_two_pass(
+                                &c_refs,
+                                &roots,
+                                &pcfg,
+                                &CorroboratedRepickConfig::default(),
+                            );
+                            all_peaks.extend(roots);
+                            all_peaks.extend(p3);
+                        } else {
+                            all_peaks.extend(roots);
+                        }
+                    }
+                    if !all_peaks.is_empty() {
+                        self.peaks = all_peaks;
+                    }
                 }
             }
 
@@ -13638,9 +13978,13 @@ impl NmrWorkbenchApp {
                 let s3_arc = Arc::new(s3);
                 self.assign_named_3d_slot(&s3_arc);
                 let c_idx = self.cubes_3d.len();
-                let mut page_idx = self.workbook.add_3d_cube_page(c_idx, &disp_3d, &s3_arc);
+                let page_idx = self.workbook.add_3d_cube_page(c_idx, &disp_3d, &s3_arc);
                 // Skip redundant slow blind full-cube pick when cube > 8M voxels or HSQC is loaded
-                if run_full_pipeline && s3_arc.data.len() <= 8_000_000 && self.hsqc_spec.is_none() {
+                if run_full_pipeline
+                    && !preserve_3d_peaks_during_load
+                    && s3_arc.data.len() <= 8_000_000
+                    && self.hsqc_spec.is_none()
+                {
                     if let Some(pg3) = self.workbook.pages_2d.get_mut(page_idx) {
                         let _ = pg3.pick_3d_cube_peaks(&s3_arc);
                     }
@@ -13648,7 +13992,6 @@ impl NmrWorkbenchApp {
                 if first_3d_page_idx.is_none() {
                     first_3d_page_idx = Some(page_idx);
                 }
-                let _ = &mut page_idx;
                 self.cubes_3d.push(s3_arc);
             }
             let stored_3d = usize::from(self.hncacb_3d.is_some())
@@ -13659,8 +14002,14 @@ impl NmrWorkbenchApp {
             if added_primary_2d {
                 self.save_live_2d_into_workbook();
             } else if let Some(p_idx) = first_3d_page_idx {
-                self.activate_2d_workbook_page(p_idx);
-                if run_full_pipeline && self.peaks.is_empty() {
+                if !had_in_flight_edits {
+                    self.activate_2d_workbook_page(p_idx);
+                }
+                if run_full_pipeline
+                    && self.peaks.is_empty()
+                    && !preserve_peaks_during_load
+                    && !keep_existing_peaks
+                {
                     if let Some(ref sky) = self.hsqc_spec {
                         let pcfg = PickerConfig::default();
                         let roots = if self.use_neural_picker {
@@ -13699,9 +14048,19 @@ impl NmrWorkbenchApp {
                 + usize::from(self.hnco_3d.is_some())
                 + usize::from(self.hncaco_3d.is_some()),
         );
-        self.sync_session_from_app_fresh(&plan.root_name);
-        self.session.state.processing_recipes = ingested_recipes;
-        self.rebuild_systems_and_matrices();
+        if !keep_existing_peaks && !keep_existing_assign {
+            self.sync_session_from_app_fresh(&plan.root_name);
+            self.session.state.processing_recipes = ingested_recipes;
+            self.rebuild_systems_and_matrices();
+        } else {
+            for (k, v) in ingested_recipes {
+                self.session.state.processing_recipes.insert(k, v);
+            }
+            self.session.state.peaks = self.peaks.clone();
+            if !preserve_peaks_during_load && !self.peaks.is_empty() {
+                self.rebuild_systems_and_matrices();
+            }
+        }
 
         if self.hsqc_spec.is_none() && n_3d_total == 0 {
             if !self.stack1d_panel.traces.is_empty() {
@@ -13736,11 +14095,20 @@ impl NmrWorkbenchApp {
         let can_run_hn = self.regime_kind != GuiRegimeKind::Idp13C
             && !self.sequence.is_empty()
             && !self.peaks.is_empty();
+        let preserve_note = if had_in_flight_edits {
+            " (preserved in-flight peak/assignment edits)"
+        } else {
+            ""
+        };
 
-        if run_full_pipeline && (can_run_idp || can_run_hn) {
+        if run_full_pipeline
+            && !keep_existing_assign
+            && !preserve_peaks_during_load
+            && (can_run_idp || can_run_hn)
+        {
             self.run_assignment();
         } else if let Some(first_warn) = self.axis_rescue_notices.first() {
-            self.status_msg = first_warn.clone();
+            self.status_msg = format!("{first_warn}{preserve_note}");
         } else if self.regime_kind == GuiRegimeKind::Idp13C {
             let (n_con, n_pro) = self
                 .c13_picked_dataset
@@ -13761,7 +14129,7 @@ impl NmrWorkbenchApp {
                 format!(" [warn: {}]", load_errors.join("; "))
             };
             self.status_msg = format!(
-                "Loaded 13C-IDP '{}' ({} + {} overlay(s), {n_con} CON roots incl. {n_pro} Pro){warn_suffix}",
+                "Loaded 13C-IDP '{}' ({} + {} overlay(s), {n_con} CON roots incl. {n_pro} Pro){preserve_note}{warn_suffix}",
                 plan.root_name,
                 self.primary_2d_label,
                 self.overlay_layers.len()
@@ -13773,7 +14141,7 @@ impl NmrWorkbenchApp {
                 format!(" [warn: {}]", load_errors.join("; "))
             };
             self.status_msg = format!(
-                "Loaded '{}' (primary: {}{}, {} peaks, {} aa){warn_suffix}",
+                "Loaded '{}' (primary: {}{}, {} peaks, {} aa){preserve_note}{warn_suffix}",
                 plan.root_name,
                 self.primary_2d_label,
                 if self.overlay_layers.is_empty() {
@@ -13853,6 +14221,9 @@ impl NmrWorkbenchApp {
                     repaint_ctx.request_repaint();
                 }) {
                 Ok(handle) => {
+                    let launch_peaks_fp = self.peaks_curation_fingerprint();
+                    let launch_assign_fp = self.assign_curation_fingerprint();
+                    let launch_peaks_3d_fp = self.peaks_3d_curation_fingerprint();
                     self.status_msg =
                         format!("Loading '{root_name}' in background ({total} experiment(s))...");
                     self.background_ingest = Some(BackgroundIngestJob {
@@ -13866,6 +14237,9 @@ impl NmrWorkbenchApp {
                         current_size_bytes: 0,
                         cloud_storage: initial_cloud,
                         cancelling: false,
+                        launch_peaks_fp,
+                        launch_assign_fp,
+                        launch_peaks_3d_fp,
                     });
                     ctx.request_repaint();
                 }
@@ -13930,7 +14304,18 @@ impl NmrWorkbenchApp {
                             self.status_msg =
                                 format!("Cancelled loading '{}'.", done_job.root_name);
                         } else {
-                            self.apply_loaded_ingest_payload(payload);
+                            let preserve_peaks =
+                                self.peaks_curation_fingerprint() != done_job.launch_peaks_fp;
+                            let preserve_assign =
+                                self.assign_curation_fingerprint() != done_job.launch_assign_fp;
+                            let preserve_3d_peaks =
+                                self.peaks_3d_curation_fingerprint() != done_job.launch_peaks_3d_fp;
+                            self.apply_loaded_ingest_payload_with_edits(
+                                payload,
+                                preserve_peaks,
+                                preserve_assign,
+                                preserve_3d_peaks,
+                            );
                         }
                     } else if cancelled {
                         self.status_msg = format!("Cancelled loading '{}'.", done_job.root_name);
@@ -14159,14 +14544,19 @@ impl NmrWorkbenchApp {
                     self.execute_ingest_plan(plan, false);
                 }
             }
-            WorkbenchAction::Register3dToHsqc2d =>
-            {
+            WorkbenchAction::Register3dToHsqc2d => {
                 #[cfg(not(target_arch = "wasm32"))]
                 if let Some(ref hsqc) = self.hsqc_spec {
                     let mut n_reg = 0usize;
                     self.axis_rescue_notices.clear();
                     self.axis_rescue_audits.clear();
                     if !self.cubes_3d.is_empty() {
+                        // Drop redundant named-slot Arc references before Arc::make_mut so cubes mutate
+                        // in place without triggering a full-cube copy-on-write clone.
+                        self.hncacb_3d = None;
+                        self.cbcaconh_3d = None;
+                        self.hnco_3d = None;
+                        self.hncaco_3d = None;
                         for s3_arc in &mut self.cubes_3d {
                             let s3 = Arc::make_mut(s3_arc);
                             Self::register_one_3d_cube(
@@ -15440,8 +15830,7 @@ impl NmrWorkbenchApp {
                             .small()
                             .weak(),
                         );
-                        let preds_i =
-                            Self::predict_aa_types_from_shifts(&self.priors, ca, cb, c, false, 3);
+                        let preds_i = self.predict_root_aa_types(ca, cb, c, 3);
                         if !preds_i.is_empty() {
                             ui.label(
                                 egui::RichText::new(format!(
@@ -15481,8 +15870,9 @@ impl NmrWorkbenchApp {
                                     self.seq_ids[self.assign_target_res]
                                 ))
                                 .show_ui(ui, |ui| {
+                                    let allow_pro = self.is_con_rooted_idp();
                                     for k in 1..self.sequence.len() {
-                                        if self.sequence[k] == "PRO" {
+                                        if !allow_pro && self.sequence[k] == "PRO" {
                                             continue;
                                         }
                                         ui.selectable_value(
@@ -18198,11 +18588,13 @@ impl NmrWorkbenchApp {
                     }
                 }
                 self.session.state.peaks = self.peaks.clone();
+                self.hncacb_3d = None;
+                self.cbcaconh_3d = None;
+                self.hnco_3d = None;
+                self.hncaco_3d = None;
                 for cube_arc in &mut self.cubes_3d {
                     if Self::normalize_exp_key(&cube_arc.exp) == from_key {
-                        let mut cloned = (**cube_arc).clone();
-                        cloned.exp = to_key.clone();
-                        *cube_arc = Arc::new(cloned);
+                        Arc::make_mut(cube_arc).exp = to_key.clone();
                     }
                 }
                 // Re-sync dedicated strip cube slots strictly by normalized experiment key.
@@ -18359,13 +18751,13 @@ impl NmrWorkbenchApp {
                     }
                     AssignSetupAction::AutoEstimateSnr => {
                         let est = if let Some(ref hsqc) = self.hsqc_spec {
-                            estimate_auto_snr_2d(hsqc, Some(self.contour_base))
+                            estimate_auto_snr_2d(hsqc, None)
                         } else if let Some(cube) = self
                             .active_cube_idx
                             .and_then(|idx| self.cubes_3d.get(idx))
                             .or_else(|| self.cubes_3d.first())
                         {
-                            estimate_auto_snr_3d(cube, Some(self.contour_base))
+                            estimate_auto_snr_3d(cube, None)
                         } else {
                             5.5
                         };
@@ -22854,6 +23246,880 @@ CBCACON\t175.41\t122.09\t30.40\t1\t520.0
                 .iter()
                 .any(|&(aa, _)| matches!(aa, "PHE" | "TYR" | "ASN" | "ASP")),
             "expected Phe/Tyr/Asn/Asp in top-3 for CA=55.6 CB=37.4, got {aromatic_asx:?}"
+        );
+    }
+
+    #[test]
+    fn test_rebuild_systems_adversarial_delete_near_neighbor_0_02_ppm() {
+        use nmr_core::peaks::Peak;
+
+        // Adversarial Case 1 (172.assign:P1-1): Assigned Peak A and unassigned Peak B 0.020 ppm
+        // away. Deleting A must NOT allow B to inherit A's residue label, confidence, or lock,
+        // and must clear A's previously recorded residue shifts.
+        let mut app = make_headless_test_app();
+        app.sequence = vec![
+            "GLY".to_string(),
+            "ALA".to_string(),
+            "SER".to_string(),
+            "VAL".to_string(),
+        ];
+        app.seq_ids = vec![1, 2, 3, 4];
+        app.peaks = vec![
+            Peak {
+                exp: "HSQC".to_string(),
+                h: 8.000,
+                n: 120.00,
+                c: None,
+                h2: None,
+                sign: 1,
+                height: Some(100.0),
+                volume: None,
+            },
+            Peak {
+                exp: "HSQC".to_string(),
+                h: 8.020,
+                n: 120.00,
+                c: None,
+                h2: None,
+                sign: 1,
+                height: Some(90.0),
+                volume: None,
+            },
+        ];
+        app.peaks_3d = vec![
+            nmr_core::picker::CubePeak3D {
+                exp: "HNCA".to_string(),
+                f3_ppm: 8.000,
+                f2_ppm: 120.00,
+                f1_ppm: 52.4,
+                sign: 1,
+                height: 40.0,
+                volume: 400.0,
+                snr: 20.0,
+                label: String::new(),
+            },
+            nmr_core::picker::CubePeak3D {
+                exp: "HNCA".to_string(),
+                f3_ppm: 8.020,
+                f2_ppm: 120.00,
+                f1_ppm: 58.3,
+                sign: 1,
+                height: 40.0,
+                volume: 400.0,
+                snr: 20.0,
+                label: String::new(),
+            },
+        ];
+        app.rebuild_systems_and_matrices();
+        assert_eq!(app.systems.len(), 2);
+
+        app.assign_res = Some(nmr_core::solver::AssignResult {
+            position: vec![1, -1],
+            confidence: vec![0.91, 0.0],
+            score: 0.0,
+            run_scores: Vec::new(),
+        });
+        app.session.state.locked_residues.insert(0, 1);
+        app.rebuild_systems_and_matrices();
+        assert!(
+            app.pred_ref
+                .as_ref()
+                .expect("pred_ref")
+                .shifts
+                .contains_key(&(1, "H".to_string())),
+            "precondition: ALA2 (idx 1) must hold A's assigned H shift"
+        );
+
+        // Delete Peak A (`0`): remaining Peak B (0.020 ppm away) must remain unassigned.
+        app.delete_2d_peak(0);
+        assert_eq!(app.systems.len(), 1);
+        assert!(
+            (app.systems[0].h - 8.020).abs() < 1e-4,
+            "remaining system must be B at 8.020 ppm, got {}",
+            app.systems[0].h
+        );
+        let res_after = app.assign_res.as_ref().expect("assign_res updated");
+        assert_eq!(
+            res_after.position,
+            vec![-1],
+            "Peak B (0.02 ppm away) must NOT inherit deleted Peak A's residue label"
+        );
+        assert_eq!(
+            res_after.confidence,
+            vec![0.0],
+            "Peak B must NOT inherit deleted Peak A's confidence"
+        );
+        assert!(
+            app.session.state.locked_residues.is_empty(),
+            "deleting Peak A must not transfer lock onto Peak B"
+        );
+        assert!(
+            !app.pred_ref
+                .as_ref()
+                .expect("pred_ref")
+                .shifts
+                .contains_key(&(1, "H".to_string()))
+                && !app
+                    .pred_ref
+                    .as_ref()
+                    .expect("pred_ref")
+                    .shifts
+                    .contains_key(&(1, "N".to_string())),
+            "deleted Peak A's residue shifts must be cleared"
+        );
+
+        // Adversarial Case 2: Peak A (`ALA2`), Peak B (`SER3`, 0.020 ppm from A), Peak C
+        // (unassigned, 0.035 ppm from A). Deleting A keeps B -> SER3 (0.83) and C -> unassigned.
+        app.peaks = vec![
+            Peak {
+                exp: "HSQC".to_string(),
+                h: 8.000,
+                n: 120.00,
+                c: None,
+                h2: None,
+                sign: 1,
+                height: Some(100.0),
+                volume: None,
+            },
+            Peak {
+                exp: "HSQC".to_string(),
+                h: 8.020,
+                n: 120.00,
+                c: None,
+                h2: None,
+                sign: 1,
+                height: Some(95.0),
+                volume: None,
+            },
+            Peak {
+                exp: "HSQC".to_string(),
+                h: 8.035,
+                n: 120.00,
+                c: None,
+                h2: None,
+                sign: 1,
+                height: Some(90.0),
+                volume: None,
+            },
+        ];
+        app.peaks_3d.clear();
+        app.assign_res = None;
+        app.session.state.locked_residues.clear();
+        app.rebuild_systems_and_matrices();
+        assert_eq!(app.systems.len(), 3);
+        app.assign_res = Some(nmr_core::solver::AssignResult {
+            position: vec![1, 2, -1],
+            confidence: vec![0.92, 0.83, 0.0],
+            score: 0.0,
+            run_scores: Vec::new(),
+        });
+        app.session.state.locked_residues.insert(0, 1);
+        app.session.state.locked_residues.insert(1, 2);
+        app.rebuild_systems_and_matrices();
+
+        app.delete_2d_peak(0);
+        let res_case2 = app.assign_res.as_ref().expect("assign_res updated");
+        assert_eq!(
+            res_case2.position,
+            vec![2, -1],
+            "B keeps SER3 (idx 2) and C stays unassigned (-1)"
+        );
+        assert!((res_case2.confidence[0] - 0.83).abs() < 1e-6);
+        assert_eq!(res_case2.confidence[1], 0.0);
+        assert_eq!(app.session.state.locked_residues.get(&0).copied(), Some(2));
+        assert!(!app.session.state.locked_residues.contains_key(&1));
+    }
+
+    #[test]
+    fn test_infer_3d_exp_from_path_ambiguous_filenames() {
+        use std::path::Path;
+
+        let cases = [
+            ("hncacb.ucsf", "HNCACB"),
+            ("/data/study/03_HNCACB.ft3", "HNCACB"),
+            ("cisd3-hncacb-nus.ucsf", "HNCACB"),
+            ("hncoca.ucsf", "HNCOCA"),
+            ("/study/HN(CO)CA.ft3", "HNCOCA"),
+            ("hncaco.ucsf", "HNCACO"),
+            ("/study/HN(CA)CO.ucsf", "HNCACO"),
+            ("hncocacb.ucsf", "CBCACONH"),
+            ("/study/HN(CO)CACB.ucsf", "CBCACONH"),
+            ("cbcaconh.ucsf", "CBCACONH"),
+            ("/study/CBCA(CO)NH.ft3", "CBCACONH"),
+            ("hncaconh.ucsf", "HNCACONH"),
+            ("/study/HN(CA)CONH.ucsf", "HNCACONH"),
+            ("hcccon.ucsf", "HCCCON"),
+            ("/study/HCC(CO)N.ucsf", "HCCCON"),
+            ("ncacon.ucsf", "NCACON"),
+            ("/study/nca_con.ft3", "NCACON"),
+            ("canco.ucsf", "CANCO"),
+            ("/study/can_co.ucsf", "CANCO"),
+            ("cbcacon.ucsf", "CBCACON"),
+            ("/study/cbca_con.ucsf", "CBCACON"),
+            ("hnco.ucsf", "HNCO"),
+            ("hnca.ucsf", "HNCA"),
+        ];
+        for (raw, expected) in cases {
+            assert_eq!(
+                super::NmrWorkbenchApp::infer_3d_exp_from_path(Path::new(raw)),
+                expected,
+                "path `{raw}` misclassified"
+            );
+        }
+    }
+
+    #[test]
+    fn test_moved_peak_recomputes_stored_shifts_and_assignment_score() {
+        use nmr_core::peaks::Peak;
+
+        let mut app = make_headless_test_app();
+        app.priors = nmr_core::priors::Priors::bmrb();
+        app.sequence = vec![
+            "GLY".to_string(),
+            "ALA".to_string(),
+            "SER".to_string(),
+            "VAL".to_string(),
+        ];
+        app.seq_ids = vec![1, 2, 3, 4];
+        app.peaks = vec![
+            Peak {
+                exp: "HSQC".to_string(),
+                h: 8.150,
+                n: 120.50,
+                c: None,
+                h2: None,
+                sign: 1,
+                height: Some(100.0),
+                volume: None,
+            },
+            Peak {
+                exp: "HSQC".to_string(),
+                h: 8.600,
+                n: 116.20,
+                c: None,
+                h2: None,
+                sign: 1,
+                height: Some(95.0),
+                volume: None,
+            },
+            // Initial HNCA match at (8.130, 120.30) attaches when Peak 0 is at (8.150, 120.50)
+            Peak {
+                exp: "HNCA".to_string(),
+                h: 8.130,
+                n: 120.30,
+                c: Some(62.00),
+                h2: None,
+                sign: 1,
+                height: Some(45.0),
+                volume: None,
+            },
+            // Slightly shifted HNCA peak at (8.195, 120.95) attaches once Peak 0 moves to (8.175, 120.75)
+            Peak {
+                exp: "HNCA".to_string(),
+                h: 8.195,
+                n: 120.95,
+                c: Some(52.40),
+                h2: None,
+                sign: 1,
+                height: Some(50.0),
+                volume: None,
+            },
+            Peak {
+                exp: "HNCA".to_string(),
+                h: 8.600,
+                n: 116.20,
+                c: Some(58.10),
+                h2: None,
+                sign: 1,
+                height: Some(45.0),
+                volume: None,
+            },
+        ];
+        app.rebuild_systems_and_matrices();
+        app.assign_res = Some(nmr_core::solver::AssignResult {
+            position: vec![1, 2],
+            confidence: vec![0.90, 0.85],
+            score: 0.0,
+            run_scores: Vec::new(),
+        });
+        app.rebuild_systems_and_matrices();
+
+        let initial_score = app.assign_res.as_ref().unwrap().score;
+        let expected_initial = super::NmrWorkbenchApp::compute_assign_score(
+            app.u_mat.as_ref().unwrap(),
+            app.p_mat.as_ref().unwrap(),
+            &app.assign_res.as_ref().unwrap().position,
+        );
+        assert!(
+            (initial_score - expected_initial).abs() < 1e-9,
+            "initial score {initial_score} must match compute_assign_score {expected_initial}"
+        );
+        assert!(
+            initial_score > -1_000_000.0,
+            "initial score {initial_score} should be finite non-FORBID"
+        );
+        let init_ref = app.pred_ref.as_ref().expect("pred_ref populated");
+        assert!((init_ref.shifts[&(1, "H".to_string())] - 8.150).abs() < 1e-6);
+        assert!((init_ref.shifts[&(1, "N".to_string())] - 120.50).abs() < 1e-6);
+        assert!((init_ref.shifts[&(1, "CA".to_string())] - 62.00).abs() < 1e-6);
+
+        // Move HSQC peak 0 within matching tolerance (`dH = 0.025, dN = 0.25`).
+        app.move_2d_peak_live(0, 8.175, 120.75, true);
+
+        let moved_ref = app.pred_ref.as_ref().expect("pred_ref recomputed");
+        let moved_ref_h = moved_ref.shifts[&(1, "H".to_string())];
+        let moved_ref_n = moved_ref.shifts[&(1, "N".to_string())];
+        let moved_ref_ca = moved_ref.shifts[&(1, "CA".to_string())];
+        assert!(
+            (moved_ref_h - 8.175).abs() < 1e-6
+                && (moved_ref_n - 120.75).abs() < 1e-6
+                && (moved_ref_ca - 52.40).abs() < 1e-6,
+            "pred_ref shifts must recompute to (8.175, 120.75, CA=52.40), got ({moved_ref_h}, {moved_ref_n}, CA={moved_ref_ca})"
+        );
+        let sess_ala = app
+            .session
+            .state
+            .assignments
+            .get(&1)
+            .expect("session assignment present for ALA2 (res_idx 1)");
+        assert!((sess_ala.shifts.get("H").copied().unwrap_or_default() - 8.175).abs() < 1e-6);
+        assert!((sess_ala.shifts.get("N").copied().unwrap_or_default() - 120.75).abs() < 1e-6);
+        assert!((sess_ala.shifts.get("CA").copied().unwrap_or_default() - 52.40).abs() < 1e-6);
+
+        let moved_score = app.assign_res.as_ref().unwrap().score;
+        let expected_moved = super::NmrWorkbenchApp::compute_assign_score(
+            app.u_mat.as_ref().unwrap(),
+            app.p_mat.as_ref().unwrap(),
+            &app.assign_res.as_ref().unwrap().position,
+        );
+        assert!(
+            (moved_score - expected_moved).abs() < 1e-9,
+            "moved score {moved_score} must match recomputed matrix score {expected_moved}"
+        );
+        assert!(
+            moved_score > initial_score + 1e-3,
+            "moving an assigned peak onto its matching HNCA shift must update assignment score (before={initial_score}, after={moved_score})"
+        );
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn test_async_3d_ingest_preserves_in_flight_edits_and_avoids_cow_duplication() {
+        use eframe::egui;
+        use nmr_core::classify::{
+            ClassifiedExperiment, DataState, ExperimentDimensionality, ExperimentVendor,
+            NusSummary, ProblemRegime, PulseSequenceClass,
+        };
+        use nmr_core::peaks::Peak;
+        use nmr_core::session::WorkbenchCommand;
+        use nmr_core::spectrum::{write_ucsf_3d, AxisPpm, Spectrum2D, Spectrum3D};
+        use nmr_gui::assign_setup_drawer::AssignSlotAction;
+        use nmr_gui::ingest_panel::{IngestExecutionPlan, SelectedExperimentSpec};
+        use std::collections::BTreeMap;
+        use std::sync::Arc;
+
+        // Build a compact valid 3D UCSF spectrum on disk for async ingest.
+        let (nx, ny, nz) = (16usize, 8usize, 8usize);
+        let ax_x = AxisPpm::from_bounds("1H", nx, 9.5, 7.5, 600.0);
+        let ax_y = AxisPpm::from_bounds("15N", ny, 126.0, 114.0, 60.8);
+        let ax_z = AxisPpm::from_bounds("13C", nz, 62.0, 42.0, 150.9);
+        let mut cube_data = vec![0.1_f32; nx * ny * nz];
+        cube_data[(3 * ny + 4) * nx + 8] = 50.0;
+        let cube = Spectrum3D {
+            name: "test_hncacb".to_string(),
+            exp: "HNCACB".to_string(),
+            axis_x: ax_x.clone(),
+            axis_y: ax_y.clone(),
+            axis_z: ax_z,
+            data: cube_data,
+        };
+        let unique_id = format!(
+            "ferric_gui_async_ingest_{}_{:?}.ucsf",
+            std::process::id(),
+            std::thread::current().id()
+        )
+        .replace(['(', ')', ' ', ':'], "_");
+        let tmp_ucsf = std::env::temp_dir().join(unique_id);
+        write_ucsf_3d(&tmp_ucsf, &cube).expect("write temp 3D ucsf");
+
+        let mut app = make_headless_test_app();
+        app.sequence = vec![
+            "ALA".to_string(),
+            "GLY".to_string(),
+            "SER".to_string(),
+            "LEU".to_string(),
+        ];
+        app.seq_ids = vec![1, 2, 3, 4];
+        app.hsqc_spec = Some(Spectrum2D {
+            name: "HSQC".to_string(),
+            axis_x: ax_x,
+            axis_y: ax_y,
+            data: vec![0.1_f32; nx * ny],
+        });
+        app.peaks = vec![
+            Peak {
+                exp: "HSQC".to_string(),
+                h: 8.20,
+                n: 119.5,
+                c: None,
+                h2: None,
+                sign: 1,
+                height: Some(100.0),
+                volume: None,
+            },
+            Peak {
+                exp: "HSQC".to_string(),
+                h: 8.55,
+                n: 121.0,
+                c: None,
+                h2: None,
+                sign: 1,
+                height: Some(90.0),
+                volume: None,
+            },
+        ];
+        app.rebuild_systems_and_matrices();
+        app.sync_session_from_app_fresh("async_2d_seed");
+
+        let plan = IngestExecutionPlan {
+            root_name: "async_3d_study".to_string(),
+            root_path: tmp_ucsf.parent().map(|p| p.to_path_buf()),
+            problem_regime: ProblemRegime::GlobularBackbone,
+            sequence_three_letter: Vec::new(),
+            selected_experiments: vec![SelectedExperimentSpec {
+                row_index: 0,
+                experiment: ClassifiedExperiment {
+                    relative_path: "hncacb.ucsf".to_string(),
+                    display_name: "hncacb.ucsf".to_string(),
+                    vendor: ExperimentVendor::SparkyUcsf,
+                    dimensionality: ExperimentDimensionality::Dim3D,
+                    data_state: DataState::Processed,
+                    spectrometer_mhz: Some(600.0),
+                    axes: Vec::new(),
+                    quadrature_badge: "Processed".to_string(),
+                    nus: NusSummary::default(),
+                    pulse_class: PulseSequenceClass::Hncacb,
+                    pulse_program: None,
+                    title: None,
+                    raw_signal_bytes: 0,
+                    processed_bytes: 2048,
+                    selected_by_default: true,
+                    notes: Vec::new(),
+                },
+                effective_class: PulseSequenceClass::Hncacb,
+                solver_exp_name: Some("HNCACB"),
+                resolved_path: Some(tmp_ucsf.clone()),
+            }],
+            in_memory_files: Arc::new(BTreeMap::new()),
+        };
+
+        let ctx = egui::Context::default();
+        app.start_ingest_plan_async(&ctx, plan, true);
+        assert!(
+            app.background_ingest.is_some(),
+            "async 3D ingest should be launched"
+        );
+
+        // Mutate 2D peaks, label, and lock/assignment while 3D ingest runs in background.
+        app.peaks.push(Peak {
+            exp: "HSQC".to_string(),
+            h: 8.75,
+            n: 122.5,
+            c: None,
+            h2: None,
+            sign: 1,
+            height: Some(85.0),
+            volume: None,
+        });
+        let user_lbl_key = super::peak_label_key_2d(8.75, 122.5);
+        app.peak_2d_labels
+            .insert(user_lbl_key, "INFLIGHT_USER_PEAK".to_string());
+        app.sync_2d_peaks_after_edit();
+        let _ = app.execute_session_cmd(WorkbenchCommand::LockResidue {
+            spin_system: 0,
+            residue_seq_idx: 2,
+            locked: true,
+        });
+        app.sync_app_from_session();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while app.background_ingest.is_some() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for background 3D ingest"
+            );
+            app.poll_background_ingest(&ctx);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        let _ = std::fs::remove_file(&tmp_ucsf);
+
+        assert_eq!(app.cubes_3d.len(), 1, "3D cube should finish ingesting");
+        assert!(
+            app.peaks
+                .iter()
+                .any(|p| (p.h - 8.75).abs() < 1e-4 && (p.n - 122.5).abs() < 1e-4),
+            "async 3D ingest completion must preserve in-flight user 2D peak edits"
+        );
+        assert_eq!(
+            app.peak_2d_labels.get(&user_lbl_key).map(String::as_str),
+            Some("INFLIGHT_USER_PEAK"),
+            "in-flight 2D peak label must be preserved"
+        );
+        assert_eq!(
+            app.session.state.locked_residues.get(&0).copied(),
+            Some(2),
+            "in-flight lock edit must be preserved"
+        );
+        assert_eq!(
+            app.assign_res
+                .as_ref()
+                .and_then(|r| r.position.first())
+                .copied(),
+            Some(2),
+            "in-flight residue assignment must be preserved"
+        );
+
+        // Verify zero CoW duplication on 3D->2D registration and slot reassignment.
+        app.active_cube_idx = Some(0);
+        assert!(
+            app.hncacb_3d
+                .as_ref()
+                .is_some_and(|slot| Arc::ptr_eq(slot, &app.cubes_3d[0])),
+            "HNCACB slot should alias cubes_3d[0] via Arc"
+        );
+        let data_ptr_before = app.cubes_3d[0].data.as_ptr();
+        app.dispatch_workbench_action(&ctx, super::WorkbenchAction::Register3dToHsqc2d);
+        assert_eq!(
+            app.cubes_3d[0].data.as_ptr(),
+            data_ptr_before,
+            "Register3dToHsqc2d must drop duplicate Arc slot refs before Arc::make_mut to avoid full-cube CoW cloning"
+        );
+        assert!(
+            app.hncacb_3d
+                .as_ref()
+                .is_some_and(|slot| Arc::ptr_eq(slot, &app.cubes_3d[0])),
+            "HNCACB slot must be resynced to cubes_3d[0]"
+        );
+
+        app.apply_assign_slot_action(AssignSlotAction::ReassignSlotExperiment {
+            from_slot: "HNCACB".to_string(),
+            to_exp: "CBCACONH".to_string(),
+        });
+        assert_eq!(
+            app.cubes_3d[0].data.as_ptr(),
+            data_ptr_before,
+            "ReassignSlotExperiment must drop duplicate Arc slot refs before Arc::make_mut"
+        );
+        assert_eq!(app.cubes_3d[0].exp, "CBCACONH");
+        assert!(app.hncacb_3d.is_none());
+        assert!(app
+            .cbcaconh_3d
+            .as_ref()
+            .is_some_and(|slot| Arc::ptr_eq(slot, &app.cubes_3d[0])));
+    }
+
+    #[test]
+    fn test_auto_snr_decoupled_from_shared_contour_base() {
+        use eframe::egui;
+        use nmr_core::picker::{estimate_auto_snr_2d, estimate_auto_snr_3d};
+        use nmr_core::spectrum::{AxisPpm, Spectrum2D, Spectrum3D};
+        use nmr_gui::workbench_mode::audit_text_layout;
+
+        let (nx, ny, nz) = (64usize, 32usize, 16usize);
+        let mut data_2d = Vec::with_capacity(nx * ny);
+        for i in 0..(nx * ny) {
+            let n = (((i * 37) % 19) as f32 - 9.0) * 0.1;
+            data_2d.push(n);
+        }
+        data_2d[16 * nx + 32] = 18.0;
+        let hsqc = Spectrum2D {
+            name: "HSQC".to_string(),
+            axis_x: AxisPpm::from_bounds("1H", nx, 10.0, 6.0, 600.0),
+            axis_y: AxisPpm::from_bounds("15N", ny, 130.0, 105.0, 60.8),
+            data: data_2d,
+        };
+
+        let mut data_3d = Vec::with_capacity(nx * ny * nz);
+        for i in 0..(nx * ny * nz) {
+            let n = (((i * 29) % 17) as f32 - 8.0) * 0.1;
+            data_3d.push(n);
+        }
+        data_3d[(8 * ny + 16) * nx + 32] = 22.0;
+        let cube = Spectrum3D {
+            name: "HNCA".to_string(),
+            exp: "HNCA".to_string(),
+            axis_x: AxisPpm::from_bounds("1H", nx, 10.0, 6.0, 600.0),
+            axis_y: AxisPpm::from_bounds("15N", ny, 130.0, 105.0, 60.8),
+            axis_z: AxisPpm::from_bounds("13C", nz, 65.0, 40.0, 150.9),
+            data: data_3d,
+        };
+
+        let expected_2d = estimate_auto_snr_2d(&hsqc, None);
+        let expected_3d = estimate_auto_snr_3d(&cube, None);
+        assert!(expected_2d < 50.0 && expected_3d < 50.0);
+
+        let mut app = make_headless_test_app();
+        app.hsqc_spec = Some(hsqc);
+        app.cubes_3d = vec![std::sync::Arc::new(cube)];
+        app.workbook.two_d.show_peak_table = true;
+        app.active_cube_idx = None;
+        // Very high user contour threshold must NOT inflate Auto SNR estimation.
+        app.contour_base = 1_000_000.0;
+        app.picker_snr = 99.0;
+        app.cube_slice.snr_threshold = 99.0;
+
+        let ctx = egui::Context::default();
+        let vp = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 800.0));
+        let click_events = |pos: egui::Pos2| -> Vec<egui::Event> {
+            vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ]
+        };
+
+        // 2D bottom table `Auto` button
+        let render_2d = |app: &mut super::NmrWorkbenchApp, events: Vec<egui::Event>| {
+            let mut out = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(vp),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    egui::CentralPanel::default().show(ui, |ui| {
+                        app.draw_2d_peaks_bottom_table(ui);
+                    });
+                },
+            );
+            out.textures_delta.clear();
+            out
+        };
+        let _ = render_2d(&mut app, Vec::new());
+        let out_2d = render_2d(&mut app, Vec::new());
+        let auto_2d_pos = audit_text_layout(&out_2d.shapes, vp)
+            .texts
+            .iter()
+            .find(|t| t.text == "Auto")
+            .expect("2D bottom table must show Auto button")
+            .rect
+            .center();
+        let _ = render_2d(&mut app, click_events(auto_2d_pos));
+        assert!(
+            (app.picker_snr - expected_2d).abs() < 1e-5,
+            "2D Auto SNR {} must match decoupled estimate_auto_snr_2d(..., None) == {expected_2d}",
+            app.picker_snr
+        );
+
+        // 3D bottom table `Auto` button
+        app.active_cube_idx = Some(0);
+        let render_3d = |app: &mut super::NmrWorkbenchApp, events: Vec<egui::Event>| {
+            let mut out = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(vp),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    egui::CentralPanel::default().show(ui, |ui| {
+                        app.draw_3d_peaks_bottom_table(ui);
+                    });
+                },
+            );
+            out.textures_delta.clear();
+            out
+        };
+        let _ = render_3d(&mut app, Vec::new());
+        let out_3d = render_3d(&mut app, Vec::new());
+        let auto_3d_pos = audit_text_layout(&out_3d.shapes, vp)
+            .texts
+            .iter()
+            .find(|t| t.text == "Auto")
+            .expect("3D bottom table must show Auto button")
+            .rect
+            .center();
+        let _ = render_3d(&mut app, click_events(auto_3d_pos));
+        assert!(
+            (app.cube_slice.snr_threshold - expected_3d).abs() < 1e-5,
+            "3D Auto SNR {} must match decoupled estimate_auto_snr_3d(..., None) == {expected_3d}",
+            app.cube_slice.snr_threshold
+        );
+
+        // Assign Setup Drawer `Auto` button
+        app.picker_snr = 77.0;
+        app.assign_setup_drawer.snr_threshold = 77.0;
+        app.assign_setup_drawer.open = true;
+        let render_drawer = |app: &mut super::NmrWorkbenchApp, events: Vec<egui::Event>| {
+            let mut out = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(vp),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    app.draw_v0171_windows_and_bridges(ui.ctx());
+                },
+            );
+            out.textures_delta.clear();
+            out
+        };
+        let _ = render_drawer(&mut app, Vec::new());
+        let out_drawer = render_drawer(&mut app, Vec::new());
+        let auto_drawer_pos = audit_text_layout(&out_drawer.shapes, vp)
+            .texts
+            .iter()
+            .find(|t| t.text == "Auto")
+            .expect("Assign setup drawer must show Auto button")
+            .rect
+            .center();
+        let _ = render_drawer(&mut app, click_events(auto_drawer_pos));
+        assert!(
+            (app.picker_snr - expected_2d).abs() < 1e-5,
+            "Drawer Auto SNR {} must ignore contour_base=1e6 and match {expected_2d}",
+            app.picker_snr
+        );
+    }
+
+    #[test]
+    fn test_aa_type_hints_never_round_below_1_to_100_and_allow_pro_for_con_idp() {
+        use eframe::egui;
+        use nmr_core::peaks::Peak;
+        use nmr_core::priors::Priors;
+
+        // 1. Sub-unity probabilities must never format as "100%".
+        assert_eq!(super::NmrWorkbenchApp::format_aa_prob_pct(0.996), "99.6%");
+        assert_eq!(super::NmrWorkbenchApp::format_aa_prob_pct(0.9999), "99.9%");
+        assert_eq!(super::NmrWorkbenchApp::format_aa_prob_pct(1.0), "100%");
+        let summary = super::NmrWorkbenchApp::format_aa_type_summary(&[("ALA", 0.997)]);
+        assert!(summary.contains("99.7%") && !summary.contains("100%"));
+
+        // Even under extreme Alanine-like shifts, softmax over 19/20 finite AAs must stay < 1.0.
+        let priors = Priors::bmrb();
+        let extreme_ala = super::NmrWorkbenchApp::predict_aa_types_from_shifts(
+            &priors,
+            Some(53.0),
+            Some(18.5),
+            Some(178.0),
+            false,
+            3,
+        );
+        assert!(
+            extreme_ala.iter().all(|&(_, p)| p < 1.0),
+            "finite competing residues must keep probabilities strictly < 1.0, got {extreme_ala:?}"
+        );
+        assert!(
+            !super::NmrWorkbenchApp::format_aa_type_summary(&extreme_ala).contains("100%"),
+            "rendered AA hint summary must not round <100% probability to 100%"
+        );
+
+        // 2. Proline is forbidden in standard globular 1H-15N roots, allowed in CON-rooted IDP.
+        let mut app = make_headless_test_app();
+        app.regime_kind = super::GuiRegimeKind::Globular;
+        assert!(!app.is_con_rooted_idp());
+        let globular_pro = app.predict_root_aa_types(Some(63.3), Some(31.8), Some(176.7), 6);
+        assert!(
+            globular_pro.iter().all(|&(aa, _)| aa != "PRO"),
+            "PRO must be excluded for non-CON globular roots, got {globular_pro:?}"
+        );
+
+        app.regime_kind = super::GuiRegimeKind::Idp13C;
+        assert!(app.is_con_rooted_idp());
+        let con_pro = app.predict_root_aa_types(Some(63.3), Some(31.8), Some(176.7), 6);
+        assert!(
+            con_pro.iter().any(|&(aa, _)| aa == "PRO"),
+            "PRO must be allowed in CON-rooted IDP AA-type hints, got {con_pro:?}"
+        );
+
+        // 3. Headless `Assign & Lock Spin System (at)` popover renders cleanly with out.textures_delta.clear().
+        app.sequence = vec!["GLY".to_string(), "PRO".to_string(), "ALA".to_string()];
+        app.seq_ids = vec![1, 2, 3];
+        app.peaks = vec![Peak {
+            exp: "CON".to_string(),
+            h: 175.0,
+            n: 136.0,
+            c: None,
+            h2: None,
+            sign: 1,
+            height: Some(80.0),
+            volume: None,
+        }];
+        app.rebuild_systems_and_matrices();
+        app.selected_ss = Some(0);
+        app.show_assign_popover = true;
+        let ctx = egui::Context::default();
+        let vp = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 800.0));
+        let mut out = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(vp),
+                ..Default::default()
+            },
+            |ui| {
+                app.draw_phase9_modals(ui.ctx());
+            },
+        );
+        out.textures_delta.clear();
+    }
+
+    #[test]
+    fn test_neural_nms_preserves_crowded_idp_amides_within_0_025_0_25_ppm() {
+        use nmr_core::neural_picker::NeuralPickerConfig;
+        use nmr_core::spectrum::{AxisPpm, Spectrum2D};
+
+        // Two crowded IDP backbone amides separated by (0.018 ppm 1H, 0.18 ppm 15N), strictly
+        // inside the previous fixed (0.025, 0.25) NMS dedup box.
+        let (nx, ny) = (1024usize, 512usize);
+        let ax_x = AxisPpm::from_bounds("1H", nx, 10.0, 6.0, 800.0);
+        let ax_y = AxisPpm::from_bounds("15N", ny, 132.0, 106.0, 81.1);
+        let mut data = vec![0.0_f32; nx * ny];
+
+        let p1 = (8.200_f64, 120.00_f64);
+        let p2 = (8.218_f64, 120.18_f64);
+        let sig_h = 0.0055_f64;
+        let sig_n = 0.055_f64;
+
+        for iy in 0..ny {
+            let n = ax_y.index_to_ppm(iy as f64);
+            for ix in 0..nx {
+                let h = ax_x.index_to_ppm(ix as f64);
+                let g1 =
+                    (-0.5 * (((h - p1.0) / sig_h).powi(2) + ((n - p1.1) / sig_n).powi(2))).exp();
+                let g2 =
+                    (-0.5 * (((h - p2.0) / sig_h).powi(2) + ((n - p2.1) / sig_n).powi(2))).exp();
+                let deterministic_noise = (((ix * 31 + iy * 17) % 11) as f64 - 5.0) * 0.05;
+                data[iy * nx + ix] = ((g1 + g2) * 100.0 + deterministic_noise) as f32;
+            }
+        }
+
+        let spec = Spectrum2D {
+            name: "crowded_idp_hsqc".to_string(),
+            axis_x: ax_x,
+            axis_y: ax_y,
+            data,
+        };
+        let picked =
+            super::pick_hsqc_2d_neural_hardened(&spec, &NeuralPickerConfig::default(), 4.0);
+        assert!(
+            picked
+                .iter()
+                .any(|p| (p.h - p1.0).abs() < 0.008 && (p.n - p1.1).abs() < 0.08),
+            "expected first crowded IDP amide near {p1:?}, got {picked:?}"
+        );
+        assert!(
+            picked
+                .iter()
+                .any(|p| (p.h - p2.0).abs() < 0.008 && (p.n - p2.1).abs() < 0.08),
+            "expected second crowded IDP amide near {p2:?} (0.018/0.18 ppm away) not to be NMS-merged, got {picked:?}"
         );
     }
 }
