@@ -1205,6 +1205,58 @@ fn decode_bruker_proc_mc2(mc2: i32, fallback_label: &str) -> Result<QuadMode, St
     }
 }
 
+/// Keep `pulprog_p1_deg` sign consistent with `axis.stored_proc.reverse` whenever raw `REVERSE`
+/// inference updates `axis.stored_proc.reverse` after `parse_bruker_indirect_axis`.
+fn sync_bruker_indirect_reverse(axis: &mut FidAxisMeta, reverse: bool) {
+    if axis.stored_proc.reverse != reverse {
+        axis.stored_proc.reverse = reverse;
+        if let Some(ref mut p1) = axis.stored_proc.pulprog_p1_deg {
+            *p1 = -*p1;
+        }
+    }
+}
+
+/// Predict TopSpin-convention first-order indirect phase (`180°` for half-dwell `t0 = dt/2`, or
+/// `360° * M` for multi-half-dwell `t0 = M * dt`) from `pulseprogram` physics or `acqus.D[d_idx]`,
+/// returning `None` for zero-delay (`t0 = 0`) or `QF` modes.
+fn bruker_indirect_predicted_phc1_deg(
+    acqus: &HashMap<String, String>,
+    d_idx: usize,
+    sw_hz: f64,
+    quad_mode: QuadMode,
+    ind_phys: Option<&crate::pulprog::IndirectDimPhysics>,
+) -> Option<f64> {
+    if quad_mode == QuadMode::Qf {
+        return None;
+    }
+    if let Some(ip) = ind_phys {
+        if ip.half_dwell_sampling || ip.predicted_phc1_deg.abs() >= 179.0 {
+            return Some(ip.predicted_phc1_deg);
+        }
+        return None;
+    }
+    if sw_hz <= 0.0 {
+        return None;
+    }
+    let d_val = acqus
+        .get("D")
+        .and_then(|s| s.split_whitespace().nth(d_idx))
+        .and_then(|tok| tok.parse::<f64>().ok())?;
+    let frac = d_val * sw_hz;
+    if (0.34..=0.68).contains(&frac) {
+        Some(180.0)
+    } else if (1.34..=4.68).contains(&frac) {
+        let m = (frac - 0.5).round() + 0.5;
+        if (frac - m).abs() <= 0.18 {
+            Some(360.0 * m)
+        } else {
+            None
+        }
+    } else {
+        None
+    }
+}
+
 fn parse_bruker_indirect_axis(
     acqus: &HashMap<String, String>,
     acqu_ind: &HashMap<String, String>,
@@ -1212,6 +1264,7 @@ fn parse_bruker_indirect_axis(
     fallback_label: &str,
     td_override: Option<usize>,
     ind_phys: Option<&crate::pulprog::IndirectDimPhysics>,
+    d_idx: usize,
 ) -> Result<FidAxisMeta, String> {
     let td = match td_override {
         Some(v) => v,
@@ -1355,16 +1408,13 @@ fn parse_bruker_indirect_axis(
             (*td_eff / 2).min(complex_points).max(1)
         };
     }
-    if proc_cal.and_then(|p| p.get("FCOR")).is_none()
-        && ind_phys.is_some_and(|ip| ip.half_dwell_sampling || ip.predicted_phc1_deg.abs() >= 360.0)
-    {
+    let pred_phc1 = bruker_indirect_predicted_phc1_deg(acqus, d_idx, sw_hz, quad_mode, ind_phys);
+    if proc_cal.and_then(|p| p.get("FCOR")).is_none() && pred_phc1.is_some() {
         stored_proc.fcor = Some(1.0);
     }
     if stored_proc.p0_deg.is_none() && stored_proc.p1_deg.is_none() {
-        if let Some(ip) = ind_phys {
-            if ip.predicted_phc1_deg.abs() >= 360.0 {
-                stored_proc.pulprog_p1_deg = Some(-ip.predicted_phc1_deg);
-            }
+        if let Some(phc1) = pred_phc1 {
+            stored_proc.pulprog_p1_deg = Some(if stored_proc.reverse { phc1 } else { -phc1 });
         }
     }
 
@@ -2029,6 +2079,12 @@ pub fn recombine_ipap_trace_pair_1d(
     recombine_ipap_trace_pair_scaled_1d(ip, ap, sw_hz, group_delay_pts, j_caco_hz, 1.0, out);
 }
 
+fn bruker_has_splitcomb_marker(own_meta_texts: &[&str]) -> bool {
+    own_meta_texts
+        .iter()
+        .any(|t| t.to_ascii_lowercase().contains("splitcomb"))
+}
+
 fn bruker_texts_indicate_already_splitcomb(
     acqu2s: &HashMap<String, String>,
     own_meta_texts: &[&str],
@@ -2040,9 +2096,341 @@ fn bruker_texts_indicate_already_splitcomb(
     {
         return true;
     }
-    own_meta_texts
-        .iter()
-        .any(|t| t.to_ascii_lowercase().contains("splitcomb"))
+    bruker_has_splitcomb_marker(own_meta_texts)
+}
+
+#[inline]
+fn bruker_ser_matches_trace_count(
+    bytes_len: usize,
+    trace_count: usize,
+    td_words: usize,
+    word_bytes: usize,
+) -> bool {
+    if trace_count == 0 {
+        return false;
+    }
+    let Some(raw_tb) = td_words.checked_mul(word_bytes) else {
+        return false;
+    };
+    let s1024 = raw_tb.div_ceil(1024).saturating_mul(1024);
+    let s256w = td_words
+        .div_ceil(256)
+        .saturating_mul(256)
+        .saturating_mul(word_bytes);
+    bytes_len == trace_count.saturating_mul(s1024)
+        || bytes_len == trace_count.saturating_mul(s256w)
+        || bytes_len == trace_count.saturating_mul(raw_tb)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Bruker3dIpapAxis {
+    /// IPAP spin-state loop (`FnILOOP = 2` on `acqu2s`) lives along F2 (`axis_y`, index `k1`).
+    F2,
+    /// IPAP spin-state loop (`FnILOOP = 2` on `acqu3s`) lives along F1 (`axis_z`, index `k2`).
+    F1,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Bruker3dIpapPlan {
+    axis: Bruker3dIpapAxis,
+    /// True only for uniform 3D IPAP where `acqu2s.TD` or `acqu3s.TD` itself includes the `× 2` factor.
+    td_includes_ipap: bool,
+    config: IpapConfig,
+}
+
+fn resolve_bruker_3d_ipap_config(
+    acqus: &HashMap<String, String>,
+    acqu2s: &HashMap<String, String>,
+    acqu3s: &HashMap<String, String>,
+    pp_text: Option<&str>,
+    splitcomb_texts: &[&str],
+    axis: Bruker3dIpapAxis,
+) -> IpapConfig {
+    let primary_acqu = match axis {
+        Bruker3dIpapAxis::F2 => acqu2s,
+        Bruker3dIpapAxis::F1 => acqu3s,
+    };
+    let secondary_acqu = match axis {
+        Bruker3dIpapAxis::F2 => acqu3s,
+        Bruker3dIpapAxis::F1 => acqu2s,
+    };
+    let mut cfg = resolve_bruker_ipap_config(acqus, Some(primary_acqu), pp_text, splitcomb_texts);
+    for key in ["JCACO", "JCOCA", "J_CACO", "CACO"] {
+        if primary_acqu.contains_key(key) || acqus.contains_key(key) {
+            break;
+        }
+        if let Some(val) = secondary_acqu
+            .get(key)
+            .and_then(|s| s.trim().parse::<f64>().ok())
+            .filter(|v| (40.0..=68.0).contains(v))
+        {
+            cfg.j_caco_hz = val;
+            break;
+        }
+    }
+    for key in ["APSCALE", "IPAP_SCALE", "AP_SCALE"] {
+        if primary_acqu.contains_key(key) || acqus.contains_key(key) {
+            break;
+        }
+        if let Some(val) = secondary_acqu
+            .get(key)
+            .and_then(|s| s.trim().parse::<f64>().ok())
+            .filter(|v| (0.5..=2.0).contains(v))
+        {
+            cfg.ap_scale = val;
+            break;
+        }
+    }
+    cfg
+}
+
+fn infer_bruker_3d_ipap_axis_from_pp(
+    pp_text: Option<&str>,
+    default_axis: Bruker3dIpapAxis,
+) -> Bruker3dIpapAxis {
+    let Some(txt) = pp_text else {
+        return default_axis;
+    };
+    let low = txt.to_ascii_lowercase();
+    let hints_f1 = low.contains("lblf1i")
+        || low.contains("splitcomb ipap 2 f1")
+        || low.contains("st1cnt = td1");
+    let hints_f2 = low.contains("lblf2i")
+        || low.contains("splitcomb ipap 2 f2")
+        || low.contains("st2cnt = td2");
+    if hints_f1 && !hints_f2 {
+        Bruker3dIpapAxis::F1
+    } else if hints_f2 && !hints_f1 {
+        Bruker3dIpapAxis::F2
+    } else {
+        default_axis
+    }
+}
+
+/// Detect whether a raw Bruker `13C`-detected 3D `ser` holds unsplit IPAP spin-state traces
+/// (`IP + AP` pairs interleaved along F2 or F1 quadrature) rather than post-`splitcomb` quadrature.
+#[allow(clippy::too_many_arguments)]
+fn detect_bruker_3d_ipap_unsplit_mode(
+    axis_x_label: &str,
+    pulprog: &str,
+    pp_text: Option<&str>,
+    acqus: &HashMap<String, String>,
+    acqu2s: &HashMap<String, String>,
+    acqu3s: &HashMap<String, String>,
+    own_meta_texts: &[&str],
+    is_nus: bool,
+    nus_expected_quad_traces: usize,
+    td_acq_y: usize,
+    td_acq_z: usize,
+    q1_mult: usize,
+    q2_mult: usize,
+    aqseq: i32,
+    bytes_len: usize,
+    td_words: usize,
+    word_bytes: usize,
+) -> Option<Bruker3dIpapPlan> {
+    if axis_x_label != "13C" || td_acq_y == 0 || td_acq_z == 0 {
+        return None;
+    }
+    if bruker_has_splitcomb_marker(own_meta_texts) {
+        return None;
+    }
+    let fn_iloop_y = acqu2s
+        .get("FnILOOP")
+        .and_then(|s| s.trim().parse::<usize>().ok());
+    let fn_iloop_z = acqu3s
+        .get("FnILOOP")
+        .and_then(|s| s.trim().parse::<usize>().ok());
+    let is_seq_ipap = is_bruker_3d_ipap_sequence(pulprog, pp_text);
+    let iloop_axis = match (fn_iloop_y, fn_iloop_z) {
+        (Some(2), _) => Some(Bruker3dIpapAxis::F2),
+        (_, Some(2)) => Some(Bruker3dIpapAxis::F1),
+        _ => None,
+    };
+
+    if is_nus {
+        let single_matches = bruker_ser_matches_trace_count(
+            bytes_len,
+            nus_expected_quad_traces,
+            td_words,
+            word_bytes,
+        );
+        let double_matches = bruker_ser_matches_trace_count(
+            bytes_len,
+            nus_expected_quad_traces.saturating_mul(2),
+            td_words,
+            word_bytes,
+        );
+        // Post-splitcomb files retain `_ia3d` PULPROG name while resetting `FnILOOP = 1` and matching 1x quad traces.
+        if iloop_axis.is_none()
+            && (fn_iloop_y == Some(1) || fn_iloop_z == Some(1))
+            && !double_matches
+        {
+            return None;
+        }
+        if !double_matches && (single_matches || (!is_seq_ipap && iloop_axis.is_none())) {
+            return None;
+        }
+        let default_axis = if aqseq == 0 {
+            Bruker3dIpapAxis::F2
+        } else {
+            Bruker3dIpapAxis::F1
+        };
+        let axis =
+            iloop_axis.unwrap_or_else(|| infer_bruker_3d_ipap_axis_from_pp(pp_text, default_axis));
+        let config =
+            resolve_bruker_3d_ipap_config(acqus, acqu2s, acqu3s, pp_text, own_meta_texts, axis);
+        return Some(Bruker3dIpapPlan {
+            axis,
+            td_includes_ipap: false,
+            config,
+        });
+    }
+
+    let expected_quad_uniform = td_acq_y.saturating_mul(td_acq_z);
+    let single_matches =
+        bruker_ser_matches_trace_count(bytes_len, expected_quad_uniform, td_words, word_bytes);
+    let double_matches = bruker_ser_matches_trace_count(
+        bytes_len,
+        expected_quad_uniform.saturating_mul(2),
+        td_words,
+        word_bytes,
+    );
+
+    if double_matches || (iloop_axis.is_some() && !single_matches) {
+        let default_axis = if aqseq == 0 {
+            Bruker3dIpapAxis::F2
+        } else {
+            Bruker3dIpapAxis::F1
+        };
+        let axis =
+            iloop_axis.unwrap_or_else(|| infer_bruker_3d_ipap_axis_from_pp(pp_text, default_axis));
+        let config =
+            resolve_bruker_3d_ipap_config(acqus, acqu2s, acqu3s, pp_text, own_meta_texts, axis);
+        return Some(Bruker3dIpapPlan {
+            axis,
+            td_includes_ipap: false,
+            config,
+        });
+    }
+
+    if is_seq_ipap && fn_iloop_y != Some(1) && fn_iloop_z != Some(1) {
+        // Uniform IPAP without `FnILOOP=2` where one indirect `TD` itself includes `× 2`.
+        let outer_default = if aqseq == 0 {
+            Bruker3dIpapAxis::F1
+        } else {
+            Bruker3dIpapAxis::F2
+        };
+        let mut axis =
+            iloop_axis.unwrap_or_else(|| infer_bruker_3d_ipap_axis_from_pp(pp_text, outer_default));
+        match axis {
+            Bruker3dIpapAxis::F1 if td_acq_z < 2 * q2_mult && td_acq_y >= 2 * q1_mult => {
+                axis = Bruker3dIpapAxis::F2;
+            }
+            Bruker3dIpapAxis::F2 if td_acq_y < 2 * q1_mult && td_acq_z >= 2 * q2_mult => {
+                axis = Bruker3dIpapAxis::F1;
+            }
+            _ => {}
+        }
+        let ok_halve = match axis {
+            Bruker3dIpapAxis::F2 => td_acq_y >= 2 * q1_mult && td_acq_y.is_multiple_of(2),
+            Bruker3dIpapAxis::F1 => td_acq_z >= 2 * q2_mult && td_acq_z.is_multiple_of(2),
+        };
+        if !ok_halve {
+            return None;
+        }
+        let config =
+            resolve_bruker_3d_ipap_config(acqus, acqu2s, acqu3s, pp_text, own_meta_texts, axis);
+        return Some(Bruker3dIpapPlan {
+            axis,
+            td_includes_ipap: true,
+            config,
+        });
+    }
+
+    None
+}
+
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn decode_bruker_trace_or_zero(
+    bytes: &[u8],
+    tidx: usize,
+    observed_raw: usize,
+    stride: usize,
+    trace_byte_len: usize,
+    n0: usize,
+    big_endian: bool,
+    dtypa: i32,
+) -> Vec<Complex64> {
+    if tidx >= observed_raw {
+        return vec![[0.0, 0.0]; n0];
+    }
+    let off = tidx * stride;
+    if off + trace_byte_len > bytes.len() {
+        return vec![[0.0, 0.0]; n0];
+    }
+    decode_bruker_trace(&bytes[off..off + trace_byte_len], n0 * 2, big_endian, dtypa)
+}
+
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn decode_bruker_3d_trace_pair_with_ipap(
+    bytes: &[u8],
+    tidx0: usize,
+    tidx1_opt: Option<usize>,
+    observed_raw: usize,
+    stride: usize,
+    trace_byte_len: usize,
+    n0: usize,
+    big_endian: bool,
+    dtypa: i32,
+    ipap: Option<IpapConfig>,
+    sw_hz: f64,
+    group_delay_pts: f64,
+) -> Vec<Complex64> {
+    if tidx0 >= observed_raw {
+        return vec![[0.0, 0.0]; n0];
+    }
+    let tr0 = decode_bruker_trace_or_zero(
+        bytes,
+        tidx0,
+        observed_raw,
+        stride,
+        trace_byte_len,
+        n0,
+        big_endian,
+        dtypa,
+    );
+    let (Some(ipap_cfg), Some(tidx1)) = (ipap, tidx1_opt) else {
+        return tr0;
+    };
+    let tr1 = decode_bruker_trace_or_zero(
+        bytes,
+        tidx1,
+        observed_raw,
+        stride,
+        trace_byte_len,
+        n0,
+        big_endian,
+        dtypa,
+    );
+    let (ip_tr, ap_tr) = if ipap_cfg.ip_first {
+        (&tr0, &tr1)
+    } else {
+        (&tr1, &tr0)
+    };
+    let mut out = vec![[0.0, 0.0]; n0];
+    recombine_ipap_trace_pair_scaled_1d(
+        ip_tr,
+        ap_tr,
+        sw_hz,
+        group_delay_pts,
+        ipap_cfg.j_caco_hz,
+        ipap_cfg.ap_scale,
+        &mut out,
+    );
+    out
 }
 
 /// Returns `Some(ipap_td_excludes_inner_loop)` when a Bruker `13C`-detected 2D dataset is an
@@ -2372,6 +2760,7 @@ pub fn read_bruker_fid_2d_from_bytes_with_ipap(
         "15N",
         Some(post_ipap_td_y),
         None,
+        0,
     )?;
     let proc2s_cal = proc2s
         .as_ref()
@@ -3158,16 +3547,18 @@ pub fn read_bruker_fid_2d_with_ipap(
         "15N",
         Some(post_ipap_td_y),
         ind_phys_y,
+        0,
     )?;
     let proc2s_cal = proc2s
         .as_ref()
         .filter(|p| bruker_proc_matches_acqu_axis(Some(p), axis_y.sw_hz, &axis_y.label));
     if proc2s_cal.and_then(|p| p.get("REVERSE")).is_none() {
-        axis_y.stored_proc.reverse = if let Some(ip) = ind_phys_y {
+        let rev = if let Some(ip) = ind_phys_y {
             ip.reverse_frequency
         } else {
             infer_bruker_raw_indirect_reverse(pp_txt.as_deref(), pulprog_str, 1, axis_y.quad_mode)
         };
+        sync_bruker_indirect_reverse(&mut axis_y, rev);
     }
 
     let ipap_cfg = ipap_mode.map(|_| {
@@ -3701,17 +4092,6 @@ fn read_bruker_fid_3d_from_params(
     allow_truncated_fid: bool,
 ) -> Result<Fid3D, String> {
     let pulprog_str = acqus.get("PULPROG").map(String::as_str).unwrap_or("");
-    let already_splitcomb = bruker_texts_indicate_already_splitcomb(acqu2s, own_meta_refs)
-        || bruker_texts_indicate_already_splitcomb(acqu3s, own_meta_refs);
-    if is_bruker_3d_ipap_sequence(pulprog_str, pp_txt) && !already_splitcomb {
-        return Err(format!(
-            "unsupported unsplit Bruker 3D IPAP dataset '{name}' (PULPROG={pulprog_str}): \
-             raw 3D IPAP spin-state recombination is not yet supported (loading raw IP+AP traces \
-             without recombination would double the indirect dimension). Pre-process with Bruker \
-             TopSpin `splitcomb` first or use 2D IPAP recombination."
-        ));
-    }
-
     let is_fntype_nus = validate_bruker_fntype(dir, acqus, &[acqu2s, acqu3s])?;
 
     let (axis_x, bytorda, dtypa) = parse_bruker_direct_axis(acqus, procs)?;
@@ -3794,7 +4174,7 @@ fn read_bruker_fid_3d_from_params(
         && (full_grid_est > total_acq_param || smaller_than_full_grid);
     let is_nus = is_fntype_nus || implicit_nus;
 
-    let (td_full_y, td_full_z) = if is_nus {
+    let (mut td_full_y, mut td_full_z) = if is_nus {
         let unflat = td_acq_y > 1 && td_acq_z > 1;
         (
             resolve_bruker_nus_full_td(
@@ -3826,28 +4206,39 @@ fn read_bruker_fid_3d_from_params(
         .and_then(|pi| pi.indirect_dims.get(1));
 
     let mut axis_y =
-        parse_bruker_indirect_axis(acqus, acqu2s, proc2s, "15N", Some(td_full_y), ind_phys_y)?;
-    let mut axis_z =
-        parse_bruker_indirect_axis(acqus, acqu3s, proc3s, "13C", Some(td_full_z), ind_phys_z)?;
-    if proc2s.and_then(|p| p.get("REVERSE")).is_none()
-        || proc3s.and_then(|p| p.get("REVERSE")).is_none()
-    {
-        let pulprog = acqus.get("PULPROG").map(String::as_str).unwrap_or("");
-        if proc2s.and_then(|p| p.get("REVERSE")).is_none() {
-            axis_y.stored_proc.reverse = if let Some(ip) = ind_phys_y {
-                ip.reverse_frequency
-            } else {
-                infer_bruker_raw_indirect_reverse(pp_txt, pulprog, 2, axis_y.quad_mode)
-            };
+        parse_bruker_indirect_axis(acqus, acqu2s, proc2s, "15N", Some(td_full_y), ind_phys_y, 0)?;
+    let mut axis_z = parse_bruker_indirect_axis(
+        acqus,
+        acqu3s,
+        proc3s,
+        "13C",
+        Some(td_full_z),
+        ind_phys_z,
+        10,
+    )?;
+    let sync_reverse_3d = |ay: &mut FidAxisMeta, az: &mut FidAxisMeta| {
+        if proc2s.and_then(|p| p.get("REVERSE")).is_none()
+            || proc3s.and_then(|p| p.get("REVERSE")).is_none()
+        {
+            if proc2s.and_then(|p| p.get("REVERSE")).is_none() {
+                let rev = if let Some(ip) = ind_phys_y {
+                    ip.reverse_frequency
+                } else {
+                    infer_bruker_raw_indirect_reverse(pp_txt, pulprog_str, 2, ay.quad_mode)
+                };
+                sync_bruker_indirect_reverse(ay, rev);
+            }
+            if proc3s.and_then(|p| p.get("REVERSE")).is_none() {
+                let rev = if let Some(ip) = ind_phys_z {
+                    ip.reverse_frequency
+                } else {
+                    infer_bruker_raw_indirect_reverse(pp_txt, pulprog_str, 1, az.quad_mode)
+                };
+                sync_bruker_indirect_reverse(az, rev);
+            }
         }
-        if proc3s.and_then(|p| p.get("REVERSE")).is_none() {
-            axis_z.stored_proc.reverse = if let Some(ip) = ind_phys_z {
-                ip.reverse_frequency
-            } else {
-                infer_bruker_raw_indirect_reverse(pp_txt, pulprog, 1, axis_z.quad_mode)
-            };
-        }
-    }
+    };
+    sync_reverse_3d(&mut axis_y, &mut axis_z);
 
     let q1_mult = if axis_y.quad_mode == QuadMode::Qf {
         1
@@ -3861,8 +4252,6 @@ fn read_bruker_fid_3d_from_params(
     };
 
     let n0 = axis_x.complex_points;
-    let n1 = axis_y.complex_points;
-    let n2 = axis_z.complex_points;
     let big_endian = bytorda != 0;
     let trace_byte_len = n0
         .checked_mul(2)
@@ -3872,6 +4261,8 @@ fn read_bruker_fid_3d_from_params(
     let mut truncated_traces: Option<(usize, usize)> = None;
 
     let (data, nus_mask) = if is_nus {
+        let n1 = axis_y.complex_points;
+        let n2 = axis_z.complex_points;
         let sched_text = nuslist_txt.ok_or_else(|| {
             format!(
                 "Bruker 3D NUS dataset in {} is missing a non-empty nuslist schedule file",
@@ -3894,26 +4285,68 @@ fn read_bruker_fid_3d_from_params(
             .len()
             .checked_mul(traces_per_row)
             .ok_or_else(|| format!("Bruker 3D NUS trace count overflow in {}", dir.display()))?;
+        let ipap_plan = detect_bruker_3d_ipap_unsplit_mode(
+            &axis_x.label,
+            pulprog_str,
+            pp_txt,
+            acqus,
+            acqu2s,
+            acqu3s,
+            own_meta_refs,
+            true,
+            expected_acq_traces,
+            td_acq_y,
+            td_acq_z,
+            q1_mult,
+            q2_mult,
+            aqseq,
+            bytes.len(),
+            axis_x.td_raw,
+            word_bytes,
+        );
+        let ipap_cfg = ipap_plan.map(|p| p.config);
+        let raw_traces_per_row = if ipap_plan.is_some() {
+            traces_per_row.checked_mul(2).ok_or_else(|| {
+                format!(
+                    "Bruker 3D NUS IPAP trace count overflow in {}",
+                    dir.display()
+                )
+            })?
+        } else {
+            traces_per_row
+        };
+        let expected_raw_traces = coords
+            .len()
+            .checked_mul(raw_traces_per_row)
+            .ok_or_else(|| format!("Bruker 3D NUS trace count overflow in {}", dir.display()))?;
         let full_td_prod = td_full_y.checked_mul(td_full_z);
-        if total_acq_param != expected_acq_traces && Some(total_acq_param) != full_td_prod {
+        let td_param_ok = if ipap_plan.is_some() {
+            total_acq_param == expected_acq_traces
+                || total_acq_param == expected_raw_traces
+                || Some(total_acq_param) == full_td_prod
+                || Some(total_acq_param) == full_td_prod.and_then(|p| p.checked_mul(2))
+        } else {
+            total_acq_param == expected_acq_traces || Some(total_acq_param) == full_td_prod
+        };
+        if !td_param_ok {
             return Err(format!(
-                "Bruker 3D NUS trace count mismatch in {}: acqu2s.TD*acqu3s.TD={total_acq_param}, but nuslist has {} points ({expected_acq_traces} traces)",
+                "Bruker 3D NUS trace count mismatch in {}: acqu2s.TD*acqu3s.TD={total_acq_param}, but nuslist has {} points ({expected_raw_traces} traces)",
                 dir.display(),
                 coords.len()
             ));
         }
         let (stride, observed) = determine_bruker_ser_stride_opts(
             bytes.len(),
-            expected_acq_traces,
+            expected_raw_traces,
             axis_x.td_raw,
             word_bytes,
             false,
             allow_truncated_fid,
             dir,
         )?;
-        if observed < expected_acq_traces {
-            truncated_traces = Some((observed, expected_acq_traces));
-            warn_truncated_fid(dir, observed, expected_acq_traces);
+        if observed < expected_raw_traces {
+            truncated_traces = Some((observed, expected_raw_traces));
+            warn_truncated_fid(dir, observed, expected_raw_traces);
         }
         let total_cplx =
             checked_fid_complex_len(&[n2, 2, n1, 2, n0], truncated_traces.is_some(), &dir_ctx)?;
@@ -3930,24 +4363,57 @@ fn read_bruker_fid_3d_from_params(
         let mut counts = vec![0usize; n2_n1];
 
         for (row_idx, &(k1, k2)) in coords.iter().enumerate() {
-            let row_base = row_idx * traces_per_row;
+            let row_base = row_idx * raw_traces_per_row;
             if row_base >= observed {
                 break;
             }
             let fetch_sub = |iy_sub: usize, iz_sub: usize| -> Vec<Complex64> {
-                let sub_idx = if aqseq == 0 {
-                    // F2 (`iy_sub`) is inner / fastest, F1 (`iz_sub`) is outer / slowest
-                    iz_sub * q1_mult + iy_sub
+                if let Some(plan) = ipap_plan {
+                    let (fast_q, slow_q, fast_mult, ipap_on_fast) = if aqseq == 0 {
+                        (iy_sub, iz_sub, q1_mult, plan.axis == Bruker3dIpapAxis::F2)
+                    } else {
+                        (iz_sub, iy_sub, q2_mult, plan.axis == Bruker3dIpapAxis::F1)
+                    };
+                    let (sub0, sub1) = if ipap_on_fast {
+                        let base = (slow_q * fast_mult + fast_q) * 2;
+                        (base, base + 1)
+                    } else {
+                        let base = (slow_q * 2) * fast_mult + fast_q;
+                        (base, base + fast_mult)
+                    };
+                    decode_bruker_3d_trace_pair_with_ipap(
+                        bytes,
+                        row_base + sub0,
+                        Some(row_base + sub1),
+                        observed,
+                        stride,
+                        trace_byte_len,
+                        n0,
+                        big_endian,
+                        dtypa,
+                        ipap_cfg,
+                        axis_x.sw_hz,
+                        axis_x.group_delay,
+                    )
                 } else {
-                    // F1 (`iz_sub`) is inner / fastest, F2 (`iy_sub`) is outer / slowest
-                    iy_sub * q2_mult + iz_sub
-                };
-                let tidx = row_base + sub_idx;
-                if tidx >= observed {
-                    return vec![[0.0, 0.0]; n0];
+                    let sub_idx = if aqseq == 0 {
+                        // F2 (`iy_sub`) is inner / fastest, F1 (`iz_sub`) is outer / slowest
+                        iz_sub * q1_mult + iy_sub
+                    } else {
+                        // F1 (`iz_sub`) is inner / fastest, F2 (`iy_sub`) is outer / slowest
+                        iy_sub * q2_mult + iz_sub
+                    };
+                    decode_bruker_trace_or_zero(
+                        bytes,
+                        row_base + sub_idx,
+                        observed,
+                        stride,
+                        trace_byte_len,
+                        n0,
+                        big_endian,
+                        dtypa,
+                    )
                 }
-                let off = tidx * stride;
-                decode_bruker_trace(&bytes[off..off + trace_byte_len], n0 * 2, big_endian, dtypa)
             };
             accumulate_bruker_3d_point(
                 axis_y.quad_mode,
@@ -3982,18 +4448,79 @@ fn read_bruker_fid_3d_from_params(
         }
         (data, Some(counts.into_iter().map(|c| c > 0).collect()))
     } else {
+        let ipap_plan = detect_bruker_3d_ipap_unsplit_mode(
+            &axis_x.label,
+            pulprog_str,
+            pp_txt,
+            acqus,
+            acqu2s,
+            acqu3s,
+            own_meta_refs,
+            false,
+            0,
+            td_acq_y,
+            td_acq_z,
+            q1_mult,
+            q2_mult,
+            aqseq,
+            bytes.len(),
+            axis_x.td_raw,
+            word_bytes,
+        );
+        if let Some(plan) = ipap_plan.filter(|p| p.td_includes_ipap) {
+            match plan.axis {
+                Bruker3dIpapAxis::F2 => {
+                    td_full_y = (td_full_y / 2).max(1);
+                    axis_y = parse_bruker_indirect_axis(
+                        acqus,
+                        acqu2s,
+                        proc2s,
+                        "15N",
+                        Some(td_full_y),
+                        ind_phys_y,
+                        0,
+                    )?;
+                }
+                Bruker3dIpapAxis::F1 => {
+                    td_full_z = (td_full_z / 2).max(1);
+                    axis_z = parse_bruker_indirect_axis(
+                        acqus,
+                        acqu3s,
+                        proc3s,
+                        "13C",
+                        Some(td_full_z),
+                        ind_phys_z,
+                        10,
+                    )?;
+                }
+            }
+            sync_reverse_3d(&mut axis_y, &mut axis_z);
+        }
+        let n1 = axis_y.complex_points;
+        let n2 = axis_z.complex_points;
+        let ipap_cfg = ipap_plan.map(|p| p.config);
+        let expected_raw_traces = if ipap_plan.is_some() {
+            td_full_y
+                .checked_mul(td_full_z)
+                .and_then(|v| v.checked_mul(2))
+                .ok_or_else(|| {
+                    format!("Bruker 3D IPAP trace count overflow in {}", dir.display())
+                })?
+        } else {
+            total_acq_param
+        };
         let (stride, observed) = determine_bruker_ser_stride_opts(
             bytes.len(),
-            total_acq_param,
+            expected_raw_traces,
             axis_x.td_raw,
             word_bytes,
             true,
             allow_truncated_fid,
             dir,
         )?;
-        if observed < total_acq_param {
-            truncated_traces = Some((observed, total_acq_param));
-            warn_truncated_fid(dir, observed, total_acq_param);
+        if observed < expected_raw_traces {
+            truncated_traces = Some((observed, expected_raw_traces));
+            warn_truncated_fid(dir, observed, expected_raw_traces);
         }
         let total_cplx =
             checked_fid_complex_len(&[n2, 2, n1, 2, n0], truncated_traces.is_some(), &dir_ctx)?;
@@ -4005,33 +4532,60 @@ fn read_bruker_fid_3d_from_params(
         let mut out_c2_cos = vec![[0.0, 0.0]; n0];
         let mut out_c2_sin = vec![[0.0, 0.0]; n0];
 
+        let uniform_pair_tidx = |iy: usize, iz: usize| -> (usize, Option<usize>) {
+            match ipap_plan {
+                None => {
+                    let tidx = if aqseq == 0 {
+                        iz * td_full_y + iy
+                    } else {
+                        iy * td_full_z + iz
+                    };
+                    (tidx, None)
+                }
+                Some(plan) => match (aqseq, plan.axis) {
+                    (0, Bruker3dIpapAxis::F2) => {
+                        let base = iz * (td_full_y * 2) + iy * 2;
+                        (base, Some(base + 1))
+                    }
+                    (0, Bruker3dIpapAxis::F1) => {
+                        let base = (iz * 2) * td_full_y + iy;
+                        (base, Some(base + td_full_y))
+                    }
+                    (_, Bruker3dIpapAxis::F1) => {
+                        let base = iy * (td_full_z * 2) + iz * 2;
+                        (base, Some(base + 1))
+                    }
+                    (_, Bruker3dIpapAxis::F2) => {
+                        let base = (iy * 2) * td_full_z + iz;
+                        (base, Some(base + td_full_z))
+                    }
+                },
+            }
+        };
+
         for k2 in 0..n2 {
             for k1 in 0..n1 {
-                let min_tidx = if aqseq == 0 {
-                    (k2 * q2_mult) * td_full_y + (k1 * q1_mult)
-                } else {
-                    (k1 * q1_mult) * td_full_z + (k2 * q2_mult)
-                };
+                let (min_tidx, _) = uniform_pair_tidx(k1 * q1_mult, k2 * q2_mult);
                 if min_tidx >= observed {
                     continue;
                 }
                 let fetch_sub = |iy_sub: usize, iz_sub: usize| -> Vec<Complex64> {
                     let iy = k1 * q1_mult + iy_sub;
                     let iz = k2 * q2_mult + iz_sub;
-                    let tidx = if aqseq == 0 {
-                        iz * td_full_y + iy
-                    } else {
-                        iy * td_full_z + iz
-                    };
-                    if tidx >= observed {
-                        return vec![[0.0, 0.0]; n0];
-                    }
-                    let off = tidx * stride;
-                    decode_bruker_trace(
-                        &bytes[off..off + trace_byte_len],
-                        n0 * 2,
+                    let (tidx0, tidx1_opt) = uniform_pair_tidx(iy, iz);
+                    decode_bruker_3d_trace_pair_with_ipap(
+                        bytes,
+                        tidx0,
+                        tidx1_opt,
+                        observed,
+                        stride,
+                        trace_byte_len,
+                        n0,
                         big_endian,
                         dtypa,
+                        ipap_cfg,
+                        axis_x.sw_hz,
+                        axis_x.group_delay,
                     )
                 };
                 accumulate_bruker_3d_point(
@@ -4102,17 +4656,17 @@ pub fn read_bruker_pseudo3d_planes_2d(
     let ind_y = pulprog_interp.indirect_dims.first();
     let ind_z = pulprog_interp.indirect_dims.get(1);
     let mut axis_2 =
-        parse_bruker_indirect_axis(&acqus, &acqu2s, proc2s.as_ref(), "15N", None, ind_y)?;
+        parse_bruker_indirect_axis(&acqus, &acqu2s, proc2s.as_ref(), "15N", None, ind_y, 0)?;
     let mut axis_3 =
-        parse_bruker_indirect_axis(&acqus, &acqu3s, proc3s.as_ref(), "15N", None, ind_z)?;
+        parse_bruker_indirect_axis(&acqus, &acqu3s, proc3s.as_ref(), "15N", None, ind_z, 10)?;
     if proc2s.as_ref().and_then(|p| p.get("REVERSE")).is_none() {
         if let Some(ip) = ind_y {
-            axis_2.stored_proc.reverse = ip.reverse_frequency;
+            sync_bruker_indirect_reverse(&mut axis_2, ip.reverse_frequency);
         }
     }
     if proc3s.as_ref().and_then(|p| p.get("REVERSE")).is_none() {
         if let Some(ip) = ind_z {
-            axis_3.stored_proc.reverse = ip.reverse_frequency;
+            sync_bruker_indirect_reverse(&mut axis_3, ip.reverse_frequency);
         }
     }
 

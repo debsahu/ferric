@@ -1691,8 +1691,9 @@ fn nus_2d_and_3d_hypercomplex_recover_100_to_1_adjacent_weak_peak_and_reject_unr
     let weak_3d = (-1isize..=1)
         .map(|d| spec3.get(ix3, iy3, (iz_weak as isize + d) as usize))
         .fold(0.0_f32, f32::max);
-    let flank_lo = spec3.get(ix3, iy3, iz_weak.saturating_sub(3));
-    let flank_hi = spec3.get(ix3, iy3, (iz_weak + 3).min(spec3.axis_z.size - 1));
+    let flank_bins = ((0.75 / spec3.axis_z.step_ppm.abs()).round() as usize).max(3);
+    let flank_lo = spec3.get(ix3, iy3, iz_weak.saturating_sub(flank_bins));
+    let flank_hi = spec3.get(ix3, iy3, (iz_weak + flank_bins).min(spec3.axis_z.size - 1));
     let mut plane_bg: Vec<f32> = Vec::new();
     for iy in 0..spec3.axis_y.size {
         if iy.abs_diff(iy3) <= 3 {
