@@ -410,6 +410,8 @@ pub const fn workbench_action_is_destructive(action: WorkbenchAction) -> bool {
             | WorkbenchAction::LoadSessionNef
             | WorkbenchAction::LoadPathOrSpectrum
             | WorkbenchAction::ReSimulateSyntheticNoise
+            | WorkbenchAction::ProcessAllRawFids
+            | WorkbenchAction::ReconstructNusIstFista
     )
 }
 
@@ -2543,7 +2545,7 @@ fn mcp_tool_schemas_json() -> Value {
         },
         {
             "name": "dispatch_workbench_action",
-            "description": "Dispatch any registered WorkbenchAction (menu, workflow, view, picker, assignment, structure, dynamics, or mode switch) by PascalCase or snake_case name. Requires ReadWrite permission; file-backed actions obey approved-root sandboxing & overwrite refusal, and destructive actions (`ResetWorkspace`, `LoadUbiquitinDemo`, `LoadSessionNef`, `ReSimulateSyntheticNoise`) are denied unless explicitly enabled in MCP settings and confirmed (`confirm: true`); `LoadPathOrSpectrum` is blocked via MCP.",
+            "description": "Dispatch any registered WorkbenchAction (menu, workflow, view, picker, assignment, structure, dynamics, or mode switch) by PascalCase or snake_case name. Requires ReadWrite permission; file-backed actions obey approved-root sandboxing & overwrite refusal, and destructive actions (`ResetWorkspace`, `LoadUbiquitinDemo`, `LoadSessionNef`, `ReSimulateSyntheticNoise`, `ProcessAllRawFids`, `ReconstructNusIstFista`) are denied unless explicitly enabled in MCP settings and confirmed (`confirm: true`); `LoadPathOrSpectrum` is blocked via MCP.",
             "annotations": {
                 "readOnlyHint": false,
                 "destructiveHint": true
@@ -5079,7 +5081,8 @@ impl McpBridgeController {
     }
 
     /// Whether destructive MCP actions (`ResetWorkspace`, `LoadUbiquitinDemo`, `LoadSessionNef`,
-    /// `ReSimulateSyntheticNoise`, `load_study_folder`, and `set_sequence` when replacing existing
+    /// `ReSimulateSyntheticNoise`, `ProcessAllRawFids`, `ReconstructNusIstFista`, `load_study_folder`,
+    /// and `set_sequence` when replacing existing
     /// sequence/assignment state) are enabled (false by default).
     pub fn destructive_actions_allowed(&self) -> bool {
         self.shared
@@ -8142,6 +8145,8 @@ mod tests {
             "LoadSessionNef",
             "LoadPathOrSpectrum",
             "ReSimulateSyntheticNoise",
+            "ProcessAllRawFids",
+            "ReconstructNusIstFista",
         ] {
             assert_eq!(find_act(d)["destructive"], true, "{d} must be destructive");
         }
@@ -8182,6 +8187,8 @@ mod tests {
             "load_ubiquitin_demo",
             "load_session_nef",
             "re_simulate_synthetic_noise",
+            "process_all_raw_fids",
+            "reconstruct_nus_ist_fista",
         ] {
             ctrl.set_destructive_actions_allowed(false);
             assert_denied(
@@ -8361,5 +8368,87 @@ mod tests {
         assert!(validate_loopback_host_and_origin("localhost:17420", false, None, 17420).is_ok());
         assert!(validate_loopback_host_and_origin("[::1]:17420", false, None, 17420).is_err());
         assert!(validate_loopback_host_and_origin("[::1]", false, None, 17420).is_err());
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn test_173r2_p1_1_process_fids_and_nus_actions_require_destructive_gate() {
+        let sandbox = TempTestDir::new("173r2_p1_1_fid_destructive");
+        let study_dir = sandbox.path().join("study_fid");
+        std::fs::create_dir_all(&study_dir).expect("create study dir");
+
+        let ctrl = McpBridgeController::default();
+        ctrl.set_approved_roots([sandbox.path()])
+            .expect("approve sandbox");
+        ctrl.sync_user_study_root(Some(&study_dir));
+        ctrl.set_permission(McpBridgePermission::ReadWrite);
+
+        let call_tool = |name: &str, args: Value| -> Value {
+            let req = serde_json::to_vec(&json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": { "name": name, "arguments": args }
+            }))
+            .unwrap();
+            ctrl.handle_jsonrpc_bytes(&req).unwrap()
+        };
+        let assert_denied = |resp: &Value, expected_kind: &str| {
+            assert_eq!(resp["result"]["isError"], true, "expected denial: {resp}");
+            let payload: Value =
+                serde_json::from_str(resp["result"]["content"][0]["text"].as_str().unwrap())
+                    .unwrap();
+            assert_eq!(payload["status"], "denied", "payload={payload}");
+            assert_eq!(payload["queued"], false, "payload={payload}");
+            assert_eq!(payload["error_kind"], expected_kind, "payload={payload}");
+        };
+
+        let insp = call_tool(
+            "inspect_workbench_data",
+            json!({ "section": "actions", "limit": 500 }),
+        );
+        assert_eq!(insp["result"]["isError"], false);
+        let insp_json: Value =
+            serde_json::from_str(insp["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        let items = insp_json["items"].as_array().unwrap();
+        for name in ["ProcessAllRawFids", "ReconstructNusIstFista"] {
+            let entry = items
+                .iter()
+                .find(|it| it["name"].as_str() == Some(name))
+                .unwrap_or_else(|| panic!("missing action {name}"));
+            assert_eq!(entry["destructive"], true, "{name} must be destructive");
+        }
+
+        for act_name in ["ProcessAllRawFids", "ReconstructNusIstFista"] {
+            ctrl.set_destructive_actions_allowed(false);
+            assert_denied(
+                &call_tool(
+                    "dispatch_workbench_action",
+                    json!({ "action": act_name, "confirm": true }),
+                ),
+                "destructive_action_denied",
+            );
+
+            ctrl.set_destructive_actions_allowed(true);
+            assert_denied(
+                &call_tool("dispatch_workbench_action", json!({ "action": act_name })),
+                "confirmation_required",
+            );
+            assert_denied(
+                &call_tool(
+                    "dispatch_workbench_action",
+                    json!({ "action": act_name, "confirm": false }),
+                ),
+                "confirmation_required",
+            );
+
+            let ok = call_tool(
+                "dispatch_workbench_action",
+                json!({ "action": act_name, "confirm": true }),
+            );
+            assert_eq!(ok["result"]["isError"], false, "{act_name} failed: {ok}");
+        }
+        let queued = ctrl.drain_pending_ui_commands();
+        assert_eq!(queued.len(), 2);
     }
 }
