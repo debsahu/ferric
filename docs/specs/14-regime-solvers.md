@@ -1,18 +1,21 @@
-# 14. Problem-Regime Solvers — Protonless `13C`-Detected IDPs, Ensemble Propensity & Paramagnetic Metalloproteins
+# 14. Problem-Regime Solvers — Protonless `13C`-Detected & Joint `HN + 13C` IDPs, Ensemble Propensity & Paramagnetic Metalloproteins
 
 > **Provenance & Clean-Room Statement**
-> Original clean-room specification and mathematical design implemented in `crates/nmr-core/src/{c13_detected,idp_solver,idp_propensity,paramagnetic,report}.rs`, `crates/nmr-gpu/src/idp_gpu.rs`, and `crates/nmr-gpu/src/shaders/{idp_scoring,idp_anneal}.wgsl`. Zero source code, macros, parameter tables, residue libraries, or binaries from any proprietary, academic-licensed, or copyleft (GPL/AGPL) NMR assignment, secondary-structure prediction, or paramagnetic tensor package were consulted. Every physical forward model, statistical prior, optimization kernel, and tensor solver derives strictly from peer-reviewed literature and public BMRB/PDB standards:
+> Original clean-room specification and mathematical design implemented in `crates/nmr-core/src/{c13_detected,idp_solver,joint_idp_solver,idp_propensity,paramagnetic,report}.rs`, `crates/nmr-gpu/src/idp_gpu.rs`, `crates/nmr-gpu/src/shaders/{idp_scoring,idp_anneal}.wgsl`, and `crates/nmr-gui/src/idp_joint_panel.rs`. Zero source code, macros, parameter tables, residue libraries, or binaries from any proprietary, academic-licensed, or copyleft (GPL/AGPL) NMR assignment, secondary-structure prediction, or paramagnetic tensor package were consulted. Every physical forward model, statistical prior, optimization kernel, and tensor solver derives strictly from peer-reviewed literature and public BMRB/PDB standards:
 >
-> 1. **Protonless `13C`-detected multidimensional NMR of intrinsically disordered proteins (IDPs)**:
+> 1. **Protonless `13C`-detected & hybrid `HN + 13C` multidimensional NMR of intrinsically disordered proteins (IDPs)**:
 >    - Bermel, W., Bertini, I., Felli, I. C., Lee, Y.-M., Luchinat, C. & Pierattelli, R. (*J. Am. Chem. Soc.* **2006**, 128, 3918–3919) — protonless `2D CON` and `13C`-direct-detected biomolecular NMR.
 >    - Bermel, W., Bertini, I., Felli, I. C., Piccioli, M. & Pierattelli, R. (*Prog. Nucl. Magn. Reson. Spectrosc.* **2006**, 48, 25–45) — `13C` direct detection (`2D CACO`, `2D CON`, `IPAP` / `S3E` homonuclear `1J(C',CA)` virtual decoupling).
 >    - Bermel, W., Bertini, I., Csizmok, V., Felli, I. C., Pierattelli, R. & Tompa, P. (*J. Magn. Reson.* **2009**, 198, 275–281) — `H`-start / `13C`-start `3D (H)CANCO`, `3D (H)CBCACON`, `3D (H)CC(CO)N`, and `3D (H)NCACO` experiments for unfolded and proline-rich proteins.
+>    - Bermel, W., Bertini, I., Felli, I. C. & Pierattelli, R. (*J. Am. Chem. Soc.* **2009**, 131, 15339–15345) — fast `13C` direct-detected biomolecular NMR (`2D CON`, `3D H(CC)CON`, `3D (H)N(CA)CON`, and `IPAP` virtual decoupling).
+>    - Sahu, D., Bastidas, M. & Showalter, S. A. (*Anal. Biochem.* **2014**, 449, 17–25; cf. carbon-detected amino-acid-selective `CAS-NMR` workflows) — combining `2D CON`, `3D (H)N(CA)CON`, and amino-acid-selective `CAS` (`CACON` `i-1` / `CANCO` `i`) subspectra for IDP backbone assignment.
+>    - Pervushin, K., Riek, R., Wider, G. & Wüthrich, K. (*Proc. Natl. Acad. Sci. USA* **1997**, 94, 12366–12371) — Transverse Relaxation-Optimized Spectroscopy (`TROSY`) selecting the slowly relaxing multiplet component shifted by $\pm \frac{1}{2}{}^{1}J_{\text{HN}}$ (`~ ±46 Hz`) relative to decoupled `1H–15N` correlations.
 >    - Nováček, J., Žídek, L. & Sklenář, V. (*J. Magn. Reson.* **2014**, 241, 41–52) — narrow-dispersion multidimensional `13C`-detected correlation strategies for IDPs.
 > 2. **Intrinsic amide proton solvent exchange & random-coil IDP chemical-shift statistics**:
 >    - Bai, Y., Milne, J. S., Mayne, L. & Englander, S. W. (*Proteins* **1993**, 17, 75–86) — primary-structure, pH, and temperature dependence of intrinsic `1H^N`–water chemical exchange rates $k_{\text{ex}}$.
->    - Tamiola, K., Acar, B. & Mulder, F. A. A. (*J. Am. Chem. Soc.* **2010**, 132, 18000–18003) — sequence-specific random-coil chemical shifts (`ncIDP`) and nearest-neighbor $(i \pm 1)$ corrections for intrinsically disordered proteins.
+>    - Tamiola, K., Acar, B. & Mulder, F. A. A. (*J. Am. Chem. Soc.* **2010**, 132, 18000–18003) — sequence-specific random-coil chemical shifts (`ncIDP`) and nearest-neighbor $(i \pm 1)$ corrections (including pre-Proline shifts) for intrinsically disordered proteins.
 >    - Kjaergaard, M., Brander, S. & Poulsen, F. M. (*J. Biomol. NMR* **2011**, 49, 139–149); Kjaergaard, M. & Poulsen, F. M. (*J. Biomol. NMR* **2011**, 50, 157–165) — temperature and neighbor dependence of disordered backbone shifts.
->    - Platzer, G., Okon, M. & McIntosh, L. P. (*J. Biomol. NMR* **2014**, 60, 109–129) — pH-dependent Henderson–Hasselbalch random-coil titration shifts of ionizable sidechains.
+>    - Platzer, G., Okon, M. & McIntosh, L. P. (*J. Biomol. NMR* **2014**, 60, 109–129) — pH-dependent Henderson–Hasselbalch random-coil titration shifts of ionizable sidechains and C-terminal carboxylate (`COO-`, `C' ~ 179 ppm` DSS).
 >    - Wishart, D. S., Bigam, C. G., Holm, A., Hodges, R. S. & Sykes, B. D. (*J. Biomol. NMR* **1995**, 5, 67–81); Markley, J. L. et al. (*Pure Appl. Chem.* **1998**, 70, 117–142) — `DSS` referencing ratios $\Xi(^{13}\text{C})/\Xi(^{1}\text{H})$ and $\Xi(^{15}\text{N})/\Xi(^{1}\text{H})$.
 > 3. **Fractional IDP secondary structure propensity (`SSP` & cooperative 4-state `δ2D`)**:
 >    - Marsh, J. A., Singh, V. K., Jia, Z. & Forman-Kay, J. D. (*Protein Sci.* **2006**, 15, 2795–2804) — single-score 5-residue weighted Secondary Structure Propensity (`SSP`) combining `CA`, `CB`, `C'`, `HA`, `N`, and `H^N` secondary shifts with pre-Proline scaling.
@@ -252,20 +255,94 @@ $$\Delta\delta^{\text{PCS}}(\mathbf{r}) = \frac{10^{4}}{4\pi r^5}\Big[(x^2 - z^2
 
 ---
 
-## 5. CLI & Interactive Workbench Contracts (`crates/nmr-cli`, `crates/nmr-gui`)
+## 5. Unified Joint `HN + 13C`-Detected IDP Backbone Solver (`idp-joint`, `T23.2` / `v0.18.0`, `crates/nmr-core/src/joint_idp_solver.rs`)
 
-### 5.1 Command-Line Interface (`ferric`)
+> **Isolation Invariant**: The `idp-joint` regime is implemented strictly in `crates/nmr-core/src/joint_idp_solver.rs` (with its interactive GUI companion in `crates/nmr-gui/src/idp_joint_panel.rs`). Globular `standard`/`evo-graph` scoring semantics (`docs/specs/03-assignment.md`) and all globular/`CISD3` release gates remain untouched.
+
+### 5.1 Physical Motivation & Peptide-Bond `(C'_{i-1}, N_i)` Node Fusion (`JointIdpNode`)
+In real-world IDP assignments on Proline-, Serine-, and Glycine-rich sequences (`10–25%` `Pro`), experimentalists routinely acquire **both** `1H`-detected triple-resonance spectra (`BEST-HSQC`, `HNCO`, `HN(CA)CO`, `HNCACB`, `HN(CO)CACB`, `BT_HNCACONH`) and protonless `13C`-detected spectra (`2D CON`, `3D H(CC)CON`, `3D (H)N(CA)CON`, and amino-acid-selective `CAS` `CACON`/`CANCO`; Bermel et al., *JACS* 2006, 2009; Sahu, Bastidas & Showalter, *Anal. Biochem.* 2014). Solving either half alone discards decisive constraints:
+- `1H`-only walks shatter at every `-Xaa-Pro-` and `-Pro-Pro-` boundary (no amide $^1\text{H}^{\text{N}}$) and lose exchange-broadened amides at physiological pH/temperature (Bai et al., 1993).
+- `13C`-only walks lack high-dispersion `HNCACB`/`HN(CA)CO` intraresidue $(CA_i, CB_i, C'_i)$ strips and reciprocal `BT_HNCACONH` `N–N` corridors unless manually merged.
+
+Because `3D HNCO` (`(H_i, N_i, C'_{i-1})`) and `2D CON` (`(C'_{i-1}, N_i)`) directly observe the **exact same covalent peptide plane** $(i-1, i)$ for every non-N-terminal residue $i \in \{1, \dots, L-1\}$, `idp-joint` unifies both suites into a single peptide-bond node graph (`JointIdpNode`) keyed on $(C'_{i-1}, N_i)$ after unsupervised global carrier registration:
+
+| Node Variant (`JointIdpNode`) | Anchor Coordinates | Slot Eligibility ($k \in \{1,\dots,L-1\}$) | Physical Origin & Role |
+|---|---|---|---|
+| **`AmideFused`** | $(C'_{i-1}, N_i, H_i)$ | Non-`Pro` (`seq[k] != PRO`) | `HNCO`-supported amide root matched 1-to-1 by minimum elliptical $(C'_{i-1}, N_i)$ distance ($\sigma_{C'} \approx 0.06\text{ ppm}$, $\sigma_N \approx 0.20\text{ ppm}$) to a `2D CON` peak (or retained as an `HN`-only amide node when `2D CON` is locally absent/overlapped). Carries both `HN` and `13C`-detected channels. |
+| **`ProlineConBridge`** | $(C'_{i-1}, N_i)$ (`N_i` in `131.5–143.0 ppm` DSS, no $^1\text{H}^{\text{N}}$) | Strictly `Pro` (`seq[k] == PRO`) | Protonless `2D CON` tertiary-imide peptide bond linking upstream $C'_{k-1}$ (`HN(CA)CO` / `CACO` / `NCACO` of residue $k-1$) directly across `Pro` into downstream $C'_k$ (`HNCO` / `CON(k+1)`), $(CA_k, CB_k)$ (`HN(CO)CACB` / `H(CC)CON`), and $N_k$ (`(H)N(CA)CON`). |
+| **`ConOnlyAmide`** | $(C'_{i-1}, N_i)$ (`N_i < 131.5 ppm` DSS, no matched `HNCO`) | Non-`Pro` (`seq[k] != PRO`) | Unmatched non-Proline `2D CON` peak rescuing solvent-exchange-bleached or severely `1H^N`-overlapped amides that disappear from `BEST-HSQC`/`HNCO`, preserving continuous walks through fast-exchanging loops. |
+
+N-terminal residue $k = 0$ has no preceding peptide carbonyl $C'_{-1}$ and remains strictly `FORBID = -1.0e9` for all peptide-bond nodes.
+
+### 5.2 Pooled Multi-Experiment Channels, Overlap/Breakthrough-Calibrated `CAS` & Directional `N–N` Edges
+Each `JointIdpNode` pools all orthogonal intraresidue ($i$) and preceding ($i-1$) observables without double-counting duplicate pathways:
+1. **Backbone Carbon Channels**:
+   - **Intraresidue (`i`)**: $(CA_i, CB_i)$ from polarity-normalized `HNCACB` (default `CA >= 0, CB < 0`; `CA_i` corroborated by `CANCO`/`NCACO`) and $C'_i$ from `HN(CA)CO` (`2D CACO` / `3D NCACO` for `ProlineConBridge` and `ConOnlyAmide`). When `HN(CO)CACB` or `H(CC)CON` is present, preceding $(CA_{i-1}, CB_{i-1})$ peaks are explicitly subtracted/downweighted before populating `ca_curr`/`cb_curr` so strong `i-1` peaks in `HNCACB` do not leak into intraresidue typing.
+   - **Preceding (`i-1`)**: $(CA_{i-1}, CB_{i-1})$ from `HN(CO)CACB`/`CBCA(CO)NH` and `H(CC)CON`/`CBCACON`, plus full aliphatic sidechain ladders $C^{\text{ali}}_{i-1}$ from `H(CC)CON`/`CCC(CO)N` (including diagnostic `Pro CD ~ 49.8 ppm` and `Pro CG ~ 27.2 ppm` for `-Pro-Xaa-` steps).
+2. **Overlap/Breakthrough-Calibrated `CAS` (`cacon` `i-1` / `canco` `i`) Likelihood (Sahu, Bastidas & Showalter, *Anal. Biochem.* 2014)**:
+   - Amino-acid-selective 2D `CON`-readout subspectra (`CAS`: e.g., `Ala`, `Gly`, `Ser`, `Thr`, `TAVI`, `Asx`, `Glx`) filter magnetization on either residue $i-1$ (**`CasMode::Cacon`**) or residue $i$ (**`CasMode::Canco`**) and project onto $(C'_{i-1}, N_i)$.
+   - Real IDP `CAS` spectra suffer both from finite sensitivity ($p_{\text{det}} \in [0.75, 0.95]$) and from incomplete pulse-filter suppression / local `CON` crowding (`p_bt` breakthrough + neighborhood overlap density $\rho_{\text{ov}}(s) \in [0, 1]$). Replacing a brittle hard cliff with an overlap/breakthrough-calibrated log-likelihood ratio prevents a single overlapped neighbor or breakthrough peak from vetoing a true assignment:
+     $$\text{LLR}_{\text{CAS}}(s, k; m) = \begin{cases} \text{clamp}\!\left(\ln\dfrac{p_{\text{det}}}{p_{\text{bt}} + (1 - p_{\text{bt}})\,\rho_{\text{ov}}(s)},\; 0,\; L_{\max}\right), & h_m(s) = 1 \land r_m(k) \in \mathcal{R}_m,\\[8pt] -\text{clamp}\!\left(\ln\dfrac{p_{\text{det}}}{p_{\text{bt}} + (1 - p_{\text{bt}})\,\rho_{\text{ov}}(s)},\; 0,\; L_{\max}\right), & h_m(s) = 1 \land r_m(k) \notin \mathcal{R}_m,\\[8pt] \ln\dfrac{1 - p_{\text{det}}}{1 - p_{\text{bt}}}, & h_m(s) = 0 \land r_m(k) \in \mathcal{R}_m,\\[6pt] 0, & \text{otherwise,} \end{cases}$$
+     where $r_m(k) = \text{seq}[k-1]$ for `cacon` (`i-1`), $r_m(k) = \text{seq}[k]$ for `canco` (`i`), $h_m(s) \in \{0, 1\}$ is the elliptical $(C'_{i-1}, N_i)$ match indicator (`tol_C' = 0.06 ppm`, `tol_N = 0.20 ppm`), and $L_{\max}$ caps single-subspectrum leverage (`~ 3.0 nats` in isolated regions, smoothly attenuated in crowded clusters). Directionality (`cacon` vs `canco`) should be specified explicitly; inferred direction emits a visible diagnostic warning.
+3. **Directional `(H)N(CA)CON` & Reciprocal `BT_HNCACONH` `N–N` Sequential Edges (Bermel et al., *JACS* 2009; Sahu et al., 2014)**:
+   - **`3D (H)N(CA)CON`**: Anchored on `CON(k)` $(C'_{k-1}, N_k)$, records **directional** backward links to $N_{k-1}$ (`s_prev -> s_curr`), including across `-Xaa-Pro-` and `-Pro-Pro-` boundaries where `1H`-detected `N–N` experiments terminate. Near-diagonal pairs ($0 < |N_k - N_{k-1}| \le 0.35\text{ ppm}$) are retained with proximity-calibrated downweighting rather than hard self-exclusion so degenerate consecutive `15N` pairs are not systematically lost.
+   - **`3D BT_HNCACONH` / `HN(CA)CONH`**: Records bidirectional $(N_k \leftrightarrow N_{k\pm 1})$ amide nitrogen corridors; requiring reciprocal confirmation ($N_a \to N_b$ and $N_b \to N_a$ within `0.35 ppm` after TROSY offset alignment) suppresses single-strip noise spikes while delivering an orthogonal `15N–15N` link channel alongside `ΔC'` and `ΔCA/ΔCB`.
+
+### 5.3 Field-Scaled TROSY $\frac{1}{2}{}^{1}J_{\text{HN}}$ Alignment & Built-In IDP Strip Hygiene
+1. **Field-Scaled TROSY $\frac{1}{2}{}^{1}J_{\text{HN}}$ Cross-Spectrum Auto-Calibration (Pervushin et al., *PNAS* 1997)**:
+   - TROSY-selected 3D spectra (such as `BT_HNCACONH` or TROSY-`HN(CA)CO`/`HNCACB`) select the narrowest multiplet component shifted by $\Delta\nu_{1\text{H}} \approx \pm\frac{1}{2}{}^{1}J_{\text{HN}}$ and $\Delta\nu_{15\text{N}} \approx \mp\frac{1}{2}{}^{1}J_{\text{HN}}$ ($|{}^{1}J_{\text{HN}}| \approx 92\text{ Hz} \implies \frac{1}{2}|{}^{1}J_{\text{HN}}| \approx 46\text{ Hz}$) relative to decoupled `HSQC`/`HNCO`/`2D CON` roots.
+   - Expressed in ppm as a function of spectrometer proton Larmor frequency $\nu_{1\text{H}} = B_0$ (`500–950 MHz`, $\nu_{15\text{N}} = \Xi(^{15}\text{N})/\Xi(^{1}\text{H}) \cdot \nu_{1\text{H}} = 0.101\,329\,12\,\nu_{1\text{H}}$):
+     $$|\Delta\delta_{1\text{H}}^{\text{TROSY}}(B_0)| = \frac{46.0\text{ Hz}}{\nu_{1\text{H}}(\text{MHz})}, \qquad |\Delta\delta_{15\text{N}}^{\text{TROSY}}(B_0)| = \frac{46.0\text{ Hz}}{\nu_{15\text{N}}(\text{MHz})}$$
+     (e.g. `±0.077 ppm 1H` / `∓0.757 ppm 15N` at `600 MHz`; `±0.058 ppm 1H` / `∓0.567 ppm 15N` at `800 MHz`).
+   - Unsupervised registration evaluates the 2D Gaussian coincidence log-likelihood at `(0, 0)` against the field-scaled TROSY offset hypotheses $(\pm 46/\nu_{1\text{H}}, \mp 46/\nu_{15\text{N}})$ (plus bounded local fine-tuning within `±0.02 ppm 1H`, `±0.15 ppm 15N`), accepting a TROSY correction only when it strictly improves coincidence log-likelihood above a look-elsewhere-guarded threshold with sufficient distinct root support.
+2. **Built-In IDP Strip Hygiene**:
+   - **`F1(C')` NUS Sidelobe Pruning**: Indirect $^{13}\text{C}'$ strips reconstructed from non-uniform sampling (`IST` / `SMILE`) can exhibit weak reconstruction sidelobes flanking dominant carbonyl peaks along a single `(H, N)` strip. Sidelobe pruning removes low-amplitude satellite candidates (`rel_amp < 0.18` of the dominant `C'` peak on the same strip when their offset matches a periodic sidelobe lag or falls outside legitimate intraresidue/preceding carbonyl envelopes) while preserving true $(C'_i, C'_{i-1})$ doublets in `HN(CA)CO`.
+   - **`Gly CB` Bleed-Through Guard (`41.0..46.5 ppm` DSS)**: Glycine has no `CB` atom, but in narrow-dispersion IDP `HNCACB`/`HN(CO)CACB` spectra an adjacent residue's negative `CB` peak or phase-twisted baseline ripple can bleed onto a Glycine strip. When a node carries a strong `CA` inside the diagnostic Glycine window (`41.0..46.5 ppm` DSS after global referencing, optionally corroborated by `Gly` `CAS` or inverted `2D CACO`), weak/inconsistent `CB` bleed-through candidates are attenuated rather than triggering a hard missing-`CB` veto against `GLY` slots.
+   - **Platzer / `ncIDP` C-Terminal `COO-` Shift Prior (`~179 ppm` DSS; Platzer et al., 2014; Tamiola et al., 2010)**: Deprotonation of the C-terminal carboxylate (`pK_a ≈ 3.1–3.6`) shifts the terminal residue's carbonyl $^{13}\text{C}'_{L-1}$ strongly downfield to `~179–181 ppm` DSS (`+4.5` to `+6.0 ppm` downfield of internal peptide carbonyls) via Henderson–Hasselbalch pH titration alongside a diagnostic terminal `15N`/`CA` shift. Encoding this prior directly into $U_{\text{joint}}[s, L-1]$ anchors the C-terminus cleanly across physiological pH.
+   - **Pre-Proline Covalent Shift Corrections (Tamiola et al., 2010)**: Sequence slots immediately preceding Proline (`seq[k+1] == PRO`) apply `ncIDP` pre-Proline offsets ($\Delta\delta_{C'} \approx -1.9\text{ ppm}$, $\Delta\delta_{CA} \approx -1.8\text{ to }-1.95\text{ ppm}$, $\Delta\delta_N \approx +1.65\text{ ppm}$, $\Delta\delta_{CB} \approx -0.35\text{ ppm}$), sharpening placement of `Xaa` nodes upstream of every `ProlineConBridge`.
+
+### 5.4 Joint Pairwise Matrix `P(s -> t)`, 2-Pass Anchor-Lock Propagation & `HN ↔ CON` Cross-Route Reporting
+1. **Unified Sequential Pairwise Matrix $P_{\text{joint}}(s \to t)$**:
+   Combines all directed sequential pathways linking node $s$ at slot $k$ to node $t$ at slot $k+1$ with smooth multiplicity damping $\Psi_{\text{mult}}(s, t)$ (same $C^1$ smoothstep principle as Section 2.3):
+   $$P_{\text{joint}}(s \to t) = w_{C'}\,\ell_{C'}\!\big(C'_i(s), C'_{i-1}(t)\big) + w_{CA}\,\ell_{CA}\!\big(CA_i(s), CA_{i-1}(t)\big) + w_{CB}\,\ell_{CB}\!\big(CB_i(s), CB_{i-1}(t)\big) + w_{NN}\,\ell_{NN}(s \to t) - \Psi_{\text{mult}}(s, t)$$
+   Across a Proline at position $k$:
+   - Upstream amide $s_{k-1}$ (`AmideFused`) links into `ProlineConBridge` $p_k$ via $C'_{k-1}(\text{HN(CA)CO}) \leftrightarrow C'_{k-1}(\text{CON root of } p_k)$, `CANCO` $CA_{k-1}$, and directional `(H)N(CA)CON` $N_{k-1} \leftarrow N_k$.
+   - `ProlineConBridge` $p_k$ links forward into downstream amide $s_{k+1}$ (`AmideFused` or `ProlineConBridge` in `-Pro-Pro-` tracts) via $C'_k(\text{CACO/NCACO}) \leftrightarrow C'_k(\text{HNCO/CON of } s_{k+1})$, `CANCO` $CA_k \leftrightarrow \text{HN(CO)CACB/H(CC)CON } CA_k$, and `(H)N(CA)CON` $N_k$.
+2. **Multi-Seed Ensemble & Conservative 2-Pass Anchor-Lock Propagation**:
+   - **Pass 1**: Multi-seed simulated annealing / evolutionary ensemble maximizes $\sum_k U_{\text{joint}}(x_k, k) + \sum_k P_{\text{joint}}(x_k \to x_{k+1})$ across all fused, Proline-bridge, and `CON`-only nodes using `ncIDP` + Platzer + pre-Proline + calibrated `CAS` unary scores and $P_{\text{joint}}$.
+   - **Conservative Anchor-Lock & Pass 2**: Unequivocal Pass-1 fragments — contiguous runs of $\ge 3$ residues or corroborated `Xaa–Pro–Yaa` bridges passing high replica consensus, strict local Boltzmann competitor margin, and multi-channel sequential support (never noisy isolated singletons) — are conservatively locked, referencing offsets are refined on the locked scaffold, and Pass 2 re-solves the remaining unassigned/ambiguous nodes against the reduced vacant slot pool to resolve crowded `Ser`/`Ala`/`Glu` repeats.
+3. **Calibrated Posterior Confidence & Per-Residue `JointRouteSupport` Provenance**:
+   Each assigned residue reports a calibrated posterior confidence in `[0, 1]` together with an explicit route provenance tag (`JointRouteSupport` in `joint_idp_solver.rs`, surfaced as `JointRouteBadge` in `idp_joint_panel.rs`):
+   - `CrossValidatedHnAndCon` — independently corroborated by both `1H`-detected (`HNCO`/`HNCACB`/`HN(CO)CACB`) and `13C`-detected (`2D CON`/`H(CC)CON`/`CAS`/`(H)N(CA)CON`) routes;
+   - `HnRoute` (`HnOnly`) — assigned via `1H`-detected amide channels without a resolved `2D CON` counterpart;
+   - `ConProBridge` — Proline imino `2D CON` bridge connecting flanking segments across `Pro`;
+   - `ConRouteOnly` (`ConOnly`) — non-Proline residue rescued solely via `13C`-detected `2D CON` in an exchange-broadened or `1H`-overlapped region.
+
+### 5.5 Clean-Room Benchmark Gate & `--engine gpu` Contract (`T23.2`)
+- **Synthetic Pro/Ser-Rich IDP Benchmark Gate (`crates/nmr-core/tests/joint_idp_solver_tests.rs`)**: Evaluates a clean-room synthetic Pro/Ser-rich IDP (`~120–160 aa`, `~15%` `Pro` including `-Xaa-Pro-` and `-Pro-Pro-` motifs, fast-exchanging bleached amides, field-scaled TROSY `±46 Hz / MHz` offset on `BT_HNCACONH`, uniform TMS `-2.7 ppm` `13C` offset, and Platzer C-terminal `COO-`), verifying that `idp-joint` achieves strictly higher overall recall and Proline-bridging accuracy than standalone `HN`-only and `CON`-only solvers while handling empty or hostile inputs with zero `NaN`/panics.
+- **Hard-Error `--engine gpu` Contract**: Consistent with Section 6.1, **`--engine gpu` MUST fail closed with an explicit error (zero silent CPU fallback)** whenever a WebGPU adapter is unavailable, GPU execution fails, or a requested regime/extension runs strictly on CPU `f64` (`idp-joint` in `v0.18.0`, `idp-13c` with `CAS` / `(H)N(CA)CON` / `HN(CA)CONH` / `HNCO->HNCACB`, `paramagnetic`, and `evo-graph`). `--engine auto` dispatches CPU (`f64`) cleanly with an explicit note when GPU kernels do not cover the active extensions.
+
+---
+
+## 6. CLI & Interactive Workbench Contracts (`crates/nmr-cli`, `crates/nmr-gui`)
+
+### 6.1 Command-Line Interface (`ferric`)
 ```text
-# 1. Problem-regime backbone assignment (globular default, 13C-detected IDP, or paramagnetic):
+# 1. Problem-regime backbone assignment (v0.17.3: globular default, 13C-detected IDP, or paramagnetic):
 ferric assign (--seq <SEQ|seq.fasta> | --star <ref.str>) [--peaks <peaks.tsv>] \
   [--regime globular|idp-13c|paramagnetic] [--solver evo-graph|standard] [--engine auto|gpu|cpu] \
+  [--hncacb-polarity auto|cb-negative|cb-positive] [--roots all|hnco] \
+  [--cas cacon:ser=<path> ...] [--cas canco:ala=<path> ...] \
   [--con <path>] [--caco <path>] [--canco <path>] [--cbcacon <path>] [--cccon <path>] [--ncaco <path>] \
+  [--hncacon <path> ...] [--hncaconh <path>] \
   [--metal-ligands CYS42,CYS44,CYS51,HIS54] [--pdb <model.pdb>] [--pcs <pcs.tsv>] \
   [--temp-k 298.15] [--ph 6.5] --out <prefix>
 
 # 2. One-command end-to-end pipeline (supports --regime globular|idp-13c|paramagnetic):
 ferric pipeline (--seq <SEQ|seq.fasta> (--hsqc <path> | --fid <dir> | --con <path> | --peaks <peaks.tsv>) | --star <entry.str>) \
-  [--regime globular|idp-13c|paramagnetic] [--engine auto|gpu|cpu] --out-dir <out/>
+  [--regime globular|idp-13c|paramagnetic] [--hncacb-polarity auto|cb-negative|cb-positive] \
+  [--roots all|hnco] [--cas X=<path> ...] [--hncacon <path> ...] [--hncaconh <path>] \
+  [--engine auto|gpu|cpu] --out-dir <out/>
 
 # 3. Standalone IDP secondary structure propensity (Marsh-inspired SSP + Camilloni-inspired 4-state HMM):
 ferric propensity --shifts <shifts.str|shifts.nef> [--temp-k 298.15] [--ph 6.5] \
@@ -275,10 +352,15 @@ ferric propensity --shifts <shifts.str|shifts.nef> [--temp-k 298.15] [--ph 6.5] 
 ferric report --star|--shifts <shifts.str> [--peaks <peaks.tsv>] [--pdb <model.pdb>] \
   [--idp-propensity|--propensity] [--temp-k 298.15] [--ph 6.5] --out <report.html>
 ```
-- `--regime globular` (default) preserves exact backwards-compatible `1H–15N` triple-resonance behavior (`03-assignment.md`).
-- `--regime idp-13c` accepts pre-picked `TSV` peak lists or volumetric `13C`-detected spectra (`--con`, `--caco`, `--canco`, `--cbcacon`, `--cccon`, `--ncaco` or auto-classified folders via `pick_c13_idp_dataset`) and dispatches `nmr_gpu::idp_gpu::assign_idp_13c_gpu` / `assign_idp_13c_cpu`: **`--engine gpu` fails with an explicit hard error (zero silent CPU fallback)** if no WebGPU adapter is available or GPU execution errors, `--engine auto` (default) attempts WebGPU and falls back to `assign_idp_13c_cpu` with a loud `stderr` warning, and `--engine cpu` runs directly on CPU, writing continuous through-Proline NMR-STAR v3 / NEF v1.1 shifts and confidences (and automatically embedding the `SSP`/`δ2D` track in `ferric pipeline --regime idp-13c`).
-- `--regime paramagnetic` dispatches `assign_paramagnetic_from_peaks` (`--solver standard|evo-graph`) with sequence-motif / `--metal-ligands` / `--pdb` Solomon $r_{\text{M}}^{-6}$ `PRE` bleaching, and when `--pcs <pcs.tsv>` and `--pdb <model.pdb>` are supplied, fits and prints the 5-parameter traceless $\Delta\boldsymbol{\chi}$ tensor ($\Delta\chi_{\text{ax}}$, $\Delta\chi_{\text{rh}}$, `ZYZ` Euler angles, and Cornilescu $Q$-factor).
+- `--regime globular` (default) preserves exact backwards-compatible `1H–15N` triple-resonance behavior (`03-assignment.md`), adding optional `--hncacb-polarity auto|cb-negative|cb-positive` (per-spectrum `HNCACB`/`HN(CO)CACB` sign normalization), `--roots hnco` (`HNCO`-corroborated root gating + `Asn`/`Gln` `NH2` doublet merging), and repeatable `--cas X=path` (routed through CPU `--solver standard`).
+- `--regime idp-13c` accepts pre-picked `TSV` peak lists or volumetric `13C`-detected spectra (`--con`, `--caco`, `--canco`, `--cbcacon`, `--cccon`, `--ncaco`, repeatable `--cas`, `--hncacon`, and optional `--hncaconh`, or auto-classified folders via `pick_c13_idp_dataset`) and dispatches `nmr_gpu::idp_gpu::assign_idp_13c_gpu` / `assign_idp_13c_cpu`:
+  - **`--engine gpu` Hard-Error Contract**: `--engine gpu` fails closed with an explicit hard error (**zero silent CPU fallback**) if no WebGPU adapter is available, if GPU execution errors, or if CPU-only `f64` extensions (`--cas`, `--hncacon`, `--hncaconh`, or `HNCO->HNCACB` intraresidue attachment) are active.
+  - `--engine auto` (default) runs WebGPU for core `CON`/`CACO`/`CANCO`/`CBCACON`/`CCCON`/`NCACO` workloads (falling back to `assign_idp_13c_cpu` with a loud `stderr` warning if WebGPU is unavailable) and routes `CAS`/`N–N`/`HNCO->HNCACB` runs to CPU (`f64`) with a clear diagnostic note.
+  - `--engine cpu` runs directly on multi-threaded CPU (`f64`), writing continuous through-Proline NMR-STAR v3 / NEF v1.1 shifts and confidences (and automatically embedding the `SSP`/`δ2D` track in `ferric pipeline --regime idp-13c`).
+- `--regime paramagnetic` dispatches `assign_paramagnetic_from_peaks` (`--solver standard|evo-graph`, CPU-only; `--engine gpu` returns an explicit hard error) with sequence-motif / `--metal-ligands` / `--pdb` Solomon $r_{\text{M}}^{-6}$ `PRE` bleaching, and when `--pcs <pcs.tsv>` and `--pdb <model.pdb>` are supplied, fits and prints the 5-parameter traceless $\Delta\boldsymbol{\chi}$ tensor ($\Delta\chi_{\text{ax}}$, $\Delta\chi_{\text{rh}}$, `ZYZ` Euler angles, and Cornilescu $Q$-factor).
+- **Upcoming `v0.18.0` Joint `idp-joint` Regime (`RegimeKind::IdpJoint`, Section 5)**: Will wire `nmr-core::joint_idp_solver` into `ferric assign` and `ferric pipeline` (with auto-selection when both `HN` triple-resonance and `2D CON`/`13C`-detected spectra are loaded), preserving the exact same `--engine gpu` fail-closed contract until a parity-verified WGSL kernel exists.
 
-### 5.2 Interactive WebGPU Workbench (`nmr-gui`)
-- **Experiment Selection Matrix & Regime Selector**: Auto-populates problem regime (`Globular`, `IDP (13C-Detected)`, `Paramagnetic`) from `nmr-core::classify` (`2D CON` / `CACO` / `CANCO` pulse programs $\to$ `IDP (13C)`, metal/paramagnetic cues $\to$ `Paramagnetic`) with manual override in the top toolbar and guided workflow stepper.
+### 6.2 Interactive WebGPU Workbench (`nmr-gui`)
+- **Experiment Selection Matrix & Regime Selector**: Auto-populates problem regime (`Globular`, `IDP (13C-Detected)`, `Paramagnetic`, and in `v0.18.0` `AutoJoint` / `IdpJoint`) from `nmr-core::classify` (`2D CON` / `CACO` / `CANCO` pulse programs $\to$ `IDP (13C)`, combined `HN` + `2D CON` $\to$ `AutoJoint`/`IdpJoint`, metal/paramagnetic cues $\to$ `Paramagnetic`) with manual override in the top toolbar and guided workflow stepper.
 - **2D `CON` Root Map & Continuous Proline Ribbon**: In `idp-13c` mode, renders the `2D CON` `(13C', 15N)` plane (highlighting the `>= 131.5 ppm` `Pro` imino region), walks `3D CANCO` / `CBCACON` / `NCACO` strips uninterrupted through `Pro` tiles on the sequence ribbon, and displays per-residue `(SSP, p_alpha, p_beta, p_ppii, p_coil)` hover/panel readouts; in `paramagnetic` mode, badges `PRE`-bleached coordination loops on the sequence ribbon so analysts immediately distinguish physical blind zones from missing data.
+- **Modular Joint `HN + 13C` IDP Panel (`v0.18.0`, `crates/nmr-gui/src/idp_joint_panel.rs`)**: Exposes `IdpJointPanelState` (`IdpRegimeSelection::{AutoJoint, IdpJoint, Idp13cOnly, Globular}`), interactive `CasSlotEntry` (`Ala`/`Gly`/`Ser`/`Thr`/`Tavi`/`Other` residue sets with explicit `Cacon` `i-1` vs `Canco` `i` direction selector and axis-consistency indicator), `HNCO` root gating / `NH2` filtering and TROSY `1/2 1J_HN` calibration toggles, resolved `X–Pro` bridge and C-terminal `COO-` anchor inspectors, and per-residue `JointRouteBadge` (`CrossValidatedHnAndCon`, `HnOnly`, `ConProBridge`, `ConOnly`) concordance summaries across both native desktop and `wasm32` targets.
