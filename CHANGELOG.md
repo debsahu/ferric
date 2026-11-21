@@ -4,6 +4,22 @@ All notable architectural changes, algorithm milestones, and verified benchmark 
 
 ---
 
+## [0.17.3] — 2026-11-21
+
+### Real-Data IDP Hardening (`RD-1`–`RD-14`), 3D Bruker IPAP/NUS Defaults, Polarity Guards & MCP Destructive-Action Gating
+
+- **Verification & Benchmark Gates**: Verified at `671c3fc` + version bump (`fmt`, `clippy --workspace --all-targets -- -D warnings`, `wasm32-unknown-unknown`, docs/CLI-flags/manual/`package_release`/P17 checks, `0`-byte protected diff on `docs/specs/03-assignment.md` & `.github/workflows/docs.yml`), Ubiquitin 5-seed `--realistic` (`evo-graph` CPU `acc=98.4%, rec=90.8%, HC_prec=98.4% (310/315)`; `standard` CPU `acc=90.0%, rec=72.5%, HC_prec=97.1% (170/175)`; `standard` WebGPU Apple M5 Pro `acc=88.4%, rec=70.2%, HC_prec=95.8% (181/189)`), and `CISD3` (`BMRB 51439`) 5-seed evaluation (`real-benchmark --split dev --seeds 5`: `evo-graph` `acc=64.4%, rec=40.4%, HC_prec=100.0% (59/59)`, `standard` CPU `acc=62.5%, rec=39.2%, HC_prec=92.9% (52/56)`, `standard` GPU `acc=58.8%, rec=36.9%, HC_prec=96.6% (57/59)`; `evo_graph_tests` `pdata/1`: `standard` CPU mean `acc=53.33%`, `evo-graph` mean `acc=55.43%, rec=38.04%, HC_prec=100.00%`). *(Real-data `13C`-detected IDP workflows remain labeled `QC=WARN` with no real-data precision claim.)*
+- **Bruker 3D FID Processing, `BT_HNCACONH` & Classification (`nmr-core::fid, process, classify, spectrum`, `crates/nmr-cli`)**:
+  - Added raw Bruker 3D IPAP virtual decoupling (`1/2 1J(C'CA)`) strictly gated on `is_seq_ipap || iloop_axis.is_some()`, swapped `d10`/`d0` indirect fallback delay indices across 3D axes, and scoped `4 * n_eff` zero-fill strictly to 3D `N–N` and `200`-iter 3D IST strictly to `N–N`/`13C`-detected 3Ds (preserving exact `2x` zero-fill and `40`-iter IST on standard 2D and `1H/15N/13C` 3D cubes).
+  - Gated `PhaseSource::FnMode` indirect `t0` phase prediction strictly on `Bruker && dims >= 3 && idx > 0 && is_nus && DefaultZero && pulprog_p1_deg.is_some()` (preserving blind `AutoChen2002` for 2D NUS and non-Bruker data), fixed `hncocacb`/`cbcaconh` before `hncoca` inference in `infer_3d_experiment_label`, added corrupt `procNs` `SF`/`OFFSET` rebuild from `acquNs` + `procNs` valid axis display (e.g. `proc3s` `F1`), fixed swapped 2D/3D `13C`-detected UCSF index ordering, and flagged shifted/mismatched `13C` windows via `check_axis_shift_window` (`overlap < 0.5 * min_width || center_outside`).
+- **IDP Polarity, Referencing & `13C`-Detected `CON`-Rooted Assignment (`nmr-core::spinsystems, solver, qc, c13_detected, idp_solver`, `crates/nmr-cli`)**:
+  - Hardened automatic `HNCACB` and `CBCA(CO)NH` polarity detection (`--hncacb-polarity auto|cb-negative|cb-positive`) with `>= 25%` minority count/ratio guards and pure `Ala CB (14.5..=22.5)` / `Thr CB (65.5..=72.5 ppm)` bands (excluding `60..65 ppm` `Val/Ile/Thr CA` bleed), plus atomic zeroing of refused `13C` offsets, `HNCO`-corroborated `--roots hnco` + `NH2` merging, and `idp-13c` extensions (`--cas`, `--cccon`, `--hncacon`, `--hncaconh` reciprocal `N–N`, `HNCO->HNCACB`) with explicit fail-closed `Err` on `--engine gpu` (`--engine auto` falls back to CPU with loud warning).
+- **MCP Security, Destructive-Action Gating, Hungarian Remap & Release Packaging (`crates/nmr-gui`, `scripts/package_release.py`, `.github/workflows/release.yml`, `crates/nmr-cli/build.rs`)**:
+  - Removed automatic `$HOME`/`cwd` root fallbacks in `mcp_bridge.rs` (moving CWD fallback behind opt-in `allow_cwd_fallback` while refusing `$HOME` and all ancestors), added nested/dangling symlink containment on `load_study_folder`, documented IPv4 loopback-only `Host` (`[::1]` rejected), and gated all non-undoable / workspace-replacing MCP actions (`ResetWorkspace`, `LoadUbiquitinDemo`, `LoadSessionNef`, `LoadPathOrSpectrum`, `ReSimulateSyntheticNoise`, `ProcessAllRawFids`, `ReconstructNusIstFista`, `load_study_folder`, and state-replacing `set_sequence`) behind `destructive` metadata, GUI `allow_destructive_actions`, and explicit `confirm: true`.
+  - Replaced greedy spin-system remapping on peak edits with connected-component Hungarian bipartite matching + exact-tie ambiguity refusal, fixed `package_release.py` Python 3.9 compatibility & Linux GUI `Recommends` (`mesa-vulkan-drivers`, `libegl1`/`mesa-libEGL`, `libwayland-egl1`) + `.deb` `copyright`/`LICENSE`, and wired `FERRIC_GIT_HASH` for AlmaLinux 9 / RPM verification.
+
+---
+
 ## [0.17.2] — 2026-11-20
 
 ### Native OS Clipboard, Auto-SNR Classical Peak Picking, Async 3D Ingest & Full-Control MCP Live Workbench Bridge

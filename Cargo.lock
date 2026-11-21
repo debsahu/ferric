@@ -1323,7 +1323,7 @@ dependencies = [
 
 [[package]]
 name = "nmr-cli"
-version = "0.17.2"
+version = "0.17.3"
 dependencies = [
  "nmr-core",
  "nmr-gpu",
@@ -1333,7 +1333,7 @@ dependencies = [
 
 [[package]]
 name = "nmr-core"
-version = "0.17.2"
+version = "0.17.3"
 dependencies = [
  "serde",
  "serde_json",
@@ -1341,7 +1341,7 @@ dependencies = [
 
 [[package]]
 name = "nmr-gpu"
-version = "0.17.2"
+version = "0.17.3"
 dependencies = [
  "bytemuck",
  "nmr-core",
@@ -1351,7 +1351,7 @@ dependencies = [
 
 [[package]]
 name = "nmr-gui"
-version = "0.17.2"
+version = "0.17.3"
 dependencies = [
  "bytemuck",
  "eframe",
