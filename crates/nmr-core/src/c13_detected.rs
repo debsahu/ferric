@@ -22,11 +22,14 @@
 
 use std::collections::{BTreeMap, VecDeque};
 use std::f64::consts::{LN_2, PI};
+use std::fmt;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
 use crate::nmrstar::Reference;
 use crate::picker::{estimate_noise_mad, pick_hsqc_2d, PickerConfig};
+use crate::priors::one_to_three;
 use crate::rng::Rng;
 use crate::spectrum::{AxisPpm, Spectrum2D, Spectrum3D};
 
@@ -2597,5 +2600,584 @@ pub fn simulate_h1_exchange_vs_c13_con(
         picked_con_roots: con_peaks.len(),
         con_bond_recovery_frac: (matched_con as f64) / denom,
         per_residue_kex_s_inv: per_residue_kex,
+    }
+}
+
+// ============================================================================
+// Amino-Acid-Selective (CAS) 2D (C', N) Evidence & Parsers (RD-4 / RD-10)
+// ============================================================================
+
+/// Default elliptical `13C'` match tolerance (ppm) between CAS `(C'_{i-1}, N_i)` peaks and roots (`RD-4`).
+pub const CAS_MATCH_TOL_C_PRIME_PPM: f64 = 0.06;
+/// Default elliptical `15N` match tolerance (ppm) between CAS `(C'_{i-1}, N_i)` peaks and roots (`RD-4`).
+pub const CAS_MATCH_TOL_N15_PPM: f64 = 0.20;
+/// Default log-likelihood magnitude (nats) added on a `(C', N)` CAS hit (`RD-4`).
+pub const CAS_LOG_LIKELIHOOD_NATS: f64 = 3.0;
+
+/// Coherence-transfer direction of a `2D` amino-acid-selective `(C'(i-1), N(i))` subspectrum (`RD-4`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CasMode {
+    /// `CACON_X` (`c_cacon_X`): peak at `(C'(i-1), N(i))` types preceding residue `i - 1` as `X`.
+    Cacon,
+    /// `CANCO_X` (`c_canco_X`): peak at `(C'(i-1), N(i))` types current residue `i` as `X`.
+    Canco,
+}
+
+impl CasMode {
+    #[inline]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Cacon => "cacon",
+            Self::Canco => "canco",
+        }
+    }
+}
+
+impl fmt::Display for CasMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// One picked peak in an amino-acid-selective `2D CACON` or `2D CANCO` `(C'(i-1), N(i))` spectrum.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CasPeak {
+    pub c_prime_ppm: f64,
+    pub n_ppm: f64,
+    pub height: f64,
+    pub volume: f64,
+}
+
+/// Parsed amino-acid-selective (`CAS`) subspectrum constraining either `i-1` (`Cacon`) or `i` (`Canco`).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CasSpectrum {
+    pub name: String,
+    pub mode: CasMode,
+    /// Canonical 3-letter residue codes (`"SER"`, `"ALA"`, `"THR"`, ...).
+    pub residues: Vec<String>,
+    pub peaks: Vec<CasPeak>,
+}
+
+impl CasSpectrum {
+    #[inline]
+    pub fn matches_residue(&self, res3: &str) -> bool {
+        self.residues.iter().any(|r| r.eq_ignore_ascii_case(res3))
+    }
+}
+
+fn single_three_letter_residue(tok: &str) -> Option<&'static str> {
+    match tok.trim().to_ascii_uppercase().as_str() {
+        "ALA" => Some("ALA"),
+        "ARG" => Some("ARG"),
+        "ASN" => Some("ASN"),
+        "ASP" => Some("ASP"),
+        "CYS" => Some("CYS"),
+        "GLN" => Some("GLN"),
+        "GLU" => Some("GLU"),
+        "GLY" => Some("GLY"),
+        "HIS" => Some("HIS"),
+        "ILE" => Some("ILE"),
+        "LEU" => Some("LEU"),
+        "LYS" => Some("LYS"),
+        "MET" => Some("MET"),
+        "PHE" => Some("PHE"),
+        "PRO" => Some("PRO"),
+        "SER" => Some("SER"),
+        "THR" => Some("THR"),
+        "TRP" => Some("TRP"),
+        "TYR" => Some("TYR"),
+        "VAL" => Some("VAL"),
+        _ => None,
+    }
+}
+
+/// Parse a residue selector token (`ser`, `ala`, `gly`, `thr`, `tavi`, `T,A,V,I`, `thr+ala`)
+/// into deduplicated canonical 3-letter BMRB residue names (`RD-4`).
+pub fn parse_cas_residue_set(token: &str) -> Result<Vec<String>, String> {
+    let raw = token.trim();
+    if raw.is_empty() {
+        return Err("empty --cas residue selector".to_string());
+    }
+    let mut out: Vec<String> = Vec::new();
+    let mut push_res = |r: &str| {
+        if !out.iter().any(|x| x == r) {
+            out.push(r.to_string());
+        }
+    };
+
+    for part in raw
+        .split([',', '+', '/'])
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        let up = part.to_ascii_uppercase();
+        if let Some(res3) = single_three_letter_residue(&up) {
+            push_res(res3);
+            continue;
+        }
+        match up.as_str() {
+            "TAVI" => {
+                for r in ["THR", "ALA", "VAL", "ILE"] {
+                    push_res(r);
+                }
+                continue;
+            }
+            "ASX" | "DN" => {
+                for r in ["ASP", "ASN"] {
+                    push_res(r);
+                }
+                continue;
+            }
+            "GLX" | "EQ" => {
+                for r in ["GLU", "GLN"] {
+                    push_res(r);
+                }
+                continue;
+            }
+            "ILV" => {
+                for r in ["ILE", "LEU", "VAL"] {
+                    push_res(r);
+                }
+                continue;
+            }
+            _ => {}
+        }
+        if part.len() <= 8 && part.chars().all(|c| c.is_ascii_alphabetic()) {
+            let mut decoded = Vec::with_capacity(part.len());
+            let mut all_valid = true;
+            for ch in part.chars() {
+                let res3 = one_to_three(ch);
+                if res3 == "UNK" {
+                    all_valid = false;
+                    break;
+                }
+                decoded.push(res3);
+            }
+            if all_valid && !decoded.is_empty() {
+                for r in decoded {
+                    push_res(r);
+                }
+                continue;
+            }
+        }
+        return Err(format!(
+            "unknown --cas residue selector {part:?} (expected e.g. ser, ala, gly, thr, tavi, or 1/3-letter AA codes)"
+        ));
+    }
+
+    if out.is_empty() {
+        return Err(format!("no valid residues in --cas selector {token:?}"));
+    }
+    Ok(out)
+}
+
+/// Infer `CasMode` (`cacon` = `i-1` vs `canco` = `i`) from an experiment label or filename hint.
+pub fn infer_cas_mode_from_hint(path: Option<&Path>, text_hint: Option<&str>) -> Option<CasMode> {
+    let check_str = |s: &str| -> Option<CasMode> {
+        let low = s.to_ascii_lowercase();
+        let has_cacon = low.contains("cacon");
+        let has_canco = low.contains("canco");
+        match (has_cacon, has_canco) {
+            (true, false) => Some(CasMode::Cacon),
+            (false, true) => Some(CasMode::Canco),
+            _ => None,
+        }
+    };
+    if let Some(txt) = text_hint {
+        if let Some(m) = check_str(txt) {
+            return Some(m);
+        }
+    }
+    if let Some(p) = path {
+        if let Some(fname) = p.file_name().and_then(|s| s.to_str()) {
+            if let Some(m) = check_str(fname) {
+                return Some(m);
+            }
+        }
+        if let Some(m) = check_str(&p.to_string_lossy()) {
+            return Some(m);
+        }
+    }
+    None
+}
+
+/// Parse CLI `--cas X=path` specification, accepting forms like `ser=path`, `cacon_ser=path`,
+/// `canco_ala=path`, `cacon:ser=path`, `canco:tavi=path`, or `ser:canco=path`.
+pub fn parse_cas_cli_spec(
+    spec: &str,
+) -> Result<(Option<CasMode>, String, Vec<String>, PathBuf), String> {
+    let Some((lhs_raw, rhs_raw)) = spec.split_once('=') else {
+        return Err(format!(
+            "invalid --cas {spec:?} (expected --cas X=path, e.g. ser=cacon_ser.tsv or canco_ala=ala.tsv)"
+        ));
+    };
+    let lhs = lhs_raw.trim();
+    let rhs = rhs_raw.trim();
+    if lhs.is_empty() || rhs.is_empty() {
+        return Err(format!("invalid --cas {spec:?} (empty selector or path)"));
+    }
+
+    let (mode, res_tok) = if let Some((a, b)) = lhs.split_once(':') {
+        let a_low = a.trim().to_ascii_lowercase();
+        let b_low = b.trim().to_ascii_lowercase();
+        if a_low == "cacon" {
+            (Some(CasMode::Cacon), b.trim().to_string())
+        } else if a_low == "canco" {
+            (Some(CasMode::Canco), b.trim().to_string())
+        } else if b_low == "cacon" {
+            (Some(CasMode::Cacon), a.trim().to_string())
+        } else if b_low == "canco" {
+            (Some(CasMode::Canco), a.trim().to_string())
+        } else {
+            return Err(format!(
+                "invalid --cas mode in {lhs:?} (expected cacon or canco)"
+            ));
+        }
+    } else {
+        let low = lhs.to_ascii_lowercase();
+        if let Some(rest) = low
+            .strip_prefix("cacon_")
+            .or_else(|| low.strip_prefix("cacon-"))
+        {
+            (Some(CasMode::Cacon), rest.to_string())
+        } else if let Some(rest) = low
+            .strip_prefix("canco_")
+            .or_else(|| low.strip_prefix("canco-"))
+        {
+            (Some(CasMode::Canco), rest.to_string())
+        } else if let Some(rest) = low
+            .strip_suffix("_cacon")
+            .or_else(|| low.strip_suffix("-cacon"))
+        {
+            (Some(CasMode::Cacon), rest.to_string())
+        } else if let Some(rest) = low
+            .strip_suffix("_canco")
+            .or_else(|| low.strip_suffix("-canco"))
+        {
+            (Some(CasMode::Canco), rest.to_string())
+        } else {
+            (None, lhs.to_string())
+        }
+    };
+
+    let residues = parse_cas_residue_set(&res_tok)?;
+    let path = PathBuf::from(rhs);
+    let label = res_tok.to_ascii_lowercase();
+    Ok((mode, label, residues, path))
+}
+
+/// Parse a `CAS` `(C'(i-1), N(i))` TSV/whitespace peak table, tolerating optional `exp` / `H` columns
+/// and automatically inferring `(C', N)` column order from disjoint `160–190` vs `95–148` ppm ranges.
+pub fn parse_cas_peaks_str(
+    txt: &str,
+    path_hint: Option<&Path>,
+    mode_hint: Option<CasMode>,
+) -> Result<(CasMode, Vec<CasPeak>), String> {
+    let mut inferred_mode: Option<CasMode> = mode_hint;
+    if inferred_mode.is_none() {
+        inferred_mode = infer_cas_mode_from_hint(path_hint, None);
+    }
+
+    let mut header_cols: Option<Vec<String>> = None;
+    let mut peaks: Vec<CasPeak> = Vec::new();
+
+    for raw_line in txt.lines() {
+        let trimmed = raw_line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if trimmed.starts_with('#') || trimmed.starts_with('!') {
+            if inferred_mode.is_none() {
+                inferred_mode = infer_cas_mode_from_hint(None, Some(trimmed));
+            }
+            continue;
+        }
+
+        let cols: Vec<&str> = trimmed
+            .split(['\t', ','])
+            .flat_map(|s| s.split_whitespace())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if cols.is_empty() {
+            continue;
+        }
+
+        let is_header_row = header_cols.is_none()
+            && cols.iter().all(|c| c.parse::<f64>().is_err())
+            && cols.iter().any(|c| {
+                let lc = c.to_ascii_lowercase();
+                matches!(
+                    lc.as_str(),
+                    "c" | "c_prime"
+                        | "c_prev"
+                        | "c13"
+                        | "n"
+                        | "n15"
+                        | "n_curr"
+                        | "w1"
+                        | "w2"
+                        | "f1"
+                        | "f2"
+                        | "exp"
+                        | "experiment"
+                        | "height"
+                        | "intensity"
+                )
+            });
+        if is_header_row {
+            header_cols = Some(cols.iter().map(|c| c.to_ascii_lowercase()).collect());
+            continue;
+        }
+
+        // Scan leading experiment token if present
+        let mut start_idx = 0usize;
+        if cols[0].parse::<f64>().is_err() && cols.len() >= 3 {
+            if inferred_mode.is_none() {
+                inferred_mode = infer_cas_mode_from_hint(None, Some(cols[0]));
+            }
+            start_idx = 1;
+        }
+
+        let mut c_opt: Option<f64> = None;
+        let mut n_opt: Option<f64> = None;
+        let mut height_opt: Option<f64> = None;
+        let mut volume_opt: Option<f64> = None;
+
+        if let Some(ref hdr) = header_cols {
+            for (idx, tok) in cols.iter().enumerate() {
+                let Some(hname) = hdr.get(idx).map(String::as_str) else {
+                    continue;
+                };
+                if hname == "exp" || hname == "experiment" {
+                    if inferred_mode.is_none() {
+                        inferred_mode = infer_cas_mode_from_hint(None, Some(tok));
+                    }
+                    continue;
+                }
+                let Ok(val) = tok.parse::<f64>() else {
+                    continue;
+                };
+                if !val.is_finite() {
+                    continue;
+                }
+                match hname {
+                    "c" | "c_prime" | "c_prev" | "c13" | "c13p" | "co" | "ca_co" => {
+                        c_opt = Some(val);
+                    }
+                    "n" | "n15" | "n_curr" => {
+                        n_opt = Some(val);
+                    }
+                    "w1" | "w2" | "w3" | "f1" | "f2" | "f3" => {
+                        if (155.0..=195.0).contains(&val) {
+                            c_opt = Some(val);
+                        } else if (90.0..=152.0).contains(&val) {
+                            n_opt = Some(val);
+                        }
+                    }
+                    "height" | "intensity" | "amp" | "data_height" => {
+                        height_opt = Some(val.abs());
+                    }
+                    "volume" | "vol" => {
+                        volume_opt = Some(val.abs());
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        if c_opt.is_none() || n_opt.is_none() {
+            let mut numeric = Vec::new();
+            for tok in &cols[start_idx..] {
+                if let Ok(v) = tok.parse::<f64>() {
+                    if v.is_finite() {
+                        numeric.push(v);
+                    }
+                }
+            }
+            for &v in &numeric {
+                if c_opt.is_none() && (155.0..=195.0).contains(&v) {
+                    c_opt = Some(v);
+                } else if n_opt.is_none() && (90.0..=152.0).contains(&v) {
+                    n_opt = Some(v);
+                }
+            }
+            // Trailing height/volume columns after shift coordinates
+            if height_opt.is_none() && numeric.len() >= 3 {
+                if let Some(&cand_h) = numeric.last() {
+                    if cand_h.abs() > 1.0 && (c_opt != Some(cand_h)) && (n_opt != Some(cand_h)) {
+                        height_opt = Some(cand_h.abs());
+                    }
+                }
+            }
+        }
+
+        if let (Some(cp), Some(np)) = (c_opt, n_opt) {
+            let h = height_opt.unwrap_or(1.0e5);
+            let v = volume_opt.unwrap_or(h);
+            peaks.push(CasPeak {
+                c_prime_ppm: cp,
+                n_ppm: np,
+                height: h,
+                volume: v,
+            });
+        }
+    }
+
+    if peaks.is_empty() {
+        let loc = path_hint
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "<memory>".to_string());
+        return Err(format!("no valid (C', N) CAS peaks parsed from {loc}"));
+    }
+
+    Ok((inferred_mode.unwrap_or(CasMode::Cacon), peaks))
+}
+
+/// Match CAS `(C'(i-1), N(i))` peaks to `(c_prev, n_curr)` roots within the `(c_tol, n_tol)` ellipse
+/// (default `0.06 ppm 13C'`, `0.20 ppm 15N`), with bounded median drift recentering if `>= 5` peaks
+/// exhibit a clean uniform `(<= 0.12 ppm C', <= 0.40 ppm N)` inter-spectrum shift (`RD-4`).
+pub fn match_cas_peaks_to_roots(
+    cas: &CasSpectrum,
+    roots: &[(f64, f64)],
+    c_tol_ppm: f64,
+    n_tol_ppm: f64,
+) -> Vec<bool> {
+    let mut hits = vec![false; roots.len()];
+    if cas.peaks.is_empty() || roots.is_empty() {
+        return hits;
+    }
+    let ct = c_tol_ppm.max(1e-4);
+    let nt = n_tol_ppm.max(1e-4);
+
+    let mark_with_shift = |dc: f64, dn: f64| -> (Vec<bool>, usize) {
+        let mut h = vec![false; roots.len()];
+        let mut matched_pks = 0usize;
+        for p in &cas.peaks {
+            let cp = p.c_prime_ppm - dc;
+            let np = p.n_ppm - dn;
+            let mut any_p = false;
+            for (r_idx, &(rc, rn)) in roots.iter().enumerate() {
+                let d2 = ((cp - rc) / ct).powi(2) + ((np - rn) / nt).powi(2);
+                if d2 <= 1.0 {
+                    h[r_idx] = true;
+                    any_p = true;
+                }
+            }
+            if any_p {
+                matched_pks += 1;
+            }
+        }
+        (h, matched_pks)
+    };
+
+    let (direct_hits, direct_pks) = mark_with_shift(0.0, 0.0);
+    if direct_pks * 2 >= cas.peaks.len() || cas.peaks.len() < 5 || roots.len() < 5 {
+        return direct_hits;
+    }
+
+    // Bounded median drift check when direct match covered < 50% of CAS peaks
+    let mut dcs = Vec::new();
+    let mut dns = Vec::new();
+    for p in &cas.peaks {
+        let mut best: Option<(f64, f64, f64)> = None;
+        for &(rc, rn) in roots {
+            let dc = p.c_prime_ppm - rc;
+            let dn = p.n_ppm - rn;
+            if dc.abs() <= 0.14 && dn.abs() <= 0.45 {
+                let d2 = (dc / ct).powi(2) + (dn / nt).powi(2);
+                if best.is_none_or(|b| d2 < b.0) {
+                    best = Some((d2, dc, dn));
+                }
+            }
+        }
+        if let Some((_, dc, dn)) = best {
+            dcs.push(dc);
+            dns.push(dn);
+        }
+    }
+    if dcs.len() >= 5 {
+        dcs.sort_by(|a, b| a.total_cmp(b));
+        dns.sort_by(|a, b| a.total_cmp(b));
+        let med_dc = dcs[dcs.len() / 2];
+        let med_dn = dns[dns.len() / 2];
+        if med_dc.abs() <= 0.12 && med_dn.abs() <= 0.40 {
+            let (shifted_hits, shifted_pks) = mark_with_shift(med_dc, med_dn);
+            if shifted_pks >= direct_pks + 2 {
+                hits = shifted_hits;
+                return hits;
+            }
+        }
+    }
+    direct_hits
+}
+
+/// Evaluate the per-residue log-likelihood evidence (nats) contributed by one `CAS` subspectrum
+/// at a root `(matched = true|false)` for candidate residue `target_res` (`RD-4`).
+#[inline]
+pub fn cas_llr_adjustment(
+    cas: &CasSpectrum,
+    matched: bool,
+    target_res: &str,
+    match_llr: f64,
+    seq_type_count: usize,
+    n_root_hits: usize,
+) -> f64 {
+    let in_type = cas.matches_residue(target_res);
+    if matched {
+        if in_type {
+            match_llr
+        } else {
+            -match_llr
+        }
+    } else if in_type && seq_type_count > 0 && n_root_hits > 0 {
+        let cov = ((n_root_hits as f64) / (seq_type_count as f64)).clamp(0.05, 0.90);
+        ((1.0 - 0.65 * cov) / 0.95).ln().clamp(-1.0, 0.0)
+    } else {
+        0.0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_rd4_cas_cli_spec_and_peak_matching() {
+        let (mode_opt, lbl, res, path) =
+            parse_cas_cli_spec("cacon_tavi=picks/c_cacon_tavi.tsv").unwrap();
+        assert_eq!(mode_opt, Some(CasMode::Cacon));
+        assert_eq!(lbl, "tavi");
+        assert_eq!(res, vec!["THR", "ALA", "VAL", "ILE"]);
+        assert_eq!(path, PathBuf::from("picks/c_cacon_tavi.tsv"));
+
+        let (mode2, _, res2, _) = parse_cas_cli_spec("canco:ser=my_ser.tsv").unwrap();
+        assert_eq!(mode2, Some(CasMode::Canco));
+        assert_eq!(res2, vec!["SER"]);
+
+        let tsv = "exp\tc_prime\tn15\theight\nCAS_CANCO_SER\t175.40\t116.20\t5000\nCAS_CANCO_SER\t177.10\t122.80\t4500\n";
+        let (p_mode, pks) = parse_cas_peaks_str(tsv, None, None).unwrap();
+        assert_eq!(p_mode, CasMode::Canco);
+        assert_eq!(pks.len(), 2);
+
+        let cas = CasSpectrum {
+            name: "canco_ser".to_string(),
+            mode: p_mode,
+            residues: res2,
+            peaks: pks,
+        };
+        let roots = vec![
+            (175.43, 116.25), // within (0.06, 0.20) ellipse -> match
+            (177.22, 122.80), // outside 0.06 ppm C' -> no match
+        ];
+        assert_eq!(
+            match_cas_peaks_to_roots(
+                &cas,
+                &roots,
+                CAS_MATCH_TOL_C_PRIME_PPM,
+                CAS_MATCH_TOL_N15_PPM
+            ),
+            vec![true, false]
+        );
     }
 }

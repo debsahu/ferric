@@ -34,9 +34,11 @@ use nmr_core::bayes_sa::{
     solve_bayes_sa_from_peaks, BayesSaConfig, BayesSaReport, LockedAssignment,
 };
 use nmr_core::c13_detected::{
-    pick_caco_2d, pick_con_2d, pick_con_anchored_3d, simulate_idp_13c_cubes, C13DetectedExp,
-    C13PickedDataset, C13PickerConfig, C13Strip3DPeak, Caco2DPeak, CacoPeakKind, Con2DPeak,
-    IdpCubeSimConfig,
+    infer_cas_mode_from_hint, parse_cas_cli_spec, parse_cas_peaks_str, pick_caco_2d, pick_con_2d,
+    pick_con_anchored_3d, simulate_idp_13c_cubes, C13DetectedExp, C13PickedDataset,
+    C13PickerConfig, C13Strip3DPeak, Caco2DPeak, CacoPeakKind, CasMode, CasPeak, CasSpectrum,
+    Con2DPeak, IdpCubeSimConfig, CAS_LOG_LIKELIHOOD_NATS, CAS_MATCH_TOL_C_PRIME_PPM,
+    CAS_MATCH_TOL_N15_PPM,
 };
 use nmr_core::dihedrals::{
     predict_dihedrals, validate_dihedrals_against_torsions, DihedralRestraint,
@@ -48,8 +50,11 @@ use nmr_core::idp_propensity::{
     compute_idp_propensity, format_propensity_json, format_propensity_tsv, PropensityConfig,
 };
 use nmr_core::idp_solver::{
-    assign_idp_13c_cpu, idp_to_reference, register_and_build_con_dipeptide_systems,
-    ConDipeptideSystem, IdpAssignResult, IdpSolverConfig,
+    assign_idp_13c_cpu, attach_hncacon_nn_links, attach_hnco_hncacb_to_con_systems,
+    estimate_idp_reference_offsets, evaluate_idp_auto_reference_safety,
+    extract_reciprocal_hncaconh_pairs, filter_reciprocal_nn_pairs, idp_to_reference,
+    pick_hncacon_nn_coadded, register_and_build_con_dipeptide_systems,
+    summarize_idp_cas_residue_typing, ConDipeptideSystem, IdpAssignResult, IdpSolverConfig,
 };
 use nmr_core::nef::{read_nef_file, write_nef_file, write_nef_str, NefDocument};
 use nmr_core::neural_picker::{
@@ -85,12 +90,12 @@ use nmr_core::paramagnetic::{
 };
 use nmr_core::peaks::{read_peaks, write_peaks, Peak, EXPERIMENT_NAMES};
 use nmr_core::picker::{
-    corroborated_re_pick_3d, pick_c13_hsqc_2d, pick_hsqc_2d, CorroboratedRepickConfig,
-    PickerConfig, StripBank3D,
+    corroborated_re_pick_3d, pick_c13_hsqc_2d, pick_hsqc_2d, pick_triple_3d,
+    CorroboratedRepickConfig, PickerConfig, StripBank3D,
 };
 use nmr_core::priors::{
-    compute_priors, estimate_reference_offsets_detailed, fit_unlabelled_global_offsets_detailed,
-    one_to_three, sync_detailed_reference_offsets, DetailedReferenceOffsets, Priors, ShiftOffsets,
+    compute_priors, fit_unlabelled_global_offsets_detailed, one_to_three,
+    sync_detailed_reference_offsets, DetailedReferenceOffsets, Priors, ShiftOffsets,
 };
 use nmr_core::process::{
     process_fid_2d_mut, process_fid_3d_mut, register_3d_hn_to_hsqc_2d_with_audit,
@@ -115,13 +120,20 @@ use nmr_core::sidechain::{
     synthesize_all_atom_reference, SidechainSimConfig, SidechainSolverConfig,
 };
 use nmr_core::simulate::{render_hsqc_2d, simulate, SimConfig, SpectrumRenderConfig};
-use nmr_core::solver::{assign, prepare_scoring_priors, AnnealConfig, AssignResult, ScoreConfig};
+use nmr_core::solver::{
+    assign, assign_with_cas, evaluate_auto_reference_safety, prepare_scoring_priors,
+    prepare_scoring_priors_checked, AnnealConfig, AssignResult, ScoreConfig,
+};
 use nmr_core::spectrum::{
     is_ucsf_file, read_bruker_pdata_2d, read_bruker_pdata_3d, read_nmrpipe_2d, read_nmrpipe_3d,
     read_ucsf_2d, read_ucsf_3d, write_bruker_pdata_2d, write_bruker_pdata_3d, write_nmrpipe_2d,
     write_nmrpipe_3d, write_ucsf_2d, write_ucsf_3d, Spectrum2D, Spectrum3D,
 };
-use nmr_core::spinsystems::{build_spin_systems, SpinSystem, Tolerances};
+use nmr_core::spinsystems::{
+    build_spin_systems, build_spin_systems_with_options, preprocess_peaks_with_options,
+    DetectedPolarity, HncacbPolarity, RootSelectionMode, SpinSystem, SpinSystemBuildOptions,
+    Tolerances,
+};
 use nmr_core::structure::{
     build_backbone_from_torsions, calculate_structure_iterative,
     calculate_structure_with_rdcs_and_dihedrals, validate_ensemble, write_pdb_ensemble,
@@ -217,7 +229,7 @@ fn usage() -> String {
        ferric fetch-bmrb      --id <bmrb_id> [--dest <dir>] [--dry-run] [--all-archives] [--max-bytes <bytes>]\n\
        ferric process         --in <fid_dir> --out <path_or_dir> [--exp <EXP>] [--recipe <json>] [--crop-h 5.5:11.5] [--no-crop] [--lp] [--auto-phase] [--phase-x P0:P1] [--phase-y P0:P1] [--phase-z P0:P1] [--hilbert] [--nus-method fista|ist]\n\
        ferric e2e-benchmark   [--star data/fixtures/synthetic_ubiquitin.str] [--noise 1.0] [--seed 42]\n\
-       ferric assign          [--peaks <peaks.tsv>] (--seq <SEQ|fasta> | --star <ref.str>) --out <prefix> [--regime globular|idp-13c|paramagnetic] [--af-structure <model.cif|pdb>] [--af-pae <pae.json>] [--noesy-15n <noesy.tsv|nef>] [--af-weight 0.65] [--af-clamp-nats 4.0] [--metal-ligands <SPEC>] [--r-bleach 11.0] [--pdb <model.pdb>] [--pcs <pcs.tsv>] [--temp-k 298.15] [--ph <f64>] [--con <path>] [--caco <path>] [--canco <path>] [--cbcacon <path>] [--cccon <path>] [--ncaco <path>] [--solver evo-graph|standard|bayes-sa] [--engine auto|gpu|cpu] [--runs 16] [--steps 1500] [--assign-cost 0.0] [--no-auto-ref] [--locks <SPEC>] [--json-out <path>] [--nef-out <path>] [--report-out <path>] [--priors priors.json] [-v]\n\
+       ferric assign          [--peaks <peaks.tsv>] (--seq <SEQ|fasta> | --star <ref.str>) --out <prefix> [--regime globular|idp-13c|paramagnetic] [--hncacb-polarity auto|cb-negative|cb-positive] [--roots all|hnco] [--cas X=path ...] [--af-structure <model.cif|pdb>] [--af-pae <pae.json>] [--noesy-15n <noesy.tsv|nef>] [--af-weight 0.65] [--af-clamp-nats 4.0] [--metal-ligands <SPEC>] [--r-bleach 11.0] [--pdb <model.pdb>] [--pcs <pcs.tsv>] [--temp-k 298.15] [--ph <f64>] [--con <path>] [--caco <path>] [--canco <path>] [--cbcacon <path>] [--cccon <path>] [--ncaco <path>] [--hncacon <path> ...] [--hncaconh <path>] [--solver evo-graph|standard|bayes-sa] [--engine auto|gpu|cpu] [--runs 16] [--steps 1500] [--assign-cost 0.0] [--no-auto-ref] [--locks <SPEC>] [--json-out <path>] [--nef-out <path>] [--report-out <path>] [--priors priors.json] [-v]\n\
        ferric propensity      --shifts <assigned.str|assigned.nef> [--temp-k 298.15] [--ph <f64>] [--format tsv|json] [-o <out_path>]\n\
        ferric torsions        --shifts <assigned.str|assigned.nef> -o <out.tsv|out.nef|out.json> [--include-chi1] [--exclude-pdb <ids>] [--exclude-bmrb <ids>] [--exclude-topology <id>]\n\
        ferric af-validate     --structure <model.cif|model.pdb> [--pae <pae.json>] --shifts <assigned.str|assigned.nef> [--s2 <modelfree.tsv>] [--fetch-uniprot <id> --cache-dir <dir>] [--exclude-pdb <ids>] [--exclude-bmrb <ids>] [-o <out.json|out.tsv|report.html>]\n\
@@ -241,7 +253,7 @@ fn usage() -> String {
        ferric nef-import      --in <project.nef> [--out-star <shifts.str>] [--out-peaks <peaks.tsv>]\n\
        ferric nef-export      --star <shifts.str> [--peaks <peaks.tsv>] --out <project.nef> [--name <entry>]\n\
        ferric report          --star|--shifts <shifts.str|shifts.nef> [--peaks <peaks.tsv>] [--pdb <ensemble.pdb>] [--rdc <rdcs.tsv|rdcs.nef>] [--idp-propensity] [--temp-k 298.15] [--ph <f64>] --out <report.html> [--title <name>]\n\
-       ferric pipeline        (--seq <SEQ|fasta> (--hsqc <path> [--triple EXP=path ...] | --fid-hsqc <dir> [--fid-triple EXP=dir ...] | --fid <dir> | --peaks <peaks.tsv>) | --star <entry.str> | --nef <project.nef>) --out-dir <dir> [--regime globular|idp-13c|paramagnetic] [--metal-ligands <SPEC>] [--pdb <model.pdb>] [--pcs <pcs.tsv>] [--temp-k 298.15] [--ph <f64>] [--idp-propensity] [--recipe <json>] [--no-crop] [--lp] [--auto-phase] [--solver evo-graph|standard|bayes-sa] [--no-auto-ref] [--locks <SPEC>] [--method classical|neural] [--engine auto|gpu|cpu] [--fold] [--pdb-ref <ref.pdb>]\n\
+       ferric pipeline        (--seq <SEQ|fasta> (--hsqc <path> [--triple EXP=path ...] | --fid-hsqc <dir> [--fid-triple EXP=dir ...] | --fid <dir> | --peaks <peaks.tsv>) | --star <entry.str> | --nef <project.nef>) --out-dir <dir> [--regime globular|idp-13c|paramagnetic] [--hncacb-polarity auto|cb-negative|cb-positive] [--roots all|hnco] [--cas X=path ...] [--hncacon <path> ...] [--hncaconh <path>] [--metal-ligands <SPEC>] [--pdb <model.pdb>] [--pcs <pcs.tsv>] [--temp-k 298.15] [--ph <f64>] [--idp-propensity] [--recipe <json>] [--no-crop] [--lp] [--auto-phase] [--solver evo-graph|standard|bayes-sa] [--no-auto-ref] [--locks <SPEC>] [--method classical|neural] [--engine auto|gpu|cpu] [--fold] [--pdb-ref <ref.pdb>]\n\
        ferric serve           [--bind 127.0.0.1:8080] [--storage ./jobs]\n\
        ferric mcp             [--transport stdio|http] [--root <dir> ...] [--mode read-only|read-write] [--bind 127.0.0.1:<port>] [--token <bearer>]\n\
        ferric mcp-config      --client antigravity|claude-desktop|cursor [--root <dir> ...] [--mode read-only|read-write] [--bridge-port <port>] [-o <out.json>]\n\
@@ -613,6 +625,184 @@ pub(crate) fn execute_assignment_workflow(
     )
 }
 
+#[derive(Clone, Debug, Default)]
+pub(crate) struct GlobularCliOptions {
+    pub(crate) polarity: HncacbPolarity,
+    pub(crate) root_mode: RootSelectionMode,
+    pub(crate) cas_spectra: Vec<CasSpectrum>,
+}
+
+fn load_cas_spectrum_from_cli(spec: &str, snr: f32) -> Result<CasSpectrum, String> {
+    let (mode_opt, res_label, residues, path) = parse_cas_cli_spec(spec)?;
+    let (mode, peaks) = if is_probable_peak_tsv(&path) {
+        let txt = fs::read_to_string(&path)
+            .map_err(|e| format!("failed to read CAS file {}: {e}", path.display()))?;
+        parse_cas_peaks_str(&txt, Some(&path), mode_opt)?
+    } else {
+        let spec2 = load_2d_spectrum_any(&path)?;
+        let pcfg = C13PickerConfig {
+            snr_2d: snr.max(3.0),
+            ..C13PickerConfig::default()
+        };
+        let picked = pick_con_2d(&spec2, &pcfg);
+        let cas_pks: Vec<CasPeak> = picked
+            .into_iter()
+            .map(|p| CasPeak {
+                c_prime_ppm: p.c_prev_ppm,
+                n_ppm: p.n_curr_ppm,
+                height: p.height,
+                volume: p.volume,
+            })
+            .collect();
+        let mode = mode_opt
+            .or_else(|| infer_cas_mode_from_hint(Some(&path), None))
+            .unwrap_or(CasMode::Cacon);
+        (mode, cas_pks)
+    };
+    let name = format!("{}_{}", mode.as_str(), res_label);
+    Ok(CasSpectrum {
+        name,
+        mode,
+        residues,
+        peaks,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn execute_assignment_workflow_with_cli_options(
+    solver: SolverKind,
+    engine_opt: Option<EngineKind>,
+    raw_peaks: &[Peak],
+    sequence: &[String],
+    priors: &Priors,
+    score_cfg: &ScoreConfig,
+    tol_overrides: ToleranceOverrides,
+    cli_opts: &GlobularCliOptions,
+    runs_opt: Option<usize>,
+    steps_opt: Option<usize>,
+    default_cpu_runs: usize,
+    seed: u64,
+    shared_gpu: Option<&GpuEngine>,
+    shared_bayes_gpu: Option<&BayesSaGpuSolver>,
+) -> Result<SolverWorkflowOutput, String> {
+    let mut tol = Tolerances::default();
+    tol_overrides.apply_to(&mut tol);
+    let build_opts = SpinSystemBuildOptions {
+        polarity: cli_opts.polarity,
+        root_mode: cli_opts.root_mode,
+        merge_nh2: cli_opts.root_mode == RootSelectionMode::Hnco,
+    };
+    let prep = preprocess_peaks_with_options(raw_peaks, &tol, build_opts)?;
+    if let Some(ref h_pol) = prep.polarity.hncacb {
+        if h_pol.signs_inverted {
+            eprintln!("[polarity] {}", h_pol.summary);
+        }
+    }
+    if let Some(ref c_pol) = prep.polarity.cbcaconh {
+        if c_pol.signs_inverted {
+            eprintln!("[polarity] {}", c_pol.summary);
+        }
+    }
+    if cli_opts.root_mode == RootSelectionMode::Hnco
+        && (prep.n_roots_dropped_hnco > 0 || prep.n_nh2_pairs_merged > 0)
+    {
+        eprintln!(
+            "[roots] --roots hnco kept {}/{} HSQC roots (dropped {} without 3D/HNCO support, merged {} NH2 pairs)",
+            prep.peaks.iter().filter(|p| p.exp == "HSQC").count(),
+            prep.n_raw_roots,
+            prep.n_roots_dropped_hnco,
+            prep.n_nh2_pairs_merged
+        );
+    }
+
+    let mut wf = if !cli_opts.cas_spectra.is_empty() && solver == SolverKind::Standard {
+        let rep = build_spin_systems_with_options(raw_peaks, &tol, 3, false, build_opts)?;
+        let systems = rep.systems;
+        let (effective_priors, offsets, detailed_offsets, _safety) =
+            prepare_scoring_priors_checked(&systems, sequence, priors, score_cfg);
+        let default_runs = default_cpu_runs;
+        let anneal_cfg = AnnealConfig {
+            runs: runs_opt.unwrap_or(default_runs),
+            steps_per_system: steps_opt.unwrap_or(1500),
+            seed,
+            ..AnnealConfig::default()
+        };
+        let mut result = assign_with_cas(
+            &systems,
+            sequence,
+            priors,
+            score_cfg,
+            &anneal_cfg,
+            &cli_opts.cas_spectra,
+            CAS_MATCH_TOL_C_PRIME_PPM,
+            CAS_MATCH_TOL_N15_PPM,
+            CAS_LOG_LIKELIHOOD_NATS,
+        );
+        let engine_label = "CPU (f64, CAS-guided)".to_string();
+        let mut qc_report = evaluate_dataset_qc(
+            Some(&prep.peaks),
+            &systems,
+            sequence,
+            priors,
+            score_cfg,
+            &result,
+            Some(&detailed_offsets),
+        );
+        if anneal_cfg.runs != STANDARD_CPU_CALIBRATED_RUNS {
+            qc_report.mark_uncalibrated_runs(
+                &engine_label,
+                anneal_cfg.runs,
+                STANDARD_CPU_CALIBRATED_RUNS,
+            );
+        }
+        apply_dataset_qc_to_assignments(&mut result, &qc_report);
+        qc_report.already_applied = true;
+        SolverWorkflowOutput {
+            solver,
+            systems,
+            kept_hsqc_indices: Some(rep.kept_hsqc_indices),
+            result,
+            effective_priors,
+            offsets,
+            detailed_offsets,
+            qc_report,
+            engine_label,
+            replicas: anneal_cfg.runs,
+            steps_per_system: anneal_cfg.steps_per_system,
+            bayes_report: None,
+        }
+    } else {
+        execute_assignment_workflow_with_options(
+            solver,
+            engine_opt,
+            &prep.peaks,
+            sequence,
+            priors,
+            score_cfg,
+            tol_overrides,
+            runs_opt,
+            steps_opt,
+            default_cpu_runs,
+            seed,
+            shared_gpu,
+            shared_bayes_gpu,
+        )?
+    };
+
+    if let Some(ref h_pol) = prep.polarity.hncacb {
+        wf.qc_report.hncacb_polarity = Some(h_pol.detected.as_str().to_string());
+    }
+    if let Some(ref c_pol) = prep.polarity.cbcaconh {
+        wf.qc_report.cbcaconh_polarity = Some(c_pol.detected.as_str().to_string());
+    }
+    if let Some(hint) = evaluate_auto_reference_safety(&wf.detailed_offsets).tms_reference_hint {
+        if !wf.qc_report.reference_hints.contains(&hint) {
+            wf.qc_report.reference_hints.push(hint);
+        }
+    }
+    Ok(wf)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn execute_assignment_workflow_with_options(
     solver: SolverKind,
@@ -636,9 +826,8 @@ pub(crate) fn execute_assignment_workflow_with_options(
             let mut tol = Tolerances::default();
             tol_overrides.apply_to(&mut tol);
             let systems = build_spin_systems(peaks, &tol, 3, false)?;
-            let base_detailed = estimate_reference_offsets_detailed(&systems, sequence, priors);
-            let (effective_priors, offsets) =
-                prepare_scoring_priors(&systems, sequence, priors, score_cfg);
+            let (effective_priors, offsets, base_detailed, _safety) =
+                prepare_scoring_priors_checked(&systems, sequence, priors, score_cfg);
             let detailed_offsets = sync_detailed_reference_offsets(&offsets, &base_detailed);
             let fit_runs = if engine == EngineKind::Gpu {
                 STANDARD_GPU_CALIBRATED_RUNS
@@ -913,6 +1102,20 @@ fn format_star_offset_header(
     if let Some(ref cw) = qc_report.calibration_warning {
         parts.push(format!("calibration_warning={cw}"));
     }
+    if let Some(ref pol) = qc_report.hncacb_polarity {
+        parts.push(format!("hncacb_polarity={pol}"));
+    }
+    if let Some(ref cpol) = qc_report.cbcaconh_polarity {
+        if cpol != "single-sign" {
+            parts.push(format!("cbcaconh_polarity={cpol}"));
+        }
+    }
+    if !qc_report.reference_hints.is_empty() {
+        parts.push(format!(
+            "reference_hints={}",
+            qc_report.reference_hints.join("; ")
+        ));
+    }
     if !qc_report.reasons.is_empty() {
         parts.push(format!("qc_notes={}", qc_report.reasons.join("; ")));
     }
@@ -1033,6 +1236,22 @@ fn render_assign_workflow_json(
         None => "null".to_string(),
     };
 
+    let pol_json = match &wf.qc_report.hncacb_polarity {
+        Some(p) => format!("\"{}\"", real_benchmark::json_escape(p)),
+        None => "null".to_string(),
+    };
+    let cpol_json = match &wf.qc_report.cbcaconh_polarity {
+        Some(p) => format!("\"{}\"", real_benchmark::json_escape(p)),
+        None => "null".to_string(),
+    };
+    let hints_json = wf
+        .qc_report
+        .reference_hints
+        .iter()
+        .map(|h| format!("\"{}\"", real_benchmark::json_escape(h)))
+        .collect::<Vec<_>>()
+        .join(", ");
+
     Ok(format!(
         "{{\n\
          \x20 \"version\": \"{}\",\n\
@@ -1043,6 +1262,9 @@ fn render_assign_workflow_json(
          \x20 \"n_spin_systems\": {},\n\
          \x20 \"n_assigned_residues\": {},\n\
          \x20 \"n_high_confidence\": {},\n\
+         \x20 \"hncacb_polarity\": {pol_json},\n\
+         \x20 \"cbcaconh_polarity\": {cpol_json},\n\
+         \x20 \"reference_hints\": [{hints_json}],\n\
          \x20 \"applied_offsets\": {{ \"h\": {:.6}, \"n\": {:.6}, \"ca\": {:.6}, \"cb\": {:.6}, \"c\": {:.6} }},\n\
          \x20 \"detailed_offsets\": {detailed_json},\n\
          \x20 \"qc_report\": {qc_json},\n\
@@ -1088,6 +1310,14 @@ fn log_workflow_diagnostics(
             "[{solver_label}] prior reference offsets (experimental - DSS prior; output kept in experimental ppm): {} (applied: {offsets})",
             detailed_offsets.format_compact()
         );
+    }
+    if let Some(ref pol) = qc_report.hncacb_polarity {
+        if pol == DetectedPolarity::CbPositive.as_str() || verbose {
+            eprintln!("[{solver_label}] HNCACB polarity: {pol}");
+        }
+    }
+    for hint in &qc_report.reference_hints {
+        eprintln!("[{solver_label}] hint: {hint}");
     }
     if qc_report.verdict != DatasetQcVerdict::Pass || verbose {
         let reasons = if qc_report.reasons.is_empty() {
@@ -2057,6 +2287,248 @@ fn load_c13_input_bundle(
     Ok(ds)
 }
 
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Idp13CInputExtras {
+    pub(crate) ds: C13PickedDataset,
+    pub(crate) hnco_peaks: Vec<Peak>,
+    pub(crate) hncacb_peaks: Vec<Peak>,
+    pub(crate) nn_prev_links: Vec<Vec<(f64, f64)>>,
+    pub(crate) reciprocal_nn_pairs: Vec<(f64, f64)>,
+    pub(crate) cas_spectra: Vec<CasSpectrum>,
+    pub(crate) hncacb_polarity: HncacbPolarity,
+}
+
+fn parse_hncacon_tsv_links(
+    path: &Path,
+    con_roots: &[Con2DPeak],
+) -> Result<Vec<Vec<(f64, f64)>>, String> {
+    let txt = fs::read_to_string(path)
+        .map_err(|e| format!("failed to read HNCACON file {}: {e}", path.display()))?;
+    let mut out = vec![Vec::new(); con_roots.len()];
+    for raw_line in txt.lines() {
+        let trimmed = raw_line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let cols: Vec<&str> = trimmed
+            .split(['\t', ','])
+            .flat_map(|s| s.split_whitespace())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if cols.is_empty() {
+            continue;
+        }
+        let nums: Vec<f64> = cols
+            .iter()
+            .filter_map(|t| t.parse::<f64>().ok().filter(|v| v.is_finite()))
+            .collect();
+        if nums.len() < 3 {
+            continue;
+        }
+        let (c_prime, n_curr, n_partner) = (nums[0], nums[1], nums[2]);
+        let snr_v = nums.get(3).copied().unwrap_or(8.0).abs().max(4.0);
+        if (n_partner - n_curr).abs() <= 0.35 {
+            continue;
+        }
+        let mut best: Option<(usize, f64)> = None;
+        for (idx, r) in con_roots.iter().enumerate() {
+            let dc = (c_prime - r.c_prev_ppm).abs();
+            let dn = (n_curr - r.n_curr_ppm).abs();
+            if dc <= 0.08 && dn <= 0.30 {
+                let d2 = (dc / 0.05).powi(2) + (dn / 0.20).powi(2);
+                if best.is_none_or(|b| d2 < b.1) {
+                    best = Some((idx, d2));
+                }
+            }
+        }
+        if let Some((r_idx, _)) = best {
+            out[r_idx].push((n_partner, snr_v));
+        }
+    }
+    Ok(out)
+}
+
+fn parse_hncaconh_tsv_pairs(path: &Path) -> Result<Vec<(f64, f64)>, String> {
+    let txt = fs::read_to_string(path)
+        .map_err(|e| format!("failed to read HNCACONH file {}: {e}", path.display()))?;
+    let mut raw = Vec::new();
+    for raw_line in txt.lines() {
+        let trimmed = raw_line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let nums: Vec<f64> = trimmed
+            .split(['\t', ','])
+            .flat_map(|s| s.split_whitespace())
+            .filter_map(|t| t.parse::<f64>().ok().filter(|v| v.is_finite()))
+            .collect();
+        if nums.len() >= 2 {
+            let ns: Vec<f64> = nums
+                .into_iter()
+                .filter(|v| (90.0..=150.0).contains(v))
+                .collect();
+            if ns.len() >= 2 && (ns[0] - ns[1]).abs() > 0.4 {
+                raw.push((ns[0], ns[1]));
+            }
+        }
+    }
+    Ok(filter_reciprocal_nn_pairs(&raw, 0.35))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn load_c13_input_bundle_with_extras(
+    peaks_paths: &[PathBuf],
+    con_path: Option<&Path>,
+    caco_path: Option<&Path>,
+    canco_path: Option<&Path>,
+    cbcacon_path: Option<&Path>,
+    cccon_path: Option<&Path>,
+    ncaco_path: Option<&Path>,
+    triples: &[(String, PathBuf)],
+    hncacon_cli_paths: &[PathBuf],
+    hncaconh_cli_paths: &[PathBuf],
+    cas_specs: &[String],
+    hncacb_polarity: HncacbPolarity,
+    snr: f32,
+) -> Result<Idp13CInputExtras, String> {
+    let mut c13_triples: Vec<(String, PathBuf)> = Vec::new();
+    let mut hncacon_paths: Vec<PathBuf> = hncacon_cli_paths.to_vec();
+    let mut hncaconh_paths: Vec<PathBuf> = hncaconh_cli_paths.to_vec();
+    let mut hnco_paths: Vec<PathBuf> = Vec::new();
+    let mut hncacb_paths: Vec<PathBuf> = Vec::new();
+
+    for (exp_raw, path) in triples {
+        let norm: String = exp_raw
+            .trim()
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric())
+            .map(|c| c.to_ascii_uppercase())
+            .collect();
+        match norm.as_str() {
+            "HNCACON" | "NCACON" | "HACANCACON" => hncacon_paths.push(path.clone()),
+            "HNCACONH" | "BTHNCACONH" => hncaconh_paths.push(path.clone()),
+            "HNCO" => hnco_paths.push(path.clone()),
+            "HNCACB" => hncacb_paths.push(path.clone()),
+            _ => c13_triples.push((exp_raw.clone(), path.clone())),
+        }
+    }
+
+    let ds = load_c13_input_bundle(
+        peaks_paths,
+        con_path,
+        caco_path,
+        canco_path,
+        cbcacon_path,
+        cccon_path,
+        ncaco_path,
+        &c13_triples,
+        snr,
+    )?;
+
+    let mut cas_spectra = Vec::with_capacity(cas_specs.len());
+    for spec in cas_specs {
+        cas_spectra.push(load_cas_spectrum_from_cli(spec, snr)?);
+    }
+
+    let mut hnco_peaks = Vec::new();
+    for hp in &hnco_paths {
+        if is_probable_peak_tsv(hp) {
+            for mut p in read_peaks(hp)? {
+                if p.exp.is_empty() || p.exp == "HSQC" {
+                    p.exp = "HNCO".to_string();
+                }
+                if p.exp == "HNCO" {
+                    hnco_peaks.push(p);
+                }
+            }
+        } else {
+            let sp3 = load_3d_spectrum_any(hp, "HNCO")?;
+            let pcfg = PickerConfig {
+                snr_threshold: snr,
+                ..PickerConfig::default()
+            };
+            for mut p in pick_triple_3d(&sp3, &[], &pcfg) {
+                p.exp = "HNCO".to_string();
+                hnco_peaks.push(p);
+            }
+        }
+    }
+
+    let mut hncacb_peaks = Vec::new();
+    for cp in &hncacb_paths {
+        if is_probable_peak_tsv(cp) {
+            for mut p in read_peaks(cp)? {
+                if p.exp.is_empty() {
+                    p.exp = "HNCACB".to_string();
+                }
+                if p.exp == "HNCACB" {
+                    hncacb_peaks.push(p);
+                }
+            }
+        } else {
+            let sp3 = load_3d_spectrum_any(cp, "HNCACB")?;
+            let pcfg = PickerConfig {
+                snr_threshold: snr,
+                ..PickerConfig::default()
+            };
+            let hnco_roots: Vec<Peak> = hnco_peaks.iter().map(|p| Peak::hsqc(p.h, p.n)).collect();
+            for mut p in pick_triple_3d(&sp3, &hnco_roots, &pcfg) {
+                p.exp = "HNCACB".to_string();
+                hncacb_peaks.push(p);
+            }
+        }
+    }
+
+    let mut nn_prev_links = vec![Vec::new(); ds.con_roots.len()];
+    let mut hncacon_cubes: Vec<Spectrum3D> = Vec::new();
+    for np in &hncacon_paths {
+        if is_probable_peak_tsv(np) {
+            let parsed = parse_hncacon_tsv_links(np, &ds.con_roots)?;
+            for (slot, items) in nn_prev_links.iter_mut().zip(parsed) {
+                slot.extend(items);
+            }
+        } else {
+            hncacon_cubes.push(load_3d_spectrum_any(np, "HNCACON")?);
+        }
+    }
+    if !hncacon_cubes.is_empty() {
+        let cube_refs: Vec<&Spectrum3D> = hncacon_cubes.iter().collect();
+        let coadded = pick_hncacon_nn_coadded(&cube_refs, &ds.con_roots, (snr as f64).max(3.5));
+        for (slot, items) in nn_prev_links.iter_mut().zip(coadded) {
+            slot.extend(items);
+        }
+    }
+    for slot in &mut nn_prev_links {
+        slot.sort_by(|a, b| b.1.total_cmp(&a.1));
+        slot.truncate(3);
+    }
+
+    let mut reciprocal_nn_pairs: Vec<(f64, f64)> = Vec::new();
+    let amide_roots: Vec<(f64, f64)> = hnco_peaks.iter().map(|p| (p.h, p.n)).collect();
+    for bp in &hncaconh_paths {
+        if is_probable_peak_tsv(bp) {
+            reciprocal_nn_pairs.extend(parse_hncaconh_tsv_pairs(bp)?);
+        } else if !amide_roots.is_empty() {
+            let sp3 = load_3d_spectrum_any(bp, "HNCACONH")?;
+            reciprocal_nn_pairs.extend(extract_reciprocal_hncaconh_pairs(
+                &sp3,
+                &amide_roots,
+                (snr as f64).max(4.0),
+            ));
+        }
+    }
+
+    Ok(Idp13CInputExtras {
+        ds,
+        hnco_peaks,
+        hncacb_peaks,
+        nn_prev_links,
+        reciprocal_nn_pairs,
+        cas_spectra,
+        hncacb_polarity,
+    })
+}
+
 pub(crate) struct IdpWorkflowOutput {
     pub(crate) systems: Vec<ConDipeptideSystem>,
     pub(crate) result: IdpAssignResult,
@@ -2067,8 +2539,8 @@ pub(crate) struct IdpWorkflowOutput {
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn execute_idp_13c_workflow(
-    dataset: &C13PickedDataset,
+pub(crate) fn execute_idp_13c_workflow_with_extras(
+    bundle: &Idp13CInputExtras,
     sequence: &[String],
     seq_ids: &[i32],
     engine_req: EngineRequest,
@@ -2091,10 +2563,37 @@ pub(crate) fn execute_idp_13c_workflow(
         }
     }
 
-    let systems = register_and_build_con_dipeptide_systems(dataset);
+    let mut systems = register_and_build_con_dipeptide_systems(&bundle.ds);
     if systems.is_empty() {
         return Err(
             "no CON dipeptide spin systems could be built from 13C-detected input".to_string(),
+        );
+    }
+
+    if bundle.nn_prev_links.len() == systems.len()
+        && bundle.nn_prev_links.iter().any(|v| !v.is_empty())
+    {
+        attach_hncacon_nn_links(&mut systems, &bundle.nn_prev_links);
+    }
+    if !bundle.hnco_peaks.is_empty() && !bundle.hncacb_peaks.is_empty() {
+        let hnco_stats = attach_hnco_hncacb_to_con_systems(
+            &mut systems,
+            &bundle.hnco_peaks,
+            &bundle.hncacb_peaks,
+            bundle.hncacb_polarity,
+        );
+        if let Some(ref pol) = hnco_stats.hncacb_polarity {
+            if let Some(ref hp) = pol.hncacb {
+                if hp.signs_inverted {
+                    eprintln!("[idp-13c polarity] {}", hp.summary);
+                }
+            }
+        }
+        eprintln!(
+            "[idp-13c HNCO->HNCACB] matched {}/{} CON roots to HNCO; attached intraresidue CA(i)/CB(i) on {} roots",
+            hnco_stats.n_con_roots_matched_hnco,
+            systems.len(),
+            hnco_stats.n_roots_with_hncacb_curr
         );
     }
 
@@ -2102,6 +2601,8 @@ pub(crate) fn execute_idp_13c_workflow(
         temperature_k: temp_k,
         ph: ph_opt.unwrap_or(6.5),
         seed,
+        cas_spectra: bundle.cas_spectra.clone(),
+        reciprocal_nn_pairs: bundle.reciprocal_nn_pairs.clone(),
         ..IdpSolverConfig::default()
     };
     if let Some(r) = runs {
@@ -2111,7 +2612,51 @@ pub(crate) fn execute_idp_13c_workflow(
         idp_cfg.steps_per_system = st.max(200);
     }
 
+    let raw_off = estimate_idp_reference_offsets(&systems, sequence, &idp_cfg);
+    let safety = evaluate_idp_auto_reference_safety(&systems, &raw_off);
+    if !bundle.cas_spectra.is_empty() {
+        let cas_rep = summarize_idp_cas_residue_typing(
+            &systems,
+            &bundle.cas_spectra,
+            &idp_cfg,
+            &safety.safe_offsets,
+        );
+        eprintln!(
+            "[idp-13c CAS] roots={} | cacon_hits={:?} canco_hits={:?} | typed_prev(Ala={},Gly={},Ser={}) typed_curr(Ala={},Gly={},Ser={})",
+            cas_rep.n_con_roots,
+            cas_rep.cacon_hit_counts,
+            cas_rep.canco_hit_counts,
+            cas_rep.roots_typed_prev.get("ALA").copied().unwrap_or(0),
+            cas_rep.roots_typed_prev.get("GLY").copied().unwrap_or(0),
+            cas_rep.roots_typed_prev.get("SER").copied().unwrap_or(0),
+            cas_rep.roots_typed_curr.get("ALA").copied().unwrap_or(0),
+            cas_rep.roots_typed_curr.get("GLY").copied().unwrap_or(0),
+            cas_rep.roots_typed_curr.get("SER").copied().unwrap_or(0),
+        );
+    }
+    if let Some(ref hint) = safety.tms_reference_hint {
+        eprintln!("[idp-13c] hint: {hint}");
+    }
+    for w in &safety.warnings {
+        eprintln!("[idp-13c] Warning: {w}");
+    }
+
+    let requires_cpu_extensions = !idp_cfg.cas_spectra.is_empty()
+        || !idp_cfg.reciprocal_nn_pairs.is_empty()
+        || systems
+            .iter()
+            .any(|s| !s.cb_curr.is_empty() || !s.nn_prev_cands.is_empty());
+
     let (result, engine_label) = match engine_req {
+        EngineRequest::Gpu if requires_cpu_extensions => {
+            eprintln!(
+                "Note: CAS / (H)N(CA)CON / HNCO->HNCACB features run on the CPU (f64) IDP solver."
+            );
+            (
+                assign_idp_13c_cpu(&systems, sequence, &idp_cfg),
+                "idp-13c CPU (f64, CAS/NN-guided)".to_string(),
+            )
+        }
         EngineRequest::Gpu => {
             let gpu = GpuEngine::new_headless()?;
             let label = format!(
@@ -2121,6 +2666,10 @@ pub(crate) fn execute_idp_13c_workflow(
             let res = nmr_gpu::idp_gpu::assign_idp_13c_gpu(&gpu, &systems, sequence, &idp_cfg)?;
             (res, label)
         }
+        EngineRequest::Auto if requires_cpu_extensions => (
+            assign_idp_13c_cpu(&systems, sequence, &idp_cfg),
+            "idp-13c CPU (f64, CAS/NN-guided)".to_string(),
+        ),
         EngineRequest::Auto => match GpuEngine::new_headless() {
             Ok(gpu) => {
                 let label = format!(
@@ -2764,6 +3313,11 @@ fn cmd_assign(args: &[String]) -> Result<(), String> {
     let mut cccon_path: Option<PathBuf> = None;
     let mut ncaco_path: Option<PathBuf> = None;
     let mut c13_triples: Vec<(String, PathBuf)> = Vec::new();
+    let mut hncacon_paths: Vec<PathBuf> = Vec::new();
+    let mut hncaconh_paths: Vec<PathBuf> = Vec::new();
+    let mut cas_specs: Vec<String> = Vec::new();
+    let mut hncacb_polarity = HncacbPolarity::Auto;
+    let mut root_mode = RootSelectionMode::All;
     let mut snr = 5.0f32;
     let mut solver = SolverKind::EvoGraph;
     let mut solver_explicit = false;
@@ -2882,6 +3436,29 @@ fn cmd_assign(args: &[String]) -> Result<(), String> {
             "--ncaco" => {
                 i += 1;
                 ncaco_path = Some(PathBuf::from(args.get(i).ok_or("missing --ncaco")?));
+            }
+            "--hncacon" => {
+                i += 1;
+                hncacon_paths.push(PathBuf::from(args.get(i).ok_or("missing --hncacon")?));
+            }
+            "--hncaconh" => {
+                i += 1;
+                hncaconh_paths.push(PathBuf::from(args.get(i).ok_or("missing --hncaconh")?));
+            }
+            "--cas" => {
+                i += 1;
+                cas_specs.push(args.get(i).ok_or("missing X=path for --cas")?.clone());
+            }
+            "--hncacb-polarity" => {
+                i += 1;
+                hncacb_polarity = HncacbPolarity::parse(
+                    args.get(i).ok_or("missing value for --hncacb-polarity")?,
+                )?;
+            }
+            "--roots" => {
+                i += 1;
+                root_mode =
+                    RootSelectionMode::parse(args.get(i).ok_or("missing value for --roots")?)?;
             }
             "--triple" => {
                 i += 1;
@@ -3030,10 +3607,12 @@ fn cmd_assign(args: &[String]) -> Result<(), String> {
             || cbcacon_path.is_some()
             || cccon_path.is_some()
             || ncaco_path.is_some()
+            || !hncacon_paths.is_empty()
+            || !hncaconh_paths.is_empty()
             || !c13_triples.is_empty();
         if has_c13_spectra {
             return Err(
-                "13C-detected spectrum flags (--con, --caco, --canco, --cbcacon, --cccon, --ncaco, --triple) are only supported with --regime idp-13c"
+                "13C-detected spectrum flags (--con, --caco, --canco, --cbcacon, --cccon, --ncaco, --hncacon, --hncaconh, --triple) are only supported with --regime idp-13c"
                     .to_string(),
             );
         }
@@ -3086,7 +3665,7 @@ fn cmd_assign(args: &[String]) -> Result<(), String> {
 
     match regime {
         RegimeKind::Idp13C => {
-            let ds = load_c13_input_bundle(
+            let bundle = load_c13_input_bundle_with_extras(
                 &peaks_paths,
                 con_path.as_deref(),
                 caco_path.as_deref(),
@@ -3095,11 +3674,15 @@ fn cmd_assign(args: &[String]) -> Result<(), String> {
                 cccon_path.as_deref(),
                 ncaco_path.as_deref(),
                 &c13_triples,
+                &hncacon_paths,
+                &hncaconh_paths,
+                &cas_specs,
+                hncacb_polarity,
                 snr,
             )?;
             let engine_req = engine_req_opt.unwrap_or(EngineRequest::Auto);
-            let wf = execute_idp_13c_workflow(
-                &ds, &sequence, &seq_ids, engine_req, temp_k, ph_opt, runs, steps, seed,
+            let wf = execute_idp_13c_workflow_with_extras(
+                &bundle, &sequence, &seq_ids, engine_req, temp_k, ph_opt, runs, steps, seed,
             )?;
             write_star_with_header(&str_out, &wf.pred, Some(&wf.conf), Some(&wf.star_header))?;
             write_shifts_tsv(&tsv_out, &wf.pred, &wf.conf)?;
@@ -3226,13 +3809,46 @@ fn cmd_assign(args: &[String]) -> Result<(), String> {
                 Some(EngineRequest::Gpu) => Some(EngineKind::Gpu),
                 Some(EngineRequest::Cpu) => Some(EngineKind::Cpu),
             };
+            let mut cas_spectra = Vec::with_capacity(cas_specs.len());
+            for spec in &cas_specs {
+                cas_spectra.push(load_cas_spectrum_from_cli(spec, snr)?);
+            }
+            let mut active_solver = solver;
+            if !cas_spectra.is_empty() && active_solver != SolverKind::Standard {
+                if solver_explicit {
+                    return Err(
+                        "--cas in globular mode requires --solver standard (or omit --solver)"
+                            .to_string(),
+                    );
+                }
+                eprintln!(
+                    "[CAS] routing globular --cas assignment through CAS-aware CPU standard solver"
+                );
+                active_solver = SolverKind::Standard;
+            }
+            let cli_opts = GlobularCliOptions {
+                polarity: hncacb_polarity,
+                root_mode,
+                cas_spectra,
+            };
             let t_solve = Instant::now();
             let (wf, af_meta_opt) = if af_opts.is_enabled() {
-                let (wf_af, meta_af) = af_assign_cmd::execute_af_assisted_assignment_workflow(
-                    &af_opts,
-                    solver,
-                    engine_opt,
+                let mut tol = Tolerances::default();
+                tol_overrides.apply_to(&mut tol);
+                let prep = preprocess_peaks_with_options(
                     &peaks,
+                    &tol,
+                    SpinSystemBuildOptions {
+                        polarity: hncacb_polarity,
+                        root_mode,
+                        merge_nh2: root_mode == RootSelectionMode::Hnco,
+                    },
+                )?;
+                let (mut wf_af, meta_af) = af_assign_cmd::execute_af_assisted_assignment_workflow(
+                    &af_opts,
+                    active_solver,
+                    engine_opt,
+                    &prep.peaks,
                     &sequence,
                     &seq_ids,
                     &pri,
@@ -3243,16 +3859,23 @@ fn cmd_assign(args: &[String]) -> Result<(), String> {
                     STANDARD_CPU_CALIBRATED_RUNS,
                     seed,
                 )?;
+                if let Some(ref h_pol) = prep.polarity.hncacb {
+                    wf_af.qc_report.hncacb_polarity = Some(h_pol.detected.as_str().to_string());
+                }
+                if let Some(ref c_pol) = prep.polarity.cbcaconh {
+                    wf_af.qc_report.cbcaconh_polarity = Some(c_pol.detected.as_str().to_string());
+                }
                 (wf_af, Some(meta_af))
             } else {
-                let wf_std = execute_assignment_workflow_with_options(
-                    solver,
+                let wf_std = execute_assignment_workflow_with_cli_options(
+                    active_solver,
                     engine_opt,
                     &peaks,
                     &sequence,
                     &pri,
                     &score_cfg,
                     tol_overrides,
+                    &cli_opts,
                     runs,
                     steps,
                     STANDARD_CPU_CALIBRATED_RUNS,
@@ -6368,6 +6991,11 @@ fn cmd_pipeline(args: &[String]) -> Result<(), String> {
     let mut cbcacon_path: Option<PathBuf> = None;
     let mut cccon_path: Option<PathBuf> = None;
     let mut ncaco_path: Option<PathBuf> = None;
+    let mut hncacon_paths: Vec<PathBuf> = Vec::new();
+    let mut hncaconh_paths: Vec<PathBuf> = Vec::new();
+    let mut cas_specs: Vec<String> = Vec::new();
+    let mut hncacb_polarity = HncacbPolarity::Auto;
+    let mut root_mode = RootSelectionMode::All;
     let mut regime = RegimeKind::Globular;
     let mut metal_ligands_spec: Option<String> = None;
     let mut r_bleach_opt: Option<f64> = None;
@@ -6488,6 +7116,29 @@ fn cmd_pipeline(args: &[String]) -> Result<(), String> {
             "--ncaco" => {
                 i += 1;
                 ncaco_path = Some(PathBuf::from(args.get(i).ok_or("missing --ncaco")?));
+            }
+            "--hncacon" => {
+                i += 1;
+                hncacon_paths.push(PathBuf::from(args.get(i).ok_or("missing --hncacon")?));
+            }
+            "--hncaconh" => {
+                i += 1;
+                hncaconh_paths.push(PathBuf::from(args.get(i).ok_or("missing --hncaconh")?));
+            }
+            "--cas" => {
+                i += 1;
+                cas_specs.push(args.get(i).ok_or("missing X=path for --cas")?.clone());
+            }
+            "--hncacb-polarity" => {
+                i += 1;
+                hncacb_polarity = HncacbPolarity::parse(
+                    args.get(i).ok_or("missing value for --hncacb-polarity")?,
+                )?;
+            }
+            "--roots" => {
+                i += 1;
+                root_mode =
+                    RootSelectionMode::parse(args.get(i).ok_or("missing value for --roots")?)?;
             }
             "--hsqc" => {
                 i += 1;
@@ -6704,12 +7355,14 @@ fn cmd_pipeline(args: &[String]) -> Result<(), String> {
             || cbcacon_path.is_some()
             || cccon_path.is_some()
             || ncaco_path.is_some()
+            || !hncacon_paths.is_empty()
+            || !hncaconh_paths.is_empty()
             || triples
                 .iter()
                 .any(|(exp, _)| C13DetectedExp::from_name(exp).is_some());
         if has_c13_flag {
             return Err(
-                "13C-detected spectrum flags (--con, --caco, --canco, --cbcacon, --cccon, --ncaco) are only supported with --regime idp-13c"
+                "13C-detected spectrum flags (--con, --caco, --canco, --cbcacon, --cccon, --ncaco, --hncacon, --hncaconh) are only supported with --regime idp-13c"
                     .to_string(),
             );
         }
@@ -6804,11 +7457,13 @@ fn cmd_pipeline(args: &[String]) -> Result<(), String> {
             || cbcacon_path.is_some()
             || cccon_path.is_some()
             || ncaco_path.is_some()
+            || !hncacon_paths.is_empty()
+            || !hncaconh_paths.is_empty()
             || !triples.is_empty();
 
-        let ds = if has_explicit_c13 {
+        let bundle = if has_explicit_c13 {
             let pp_vec: Vec<PathBuf> = peaks_path.into_iter().collect();
-            load_c13_input_bundle(
+            load_c13_input_bundle_with_extras(
                 &pp_vec,
                 con_path.as_deref(),
                 caco_path.as_deref(),
@@ -6817,6 +7472,10 @@ fn cmd_pipeline(args: &[String]) -> Result<(), String> {
                 cccon_path.as_deref(),
                 ncaco_path.as_deref(),
                 &triples,
+                &hncacon_paths,
+                &hncaconh_paths,
+                &cas_specs,
+                hncacb_polarity,
                 snr,
             )?
         } else if let Some(ref r) = star_ref_opt {
@@ -6838,10 +7497,19 @@ fn cmd_pipeline(args: &[String]) -> Result<(), String> {
             for (exp, ref sp3) in &cubes.cubes_3d {
                 strip_peaks.extend(pick_con_anchored_3d(sp3, *exp, &con_roots, &pcfg));
             }
-            C13PickedDataset {
-                con_roots,
-                caco_peaks,
-                strip_peaks,
+            let mut cas_spectra = Vec::with_capacity(cas_specs.len());
+            for spec in &cas_specs {
+                cas_spectra.push(load_cas_spectrum_from_cli(spec, snr)?);
+            }
+            Idp13CInputExtras {
+                ds: C13PickedDataset {
+                    con_roots,
+                    caco_peaks,
+                    strip_peaks,
+                },
+                cas_spectra,
+                hncacb_polarity,
+                ..Idp13CInputExtras::default()
             }
         } else {
             return Err(
@@ -6849,10 +7517,11 @@ fn cmd_pipeline(args: &[String]) -> Result<(), String> {
                     .to_string(),
             );
         };
+        let ds = bundle.ds.clone();
 
         let t_solve = Instant::now();
-        let wf = execute_idp_13c_workflow(
-            &ds,
+        let wf = execute_idp_13c_workflow_with_extras(
+            &bundle,
             &sequence,
             &seq_ids,
             engine_req_opt.unwrap_or(EngineRequest::Auto),
@@ -7212,14 +7881,37 @@ fn cmd_pipeline(args: &[String]) -> Result<(), String> {
         let rlbl = elbl.clone();
         (pr, cf, sys, res, elbl, rlbl, dt, Some(hdr), None)
     } else {
-        let mut wf = execute_assignment_workflow_with_options(
-            solver,
+        let mut cas_spectra = Vec::with_capacity(cas_specs.len());
+        for spec in &cas_specs {
+            cas_spectra.push(load_cas_spectrum_from_cli(spec, snr)?);
+        }
+        let mut active_solver = solver;
+        if !cas_spectra.is_empty() && active_solver != SolverKind::Standard {
+            if solver_explicit {
+                return Err(
+                    "--cas in globular mode requires --solver standard (or omit --solver)"
+                        .to_string(),
+                );
+            }
+            eprintln!(
+                "[CAS] routing globular --cas pipeline through CAS-aware CPU standard solver"
+            );
+            active_solver = SolverKind::Standard;
+        }
+        let cli_opts = GlobularCliOptions {
+            polarity: hncacb_polarity,
+            root_mode,
+            cas_spectra,
+        };
+        let mut wf = execute_assignment_workflow_with_cli_options(
+            active_solver,
             engine_opt,
             &peaks,
             &base_ref.sequence,
             &pri,
             &scfg,
             tol_overrides,
+            &cli_opts,
             runs,
             steps,
             STANDARD_CPU_CALIBRATED_RUNS,
@@ -7292,10 +7984,28 @@ fn cmd_pipeline(args: &[String]) -> Result<(), String> {
     write_star_with_header(&star_out, &pred_ref, Some(&conf), star_hdr.as_deref())?;
     write_shifts_tsv(&tsv_out, &pred_ref, &conf)?;
     if let Some(ref qcr) = qc_opt {
-        let _ = fs::write(
-            &qc_out,
-            format!("{}\n", real_benchmark::render_qc_report_json(qcr, 0)),
-        );
+        let mut base_json = real_benchmark::render_qc_report_json(qcr, 0);
+        if let Some(end_brace) = base_json.rfind('}') {
+            let pol_json = match &qcr.hncacb_polarity {
+                Some(p) => format!("\"{}\"", real_benchmark::json_escape(p)),
+                None => "null".to_string(),
+            };
+            let cpol_json = match &qcr.cbcaconh_polarity {
+                Some(p) => format!("\"{}\"", real_benchmark::json_escape(p)),
+                None => "null".to_string(),
+            };
+            let hints_json = qcr
+                .reference_hints
+                .iter()
+                .map(|h| format!("\"{}\"", real_benchmark::json_escape(h)))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let head = base_json[..end_brace].trim_end();
+            base_json = format!(
+                "{head},\n  \"hncacb_polarity\": {pol_json},\n  \"cbcaconh_polarity\": {cpol_json},\n  \"reference_hints\": [{hints_json}]\n}}"
+            );
+        }
+        let _ = fs::write(&qc_out, format!("{base_json}\n"));
     }
     let nef_doc =
         NefDocument::from_reference_and_peaks(&project_name, &pred_ref, Some(&conf), &peaks);
@@ -9612,6 +10322,88 @@ seq#\tresidue\tH\tN\tC\tCA\tsidechains
                 .iter()
                 .any(|p| p.c.is_some_and(|c| (c - 63.8).abs() < 0.8)),
             "two-pass corroborated 3D picker falsely rescued uncorroborated 63.8 ppm decoy: {hnca_pks:?}"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_rd1_rd4_rd5_cli_assign_flags() {
+        use nmr_core::peaks::write_peaks;
+        use nmr_core::simulate::{simulate, SimConfig};
+
+        let dir = env::temp_dir().join(format!("nmr_cli_rd_flags_{}", process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let star_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("data/fixtures/synthetic_ubiquitin.str");
+        let star = read_star(&star_path, None).unwrap();
+        let (mut peaks, _) = simulate(&star, &SimConfig::default());
+
+        // Invert HNCACB polarity so CB is positive (RD-1) and inject an NH2 doublet + orphan HSQC root (RD-5)
+        for p in &mut peaks {
+            if p.exp == "HNCACB" {
+                p.sign = -p.sign;
+            }
+        }
+        peaks.push(Peak::hsqc(7.05, 112.10).with_intensity(900.0, None));
+        peaks.push(Peak::hsqc(7.75, 112.12).with_intensity(880.0, None));
+        peaks.push(Peak::hsqc(9.95, 127.40).with_intensity(700.0, None));
+
+        let peaks_tsv = dir.join("peaks.tsv");
+        write_peaks(&peaks_tsv, &peaks).unwrap();
+
+        // Write a small CAS Ser list matching Ser20's (C'(19), N(20)) if present
+        let cas_tsv = dir.join("c_ser_canco.tsv");
+        let mut cas_txt = String::from("exp\tc_prime\tn15\theight\n");
+        if let (Some(&c19), Some(&n20)) = (
+            star.shifts.get(&(18, "C".to_string())),
+            star.shifts.get(&(19, "N".to_string())),
+        ) {
+            cas_txt.push_str(&format!("CAS_CANCO_SER\t{c19:.3}\t{n20:.3}\t1000.0\n"));
+        }
+        fs::write(&cas_tsv, cas_txt).unwrap();
+
+        let out_prefix = dir.join("out_ubi");
+        let json_out = dir.join("out_ubi.json");
+        cmd_assign(&[
+            "--peaks".into(),
+            peaks_tsv.to_string_lossy().into_owned(),
+            "--star".into(),
+            star_path.to_string_lossy().into_owned(),
+            "--out".into(),
+            out_prefix.to_string_lossy().into_owned(),
+            "--hncacb-polarity".into(),
+            "auto".into(),
+            "--roots".into(),
+            "hnco".into(),
+            "--cas".into(),
+            format!("canco_ser={}", cas_tsv.display()),
+            "--solver".into(),
+            "standard".into(),
+            "--engine".into(),
+            "cpu".into(),
+            "--runs".into(),
+            "8".into(),
+            "--steps".into(),
+            "800".into(),
+            "--json-out".into(),
+            json_out.to_string_lossy().into_owned(),
+        ])
+        .unwrap();
+
+        let json_txt = fs::read_to_string(&json_out).unwrap();
+        assert!(
+            json_txt.contains("\"hncacb_polarity\": \"cb-positive\""),
+            "CLI assign JSON must report cb-positive HNCACB polarity: {json_txt}"
+        );
+        let assigned = read_star(dir.join("out_ubi.str"), None).unwrap();
+        assert!(
+            assigned.shifts.len() >= 300,
+            "expected substantial assigned shifts via CLI assign with RD-1/4/5 flags, got {}",
+            assigned.shifts.len()
         );
 
         let _ = fs::remove_dir_all(&dir);
