@@ -85,9 +85,9 @@ $$C_v(T_m) = \frac{\langle E^2 \rangle_{T_m} - \langle E \rangle_{T_m}^2}{T_m^2}
 
 ---
 
-## Real-Data IDP Workflows: Polarity, Root Gating, `CAS-NMR`, `idp-13c` (`v0.17.3`) & Joint `HN + 13C` (`v0.18.0`)
+## Real-Data IDP Workflows: Polarity, Root Gating, `CAS-NMR`, `idp-13c` (`v0.17.3`) & Unified Joint `HN + 13C` (`idp-joint`, `v0.18.0`)
 
-Real experimental IDP datasets combine narrow chemical-shift dispersion, high Proline content, fast amide-proton solvent exchange, and pulse-program-specific sign or referencing quirks. Starting in **`v0.17.3`**, `ferric assign` and `ferric pipeline` provide four dedicated controls for real-data IDP processing, complemented by the upcoming **`v0.18.0`** unified joint `HN + 2D CON` Proline-bridging regime (`idp-joint`, specified in `docs/specs/14-regime-solvers.md` §5).
+Real experimental IDP datasets combine narrow chemical-shift dispersion, high Proline content, fast amide-proton solvent exchange, and pulse-program-specific sign or referencing quirks. `ferric assign` and `ferric pipeline` provide four dedicated controls for real-data IDP processing (`v0.17.3`) together with the unified joint `HN + 2D CON` Proline-bridging regime **`--regime idp-joint`** (`v0.18.0`, specified in `docs/specs/14-regime-solvers.md` §5).
 
 ### 1. Automatic `HNCACB` / `HN(CO)CACB` Sign Polarity (`--hncacb-polarity`)
 
@@ -98,7 +98,7 @@ Different Bruker/Varian pulse programs and processing phases produce opposite si
 
 ### 2. `HNCO`-Corroborated Root Gating & `NH2` Merging (`--roots hnco`)
 
-Raw `2D HSQC` peak tables on disordered proteins often include baseline spikes, water-ridge artifacts, and paired `Asn`/`Gln` sidechain $\text{NH}_2$ doublets (shared ${}^{15}\text{N}$ in `108–115 ppm`, $|\Delta\delta_H| \approx 0.7\text{ ppm}$).
+Raw `2D HSQC` peak tables on disordered proteins often include baseline spikes, water-ridge artifacts, and paired `Asn`/`Gln` sidechain $\text{NH}_2$ doublets (shared ${}^{15}\text{N}$ in `108–115 ppm`, both $^1\text{H}$ in `6.4–7.9 ppm`, $|\Delta\delta_H| \approx 0.7\text{ ppm}$).
 
 - **`--roots all` (default)**: Preserves 1-to-1 `HSQC` root indexing.
 - **`--roots hnco`**: Retains only `HSQC` roots corroborated by `3D HNCO` (falling back to any non-`HSQC` 3D correlation if `HNCO` is absent) and merges `Asn`/`Gln` sidechain $\text{NH}_2$ doublet pairs prior to spin-system assembly, preventing sidechain peaks from stealing backbone slots.
@@ -112,15 +112,16 @@ Carbon-detected amino-acid-selective (`CAS`) `2D CON`-readout subspectra (Sahu, 
 | **`cacon`** | **`i - 1`** | Selects the residue **preceding** the `(C'_{i-1}, N_i)` peptide bond | `--cas cacon:ser=cacon_ser.tsv` |
 | **`canco`** | **`i`** | Selects the residue **following** the `(C'_{i-1}, N_i)` peptide bond | `--cas canco:ala=canco_ala.tsv` |
 
-- **Repeatable syntax**: Pass `--cas` once per subspectrum (`cacon:<res>=<path>`, `canco:<res>=<path>`, `cacon_<res>=<path>`, or `<res>:canco=<path>`). Residue selectors accept single- or three-letter codes, comma/`+`-separated sets, and standard shorthands (`ser`, `ala`, `gly`, `thr`, `tavi` = `Thr/Ala/Val/Ile`, `asx` = `Asp/Asn`, `glx` = `Glu/Gln`, `ilv` = `Ile/Leu/Val`). Always state `cacon:` or `canco:` explicitly rather than relying on filename inference.
-- **Globular vs `13C`-detected usage**: In `--regime globular`, `--cas` routes through the CPU `f64` `--solver standard` path. In `--regime idp-13c`, `CAS` subspectra combine directly with `2D CON`, `H(CC)CON`, `(H)N(CA)CON`, and `HNCO`$\to$`HNCACB` scoring using overlap- and breakthrough-tolerant likelihoods.
+- **Repeatable syntax**: Pass `--cas` once per subspectrum (`cacon:<res>=<path>`, `canco:<res>=<path>`, `cacon_<res>=<path>`, or `<res>:canco=<path>`). Residue selectors accept single- or three-letter codes, comma/`+`-separated sets, and standard shorthands (`ser`, `ala`, `gly`, `thr`, `tavi` = `Thr/Ala/Val/Ile`, `asx` = `Asp/Asn`, `glx` = `Glu/Gln`, `ilv` = `Ile/Leu/Val`). Always state `cacon:` or `canco:` explicitly; ambiguous inputs fail closed instead of silently defaulting.
+- **Overlap & breakthrough calibration**: `CAS` peaks are scored via overlap-fanout-damped, breakthrough-calibrated log-likelihood ratios (`c13_detected::cas_llr_adjustment`) with bounded asymmetric mismatch penalties (`~ -0.74 nats` clean, softening under excess hits/crowding) so crowded `CON` clusters never override corroborated `CA`/`CB` sequential walks.
+- **Regime usage**: In `--regime globular`, `--cas` routes through CPU `f64` `--solver standard`. In `--regime idp-13c` and `--regime idp-joint`, `CAS` subspectra combine directly with `2D CON`, `H(CC)CON`, `(H)N(CA)CON`, and `HN` triple-resonance channels.
 
 ### 4. `13C`-Detected `idp-13c` Workflow (`v0.17.3`)
 
-In **`v0.17.3`**, `--regime idp-13c` builds continuous through-Proline `CON(i)` dipeptide walks from `2D CON` roots plus `3D H(CC)CON` / `CBCACON` / `CANCO` / `NCACO`, repeatable `--cas` subspectra, directional `3D (H)N(CA)CON` (`--hncacon`) `N–N` edges, and optional reciprocal `3D BT_HNCACONH` (`--hncaconh`) `N–N` links, guarded by capped unlabelled auto-referencing (`~3.5 ppm` $^{13}\text{C}$, `~1.5 ppm` $^{15}\text{N}$, with TMS-vs-DSS and carbon-spread polarity hints):
+`--regime idp-13c` builds continuous through-Proline `CON(i)` dipeptide walks from `2D CON` roots plus `3D H(CC)CON` / `CBCACON` / `CANCO` / `NCACO`, repeatable `--cas` subspectra, directional `3D (H)N(CA)CON` (`--hncacon`) `N–N` edges, and optional reciprocal `3D BT_HNCACONH` (`--hncaconh`) `N–N` links, guarded by capped unlabelled auto-referencing (`~3.5 ppm` $^{13}\text{C}$, `~1.5 ppm` $^{15}\text{N}$, with TMS-vs-DSS and carbon-spread polarity hints):
 
 ```bash
-# v0.17.3 13C-detected CON-rooted IDP workflow with CAS + (H)N(CA)CON + optional HN(CA)CONH
+# 13C-detected CON-rooted IDP workflow with CAS + (H)N(CA)CON
 ferric assign --seq idp.fasta --regime idp-13c \
   --con con_2d.tsv \
   --cccon hcccon_3d.tsv \
@@ -133,19 +134,36 @@ ferric assign --seq idp.fasta --regime idp-13c \
   --engine auto --out out/idp_13c
 ```
 
-> [!IMPORTANT] `--engine gpu` Fail-Closed Policy for `idp-13c` Extensions
-> Pure `13C`-detected runs (`--con` + `--caco`/`--canco`/`--cbcacon`/`--cccon`/`--ncaco`) execute on WebGPU via `--engine gpu` or `--engine auto`. When CPU-only `f64` extensions are active (`--cas`, `--hncacon`, `--hncaconh`, or `HNCO`$\to$`HNCACB` attachment), **`--engine gpu` returns an explicit hard error (zero silent CPU fallback)**; pass `--engine auto` or `--engine cpu` instead.
+> [!IMPORTANT] `--engine gpu` Fail-Closed Policy for `idp-13c` Extensions & `idp-joint`
+> Pure `13C`-detected runs (`--con` + `--caco`/`--canco`/`--cbcacon`/`--cccon`/`--ncaco`) execute on WebGPU via `--engine gpu` or `--engine auto`. When CPU-only `f64` extensions are active (`--cas`, `--hncacon`, `--hncaconh`, or `HNCO`$\to$`HNCACB` attachment) — or whenever `--regime idp-joint` is selected — **`--engine gpu` fails closed with an explicit hard error (zero silent CPU fallback)**; pass `--engine cpu` or `--engine auto` instead.
 
-### 5. Upcoming `v0.18.0` Unified Joint `HN + 2D CON` Proline-Bridging Solver (`idp-joint`) & `HN` $\leftrightarrow$ `CON` Cross-Validation
+### 5. Unified Joint `HN + 2D CON` Proline-Bridging Solver (`--regime idp-joint`, `v0.18.0`) & `HN` $\leftrightarrow$ `CON` Cross-Validation
 
-When an IDP project has **both** `1H`-detected triple-resonance spectra (`BEST-HSQC`, `HNCO`, `HN(CA)CO`, `HNCACB`, `HN(CO)CACB`, `BT_HNCACONH`) and `13C`-detected spectra (`2D CON`, `H(CC)CON`, `(H)N(CA)CON`, `CAS`), the upcoming **`v0.18.0`** **`idp-joint`** regime (`crates/nmr-core/src/joint_idp_solver.rs`, `docs/specs/14-regime-solvers.md` §5) eliminates the artificial split between `HN` and `13C` assignments:
+When an IDP project includes **both** `1H`-detected triple-resonance spectra (`BEST-HSQC`, `HNCO`, `HN(CA)CO`, `HNCACB`, `HN(CO)CACB` / `CBCA(CO)NH` / `HNCOCACB`, `BT_HNCACONH`) and `13C`-detected spectra (`2D CON`, `H(CC)CON`, `(H)N(CA)CON`, `CAS`), **`--regime idp-joint`** (`crates/nmr-core/src/joint_idp_solver.rs`, `docs/specs/14-regime-solvers.md` §5) unifies both routes into a single peptide-bond graph. If `--regime` is omitted on `ferric assign` or `ferric pipeline` and both `1H`-amide (`--peaks` / `--hsqc`) and `--con` inputs are supplied, FERRIC **auto-selects `--regime idp-joint`**:
 
-1. **Shared `(C'_{i-1}, N_i)` Peptide-Bond Fusion**: Fuses `HNCO`-supported amide roots with matching `2D CON` peaks into unified **`AmideFused`** nodes, inserts **`ProlineConBridge`** nodes (`15N` `131.5–143.0 ppm`, no $^1\text{H}^{\text{N}}$) that bridge upstream `HN(CA)CO` $C'_{i-1}$ straight across `-Xaa-Pro-` and `-Pro-Pro-` junctions into downstream `HNCO` $C'_i$ and `HN(CO)CACB`/`H(CC)CON` $(CA_i, CB_i)$, and preserves **`ConOnlyAmide`** nodes to span exchange-broadened amide gaps.
-2. **Automatic TROSY $\frac{1}{2}{}^{1}J_{\text{HN}}$ Alignment & IDP Strip Hygiene**: Auto-calibrates field-scaled TROSY offsets ($\pm 46\text{ Hz} / B_0$, e.g. `±0.058 ppm 1H` / `∓0.567 ppm 15N` at `800 MHz`; Pervushin et al. 1997) between TROSY 3Ds (`BT_HNCACONH`) and decoupled `HSQC`/`HNCO`, prunes indirect `F1(C')` NUS sidelobes, guards `Gly CB` bleed-through (`CA` in `41.0–46.5 ppm` DSS), incorporates the Platzer/`ncIDP` C-terminal `COO-` carbonyl prior (`~179 ppm` DSS; Platzer et al. 2014) and pre-Proline shift offsets, and runs conservative 2-pass anchor-lock propagation across unequivocal $\ge 3$-residue blocks and `X–Pro` bridges.
-3. **`HN` $\leftrightarrow$ `CON` Cross-Validation Workflow (CLI Reports & `v0.18.0` GUI Panel)**:
-   Every assigned residue in `idp-joint` emits an explicit route-concordance tag (`CrossValidatedHnAndCon`, `HnOnly`, `ConProBridge`, or `ConOnly`), surfaced interactively alongside the `CAS` (`cacon`/`canco`) slot mapper in the upcoming `v0.18.0` GUI joint-IDP panel (`crates/nmr-gui/src/idp_joint_panel.rs`):
-   - **Start with `CrossValidatedHnAndCon` stretches and `ConProBridge` junctions**: Residues independently corroborated by both `HN` and `CON` routes (and Prolines bridging two cross-validated flanks) form the highest-reliability assignment scaffold.
-   - **Audit `HnOnly` and `ConOnly` transitions**: Use the strip tiler to inspect single-route stretches (fast-exchanging loops or weak `CON` peaks), verify `CAS` residue-type tags (`cacon` `i-1` vs `canco` `i`), lock confirmed anchors, and re-solve any ambiguous `Ser`/`Glu`/`Ala` repeats.
+```bash
+# Unified joint HN + 2D CON + Proline-bridge + CAS + N-N IDP assignment (CPU f64)
+ferric assign --seq idp.fasta --regime idp-joint \
+  --peaks hn_triple_peaks.tsv \
+  --con con_2d.tsv \
+  --cccon hcccon_3d.tsv \
+  --cas cacon:ser=cacon_ser.tsv \
+  --cas canco:ala=canco_ala.tsv \
+  --hncacon hncacon_3d.tsv \
+  --hncaconh bt_hncaconh_3d.tsv \
+  --roots hnco --hncacb-polarity auto \
+  --temp-k 298.15 --ph 6.5 \
+  --engine cpu --out out/idp_joint
+```
+
+Key algorithmic safeguards in `--regime idp-joint`:
+1. **Exact Hungarian `(C'_{i-1}, N_i)` Fusion & Proline Bridging**: Solves noise-scaled 1-to-1 Hungarian matching between `HNCO` amide roots and `2D CON` peaks to create **`AmideFused`** nodes, preserves Proline **`ProlineConBridge`** nodes (`15N` **`131.5–144.5 ppm` DSS**, no $^1\text{H}^{\text{N}}$) bridging directly across `-Xaa-Pro-` and `-Pro-Pro-` junctions, and retains unmatched non-Proline **`ConOnlyAmide`** nodes across exchange-broadened amide gaps.
+2. **Crowded-HSQC-Robust TROSY `46 Hz (1/2 1J_NH)` Calibration & IDP Strip Hygiene**: Auto-calibrates field-scaled TROSY offsets — `46 Hz (1/2 1J_NH)`, field-scaled to ppm (`-0.058 ppm 1H` / `+0.567 ppm 15N` at `800 MHz`; Pervushin et al. 1997) — across all four sign quadrants using 1-to-1 coincidence matching minus an empirical crowded-HSQC decoy baseline (`>= 5` matched roots), prunes multi-peak symmetric `F1(C')` NUS sidelobes while keeping genuine 2-peak `(C'_i, C'_{i-1})` doublets intact, guards `Gly CB` bleed-through (`CA` in `41.0–46.5 ppm` DSS), applies all four pre-Proline shift offsets (`C' -1.90`, `CA -1.80`, `N +1.65`, `CB -0.35 ppm`) plus the Platzer/`ncIDP` C-terminal `COO-` carbonyl prior (`~179.0 ppm` DSS; Platzer et al. 2014), and runs conservative 2-pass anchor-lock propagation without any Pass-2 confidence floor.
+3. **Honest `JOINT_IDP_CALIBRATION_KNOTS` & Unlabelled QC Abstention**: Evaluates 2-swap, cycle, and `2..=4`-residue motif-swap competitors under adaptive $\tau_{\text{local,eff}}$, maps posteriors through dedicated PAV knots fitted on disjoint synthetic sequences, and enforces sequence low-complexity, decoy/root-inflation (`>= 1.35x`), fusion-scatter, and ambiguity QC gates (`Warn` / `Abstain` with strict confidence caps). On held-out synthetic 3-seed benchmarks (`0` ground-truth root hints), `idp-joint` achieves `93.0%` mean accuracy / `93.7%` Proline recovery vs `42.0%` / `50.8%` for standalone `idp-13c` and `54.4%` / `0.0%` for standalone `evo-graph`, while honestly returning `ABSTAIN` (`0` HC calls) on heavy decoy/combined stress and on unlabelled Clec16a real-data replay (`2.25x` root inflation; **synthetic accuracy benchmarks only — zero real-data ground-truth accuracy claim**).
+4. **`HN` $\leftrightarrow$ `CON` Cross-Validation in `ferric-gui` (`idp_joint_panel.rs`)**:
+   The desktop and WebAssembly workbench wires `IdpJointPanelState` directly into `NmrWorkbenchApp`, `ingest_panel.rs` (auto-detecting joint `HN + CON` study folders and populating validated `CAS` slots up to `MAX_CAS_SLOTS = 16` with live `(13C', 15N)` axis validation), the sequence ribbon, and the 3D strip tiler, emitting a runnable `cli_preview_command` matching `ferric assign`:
+   - **Start with `XVal` (`CrossValidatedHnAndCon`) stretches and `[Pro]` (`ConProBridge`) junctions**: Residues corroborated by both `HN` and `CON` routes (and Proline bridges linking two cross-validated flanks) form the primary verification scaffold.
+   - **Audit `HN` (`HnRoute`) and `CON` (`ConRouteOnly`) transitions**: Click any residue in the concordance table to jump straight to its 3D strip walk, inspect `CAS` (`cacon` `i-1` vs `canco` `i`) typing and C-terminal `COO-` hints, lock confirmed anchors, and re-run `assign_joint_idp_cpu` live.
 
 ---
 
@@ -157,7 +175,8 @@ When an IDP project has **both** `1H`-detected triple-resonance spectra (`BEST-H
 | Interactive fast GPU re-annealing with user locks (`--locks`) | `--solver standard --engine gpu` | Sub-second WebGPU `16 KiB` SRAM turnaround with strong empirical calibration |
 | Large single-chain globular proteins (`250–800 aa`) or sparse gaps | `--solver bayes-sa --engine gpu` | Null chemical potential $\mu_{\text{null}}$ + rare-shift Bayes factors + 3-tier `anneal_bayes_256`/`1024`/`global` GPU kernels |
 | Proline-rich IDPs with `2D CON` + `3D CANCO`/`CBCACON` (pure `13C`) | `--regime idp-13c --engine gpu` | Unbroken `CON(i)` dipeptide walk through Prolines with T/pH `ncIDP` coil priors ([Chapter 1](01-quickstart-and-workflows.md#protein-workflow-3-proline-rich-idps-13c-detected-protonless-nmr)) |
-| Proline-rich IDPs with `2D CON` + `CAS` + `(H)N(CA)CON` (`v0.17.3`) | `--regime idp-13c --engine auto` | Combines `CON`, `H(CC)CON`, `--cas`, and `--hncacon` on CPU `f64` (planned `v0.18.0` `idp-joint` unifies this directly with `HN` triple-resonance strips) |
+| Proline-rich IDPs with `2D CON` + `CAS` + `(H)N(CA)CON` (`13C`-only) | `--regime idp-13c --engine auto` | Combines `CON`, `H(CC)CON`, `--cas`, and `--hncacon` on CPU `f64` |
+| Proline-rich IDPs with **both** `1H` triple-resonance and `2D CON`/`13C` (`v0.18.0`) | `--regime idp-joint --engine cpu` | Exact Hungarian `HN ↔ CON` fusion, Proline bridging (`131.5–144.5 ppm`), TROSY `46 Hz (1/2 1J_NH)` alignment, calibrated `CAS`, and `XVal`/`[Pro]` cross-route reporting (auto-selected when both `HN` and `--con` are provided) |
 | `[2Fe-2S]`, high-spin $3d$, or lanthanide metalloproteins | `--regime paramagnetic --solver evo-graph` | `u_para` blind-zone prior prevents forcing noise roots into `PRE`-bleached coordination spheres |
 
 ---
