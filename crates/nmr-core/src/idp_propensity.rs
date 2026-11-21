@@ -1365,6 +1365,66 @@ pub fn format_propensity_tsv(report: &PropensityReport) -> String {
     out
 }
 
+/// Format a [`PropensityReport`] as TSV with explicit unlabelled QC status (`180r3.cli:P1-3`):
+/// prepends `# PROVISIONAL_OUTPUT: QC=ABSTAIN (...)` on `Abstain` and appends a `qc_verdict`
+/// column (`PASS`/`WARN`/`ABSTAIN`) on every row.
+pub fn format_propensity_tsv_with_qc(
+    report: &PropensityReport,
+    verdict: crate::qc::DatasetQcVerdict,
+    reasons: &[String],
+) -> String {
+    let verdict_str = verdict.as_str();
+    let mut out = String::with_capacity(report.residues.len() * 108 + 384);
+    if verdict == crate::qc::DatasetQcVerdict::Abstain {
+        let reason_txt = if reasons.is_empty() {
+            "unlabelled QC gate triggered".to_string()
+        } else {
+            reasons.join("; ").replace(['\r', '\n'], " ")
+        };
+        out.push_str(&format!(
+            "# PROVISIONAL_OUTPUT: QC=ABSTAIN ({reason_txt}; do not treat secondary-structure propensities as validated)\n"
+        ));
+    }
+    out.push_str(&format!(
+        "# nmr-core SSP / d2D Conformational Propensity Report (T={:.2} K, pH={:.2}, QC={verdict_str})\n",
+        report.temperature_kelvin, report.effective_ph
+    ));
+    out.push_str("seq_id\tresidue\thas_data\tn_nuclei\tssp\tp_alpha\tp_beta\tp_ppii\tp_coil\tstate\tdCA\tdCB\tdC\tdHA\tdH\tdN\tqc_verdict\n");
+    for r in &report.residues {
+        let ssp_s = r
+            .ssp_score
+            .map(|v| format!("{v:+.4}"))
+            .unwrap_or_else(|| "NA".to_string());
+        let fmt_sec = |atom: &str| -> String {
+            r.secondary_shifts
+                .get(atom)
+                .map(|v| format!("{v:+.3}"))
+                .unwrap_or_else(|| "NA".to_string())
+        };
+        out.push_str(&format!(
+            "{}\t{}\t{}\t{}\t{}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            r.seq_id,
+            r.residue,
+            r.has_data,
+            r.n_observed_nuclei,
+            ssp_s,
+            r.p_alpha,
+            r.p_beta,
+            r.p_ppii,
+            r.p_coil,
+            r.dominant_state.code(),
+            fmt_sec("CA"),
+            fmt_sec("CB"),
+            fmt_sec("C"),
+            fmt_sec("HA"),
+            fmt_sec("H"),
+            fmt_sec("N"),
+            verdict_str,
+        ));
+    }
+    out
+}
+
 /// Format a [`PropensityReport`] as pretty-printed JSON.
 pub fn format_propensity_json(report: &PropensityReport) -> Result<String, String> {
     serde_json::to_string_pretty(report)

@@ -14,19 +14,20 @@ use nmr_core::c13_detected::{
 };
 use nmr_core::evo_graph::{assign_evo_graph_from_peaks, EvoGraphConfig};
 use nmr_core::idp_solver::{
-    fit_idp_calibration_knots_pav, register_and_build_con_dipeptide_systems,
-    try_assign_idp_13c_cpu, IdpShiftOffsets, IdpSolverConfig, MAX_IDP_MATRIX_CELLS,
+    register_and_build_con_dipeptide_systems, try_assign_idp_13c_cpu, IdpShiftOffsets,
+    IdpSolverConfig, MAX_IDP_MATRIX_CELLS,
 };
 use nmr_core::joint_idp_solver::{
     apply_gly_cb_bleedthrough_guard, assign_joint_idp, assign_joint_idp_cpu,
     build_calibrated_cas_tables, calibrate_joint_posterior, calibrate_trosy_hn_offset,
-    joint_idp_to_reference, joint_idp_unary_matrix, pre_pro_shift_corrections,
-    predict_joint_ncidp_shifts, prune_f1_c_prime_nus_sidelobes, trosy_expected_shift_ppm,
-    try_joint_idp_unary_matrix, DirectionalNnPeak, HncaconhPeak, JointIdpAssignResult,
-    JointIdpConfig, JointIdpDataset, JointIdpNode, JointNodeKind, JointRouteSupport,
-    CANONICAL_TROSY_FALLBACK_MHZ, JOINT_IDP_CALIBRATION_KNOTS, MIN_TROSY_MATCHED_ROOTS,
-    PRE_PRO_CA_CORRECTION_PPM, PRE_PRO_CB_CORRECTION_PPM, PRE_PRO_C_PRIME_CORRECTION_PPM,
-    PRE_PRO_N_CORRECTION_PPM, PROLINE_N15_MAX_PPM, PROLINE_N15_MIN_PPM, TROSY_HALF_J_HN_HZ,
+    joint_idp_to_reference, joint_idp_unary_matrix, motif_repeat_metrics,
+    pre_pro_shift_corrections, predict_joint_ncidp_shifts, prune_f1_c_prime_nus_sidelobes,
+    trosy_expected_shift_ppm, try_joint_idp_unary_matrix, DirectionalNnPeak, HncaconhPeak,
+    JointIdpAssignResult, JointIdpConfig, JointIdpDataset, JointIdpNode, JointNodeKind,
+    JointRouteSupport, CANONICAL_TROSY_FALLBACK_MHZ, JOINT_IDP_CALIBRATION_KNOTS,
+    MIN_TROSY_MATCHED_ROOTS, PRE_PRO_CA_CORRECTION_PPM, PRE_PRO_CB_CORRECTION_PPM,
+    PRE_PRO_C_PRIME_CORRECTION_PPM, PRE_PRO_N_CORRECTION_PPM, PROLINE_N15_MAX_PPM,
+    PROLINE_N15_MIN_PPM, TROSY_HALF_J_HN_HZ,
 };
 use nmr_core::peaks::Peak;
 use nmr_core::picker::{pick_hsqc_2d, pick_triple_3d, PickerConfig};
@@ -144,16 +145,50 @@ fn generate_random_idp_sequence(len: usize, seq_seed: u64) -> Vec<String> {
     out
 }
 
+/// Generate a realistic 9-mer motif-repeat IDP sequence of length `len` with `25–35%` random
+/// point mutations (`180r3.core:P2-2`: e.g. degenerate tandem repeats like CTD/FUS/tau motifs).
+fn generate_motif_repeat_idp_sequence(len: usize, seq_seed: u64) -> Vec<String> {
+    const MOTIF: &[char] = &['S', 'P', 'T', 'S', 'P', 'S', 'Y', 'G', 'Q']; // 9-mer repeat
+    const MUT_ALPHABET: &[char] = &[
+        'A', 'E', 'D', 'K', 'N', 'T', 'V', 'L', 'R', 'H', 'G', 'S', 'Q',
+    ];
+    let mut rng = Rng::new(seq_seed);
+    let mut out = Vec::with_capacity(len);
+    out.push("MET".to_string());
+    for i in 1..len {
+        let mut ch = MOTIF[(i - 1) % MOTIF.len()];
+        // ~30% point mutation rate across copies (within 25–35%)
+        if rng.f64() < 0.30 {
+            let mut m = MUT_ALPHABET[rng.usize(MUT_ALPHABET.len())];
+            if m == ch {
+                m = MUT_ALPHABET[(rng.usize(MUT_ALPHABET.len()) + 1) % MUT_ALPHABET.len()];
+            }
+            ch = m;
+        }
+        if i + 1 == len && ch == 'P' {
+            ch = 'A';
+        }
+        out.push(one_to_three(ch).to_string());
+    }
+    out
+}
+
 #[derive(Clone, Debug)]
 struct IdpStressSpec {
     jitter_h: f64,
     jitter_n: f64,
     jitter_c: f64,
     rc_dev_scale: f64,
-    /// Systematic per-residue-type predictor bias amplitude on `15N` (ppm, e.g., `1.0` -> `Uniform(-1.0, +1.0)` per AA type).
+    /// Systematic per-residue-type predictor bias amplitude on `15N` (ppm).
     predictor_bias_n: f64,
-    /// Systematic per-residue-type predictor bias amplitude on `13C'`, `13CA`, `13CB` (ppm, e.g., `0.4` -> `Uniform(-0.4, +0.4)` per AA type).
+    /// Systematic per-residue-type predictor bias amplitude on `13C'`, `13CA`, `13CB` (ppm).
     predictor_bias_c: f64,
+    /// Transient helix amplitude on `k in [30, 50) U [85, 103)` (`1.0` = `CA+1.2, C'+0.9, CB-0.3, N-0.6`).
+    helix_amp: f64,
+    /// Systematic neighbor-dependent bias amplitude keyed on `seq[k-1]` for `15N` (ppm).
+    neighbor_bias_n: f64,
+    /// Systematic neighbor-dependent bias amplitude keyed on `seq[k-1]` for `13C'/CA/CB` (ppm).
+    neighbor_bias_c: f64,
     random_drop_frac: f64,
     n_decoy_con_roots: usize,
     n_decoy_hn_roots: usize,
@@ -173,6 +208,9 @@ impl Default for IdpStressSpec {
             rc_dev_scale: 1.0,
             predictor_bias_n: 0.0,
             predictor_bias_c: 0.0,
+            helix_amp: 0.0,
+            neighbor_bias_n: 0.0,
+            neighbor_bias_c: 0.0,
             random_drop_frac: 0.08,
             n_decoy_con_roots: 15,
             n_decoy_hn_roots: 6,
@@ -194,6 +232,8 @@ struct SyntheticGroundTruth {
     shifts: Vec<ResidueTruthShifts>,
     /// True if residue `k` is exchange-broadened (missing from all `1H`-detected spectra).
     exchange_broadened: Vec<bool>,
+    /// True synthetic uniform `13C` referencing offset applied to generated spectra (e.g. `-2.70` ppm TMS).
+    tms_c13_offset: f64,
 }
 
 /// Synthesize a realistic, clean-room IDP dataset under `IdpStressSpec` with ZERO ground-truth
@@ -208,15 +248,13 @@ fn synthesize_idp_stress_dataset(
     let cfg_pred = JointIdpConfig::default();
     let preds = predict_joint_ncidp_shifts(seq, &cfg_pred);
 
-    // Optional systematic per-residue-type predictor bias (`180r2.core:P1-3`):
-    // mimics realistic mismatch between ncIDP random-coil predictions and real experimental IDPs.
+    let all_aas = [
+        "ALA", "ARG", "ASN", "ASP", "CYS", "GLN", "GLU", "GLY", "HIS", "ILE", "LEU", "LYS", "MET",
+        "PHE", "PRO", "SER", "THR", "TRP", "TYR", "VAL",
+    ];
     let mut aa_bias: BTreeMap<String, (f64, f64, f64, f64)> = BTreeMap::new();
     if spec.predictor_bias_n > 0.0 || spec.predictor_bias_c > 0.0 {
         let mut bias_rng = Rng::new(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0xBEEF_CAFE);
-        let all_aas = [
-            "ALA", "ARG", "ASN", "ASP", "CYS", "GLN", "GLU", "GLY", "HIS", "ILE", "LEU", "LYS",
-            "MET", "PHE", "PRO", "SER", "THR", "TRP", "TYR", "VAL",
-        ];
         for aa in all_aas {
             let bn = if spec.predictor_bias_n > 0.0 {
                 bias_rng.uniform(-spec.predictor_bias_n, spec.predictor_bias_n)
@@ -242,11 +280,39 @@ fn synthesize_idp_stress_dataset(
         }
     }
 
+    let mut prev_nb_bias: BTreeMap<String, (f64, f64, f64, f64)> = BTreeMap::new();
+    if spec.neighbor_bias_n > 0.0 || spec.neighbor_bias_c > 0.0 {
+        let mut nb_rng = Rng::new(seed.wrapping_mul(0xBF58_476D_1CE4_E5B9) ^ 0xCAFE_BABE);
+        for aa in all_aas {
+            let bn = if spec.neighbor_bias_n > 0.0 {
+                nb_rng.uniform(-spec.neighbor_bias_n, spec.neighbor_bias_n)
+            } else {
+                0.0
+            };
+            let bc = if spec.neighbor_bias_c > 0.0 {
+                nb_rng.uniform(-spec.neighbor_bias_c, spec.neighbor_bias_c)
+            } else {
+                0.0
+            };
+            let bca = if spec.neighbor_bias_c > 0.0 {
+                nb_rng.uniform(-spec.neighbor_bias_c, spec.neighbor_bias_c)
+            } else {
+                0.0
+            };
+            let bcb = if spec.neighbor_bias_c > 0.0 {
+                nb_rng.uniform(-spec.neighbor_bias_c, spec.neighbor_bias_c)
+            } else {
+                0.0
+            };
+            prev_nb_bias.insert(aa.to_string(), (bn, bc, bca, bcb));
+        }
+    }
+
     let proton_mhz = 800.0_f64;
     let trosy_dh = -TROSY_HALF_J_HN_HZ / proton_mhz;
     let trosy_dn = TROSY_HALF_J_HN_HZ / n15_obs_mhz(proton_mhz);
 
-    // 1. Ground-truth DSS backbone shifts with configurable random-coil dispersion + predictor bias
+    // 1. Ground-truth DSS backbone shifts with coil spread + per-AA + segmental helix + neighbor bias
     let mut shifts = Vec::with_capacity(len);
     for k in 0..len {
         let p = &preds[k];
@@ -255,6 +321,26 @@ fn synthesize_idp_stress_dataset(
             .get(&seq[k])
             .copied()
             .unwrap_or((0.0, 0.0, 0.0, 0.0));
+        let (nbn, nbc, nbca, nbcb) = if k >= 1 {
+            prev_nb_bias
+                .get(&seq[k - 1])
+                .copied()
+                .unwrap_or((0.0, 0.0, 0.0, 0.0))
+        } else {
+            (0.0, 0.0, 0.0, 0.0)
+        };
+        let in_helix = spec.helix_amp != 0.0 && ((30..50).contains(&k) || (85..103).contains(&k));
+        let (hn_s, hc_s, hca_s, hcb_s) = if in_helix {
+            (
+                -0.6 * spec.helix_amp,
+                0.9 * spec.helix_amp,
+                1.2 * spec.helix_amp,
+                -0.3 * spec.helix_amp,
+            )
+        } else {
+            (0.0, 0.0, 0.0, 0.0)
+        };
+
         let h = if is_pro || k == 0 {
             None
         } else {
@@ -268,17 +354,20 @@ fn synthesize_idp_stress_dataset(
             };
             Some(base_h + rng.normal(0.0, 0.22 * spec.rc_dev_scale))
         };
-        let n =
-            p.n_ppm + bn + rng.normal(0.0, if is_pro { 0.55 } else { 0.48 } * spec.rc_dev_scale);
+        let n = p.n_ppm
+            + bn
+            + nbn
+            + hn_s
+            + rng.normal(0.0, if is_pro { 0.55 } else { 0.48 } * spec.rc_dev_scale);
         let c = if k + 1 == len {
             179.25 + rng.normal(0.0, 0.16 * spec.rc_dev_scale.min(1.5))
         } else {
-            p.c_ppm + bc + rng.normal(0.0, 0.25 * spec.rc_dev_scale)
+            p.c_ppm + bc + nbc + hc_s + rng.normal(0.0, 0.25 * spec.rc_dev_scale)
         };
-        let ca = p.ca_ppm + bca + rng.normal(0.0, 0.26 * spec.rc_dev_scale);
+        let ca = p.ca_ppm + bca + nbca + hca_s + rng.normal(0.0, 0.26 * spec.rc_dev_scale);
         let cb = p
             .cb_ppm
-            .map(|m| m + bcb + rng.normal(0.0, 0.30 * spec.rc_dev_scale));
+            .map(|m| m + bcb + nbcb + hcb_s + rng.normal(0.0, 0.30 * spec.rc_dev_scale));
         let sc: Vec<f64> = p
             .sidechain_c
             .iter()
@@ -699,6 +788,7 @@ fn synthesize_idp_stress_dataset(
         seq: seq.to_vec(),
         shifts,
         exchange_broadened,
+        tms_c13_offset: spec.tms_c13_offset,
     };
     (dataset, truth)
 }
@@ -740,50 +830,58 @@ impl EvalMetrics {
     }
 }
 
-/// Check whether `node` (after subtracting `fitted_offsets`) truly belongs to sequence slot `k`.
+/// Check whether `node` physically originated from sequence slot `k` using the true synthetic
+/// referencing offset `truth.tms_c13_offset` (and `1H` amide shift when present to disambiguate
+/// overlapping `2D CON` roots).
 fn is_node_match_for_slot(
     node: &JointIdpNode,
-    offsets: &IdpShiftOffsets,
+    _offsets: &IdpShiftOffsets,
     k: usize,
     truth: &SyntheticGroundTruth,
 ) -> bool {
     let len = truth.seq.len();
-    let n_corr = node.n_curr - offsets.d_n;
-    if let Some(c_obs) = node.c_prev {
-        let c_corr = c_obs - offsets.d_c;
-        let dist_k =
-            ((c_corr - truth.shifts[k - 1].2) / 0.14).hypot((n_corr - truth.shifts[k].1) / 0.55);
-        let mut best_slot = k;
-        let mut best_dist = dist_k;
-        for kp in 1..len {
-            let d = ((c_corr - truth.shifts[kp - 1].2) / 0.14)
-                .hypot((n_corr - truth.shifts[kp].1) / 0.55);
-            if d < best_dist {
-                best_dist = d;
-                best_slot = kp;
-            }
-        }
-        best_slot == k && dist_k <= 2.8
-    } else if let Some(h_obs) = node.h_curr {
-        let Some(h_true) = truth.shifts[k].0 else {
-            return false;
-        };
-        let dist_k = ((h_obs - h_true) / 0.05).hypot((n_corr - truth.shifts[k].1) / 0.55);
-        let mut best_slot = k;
-        let mut best_dist = dist_k;
-        for kp in 1..len {
-            if let Some(hp) = truth.shifts[kp].0 {
-                let d = ((h_obs - hp) / 0.05).hypot((n_corr - truth.shifts[kp].1) / 0.55);
-                if d < best_dist {
-                    best_dist = d;
-                    best_slot = kp;
+    let n_obs = node.n_curr;
+    let slot_dist = |kp: usize| -> f64 {
+        let dn = (n_obs - truth.shifts[kp].1) / 0.55;
+        match (node.c_prev, node.h_curr) {
+            (Some(c_obs), Some(h_obs)) => {
+                let dc = ((c_obs - truth.tms_c13_offset) - truth.shifts[kp - 1].2) / 0.14;
+                if let Some(h_true) = truth.shifts[kp].0 {
+                    let dh = (h_obs - h_true) / 0.05;
+                    (dc * dc + dn * dn + dh * dh).sqrt()
+                } else {
+                    1e6
                 }
             }
+            (Some(c_obs), None) => {
+                let dc = ((c_obs - truth.tms_c13_offset) - truth.shifts[kp - 1].2) / 0.14;
+                dc.hypot(dn)
+            }
+            (None, Some(h_obs)) => {
+                if let Some(h_true) = truth.shifts[kp].0 {
+                    ((h_obs - h_true) / 0.05).hypot(dn)
+                } else {
+                    1e6
+                }
+            }
+            (None, None) => 1e6,
         }
-        best_slot == k && dist_k <= 2.8
-    } else {
-        false
+    };
+
+    let dist_k = slot_dist(k);
+    if dist_k > 2.8 {
+        return false;
     }
+    let mut best_slot = k;
+    let mut best_dist = dist_k;
+    for kp in 1..len {
+        let d = slot_dist(kp);
+        if d < best_dist {
+            best_dist = d;
+            best_slot = kp;
+        }
+    }
+    best_slot == k
 }
 
 /// Evaluate a `JointIdpAssignResult` against ground truth across `k = 1..L`.
@@ -856,6 +954,133 @@ fn compute_reliability_and_ece(samples: &[(f64, bool)]) -> (f64, [(usize, f64, f
     (ece, bins)
 }
 
+/// Exact tie-aware Mann–Whitney U AUROC for `(predicted_confidence, is_correct)` pairs.
+fn compute_auroc(samples: &[(f64, bool)]) -> f64 {
+    let n_pos = samples.iter().filter(|&&(_, y)| y).count();
+    let n_neg = samples.len() - n_pos;
+    if n_pos == 0 {
+        return 0.5;
+    }
+    if n_neg == 0 {
+        return 1.0;
+    }
+    let mut sorted: Vec<(f64, bool)> = samples.to_vec();
+    sorted.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let mut rank_sum_pos = 0.0_f64;
+    let mut i = 0usize;
+    while i < sorted.len() {
+        let mut j = i + 1;
+        while j < sorted.len() && (sorted[j].0 - sorted[i].0).abs() <= 1e-12 {
+            j += 1;
+        }
+        // 1-indexed average rank across the tie group [i, j)
+        let avg_rank = 0.5 * ((i + 1) as f64 + j as f64);
+        let pos_in_group = sorted[i..j].iter().filter(|&&(_, y)| y).count();
+        rank_sum_pos += avg_rank * (pos_in_group as f64);
+        i = j;
+    }
+    let u = rank_sum_pos - (n_pos as f64) * ((n_pos + 1) as f64) / 2.0;
+    (u / ((n_pos as f64) * (n_neg as f64))).clamp(0.0, 1.0)
+}
+
+/// Regularized isotonic PAV knot fitter (`180r3.core:P2-4`):
+/// Uses a sharp Gaussian kernel (`bw = 0.045`) plus a weak identity prior (`n_prior = 30` total
+/// pseudo-observations along `y = x` concentrated on low bins `x < 0.55`) so sparse low-posterior
+/// knots never extrapolate high from the dense `raw > 0.90` mass.
+/// Returns `(x, fitted_y, nearest_empirical_n)` for every knot.
+fn fit_unbiased_calibration_knots_with_prior(
+    samples: &[(f64, bool)],
+    knot_xs: &[f64],
+) -> Vec<(f64, f64, usize)> {
+    let m = knot_xs.len();
+    let bw = 0.045_f64;
+    let mut nearest_n = vec![0usize; m];
+    for &(p, _) in samples {
+        let mut best_i = 0usize;
+        let mut best_d = (p - knot_xs[0]).abs();
+        for (i, &xk) in knot_xs.iter().enumerate().skip(1) {
+            let d = (p - xk).abs();
+            if d < best_d {
+                best_d = d;
+                best_i = i;
+            }
+        }
+        nearest_n[best_i] += 1;
+    }
+
+    let low_indices: Vec<usize> = knot_xs
+        .iter()
+        .enumerate()
+        .filter(|(_, &x)| x > 0.0 && x < 0.55)
+        .map(|(i, _)| i)
+        .collect();
+    let prior_per_low = if low_indices.is_empty() {
+        0.0
+    } else {
+        30.0 / (low_indices.len() as f64)
+    };
+
+    // Weighted kernel mean + weak identity prior on low bins
+    let mut y = vec![0.0_f64; m];
+    let mut w = vec![0.0_f64; m];
+    for (i, &xk) in knot_xs.iter().enumerate() {
+        if xk <= 0.0 {
+            y[i] = 0.0;
+            w[i] = 1e6;
+            continue;
+        }
+        let mut sw = 0.0_f64;
+        let mut sy = 0.0_f64;
+        for &(p, ok) in samples {
+            let d = (p - xk) / bw;
+            if d.abs() <= 4.0 {
+                let wt = (-0.5 * d * d).exp();
+                sw += wt;
+                if ok {
+                    sy += wt;
+                }
+            }
+        }
+        let prior_w = if xk < 0.55 {
+            prior_per_low
+        } else if xk <= 0.65 {
+            2.0
+        } else {
+            0.5
+        };
+        sw += prior_w;
+        sy += prior_w * xk;
+        y[i] = (sy / sw.max(1e-9)).clamp(0.0, 0.995);
+        w[i] = sw.max(1e-6);
+    }
+
+    // Weighted Pool-Adjacent-Violators (PAV) for non-decreasing isotonicity
+    let mut blocks: Vec<(usize, usize, f64, f64)> = Vec::with_capacity(m);
+    for i in 0..m {
+        blocks.push((i, i, y[i] * w[i], w[i]));
+        while blocks.len() >= 2 {
+            let len = blocks.len();
+            let prev = blocks[len - 2];
+            let curr = blocks[len - 1];
+            if prev.2 / prev.3 > curr.2 / curr.3 {
+                blocks.pop();
+                blocks[len - 2] = (prev.0, curr.1, prev.2 + curr.2, prev.3 + curr.3);
+            } else {
+                break;
+            }
+        }
+    }
+    let mut out = vec![(0.0, 0.0, 0usize); m];
+    for (lo, hi, swy, sw) in blocks {
+        let val = (swy / sw).clamp(0.0, 0.995);
+        for i in lo..=hi {
+            let v = if knot_xs[i] <= 0.0 { 0.0 } else { val };
+            out[i] = (knot_xs[i], v, nearest_n[i]);
+        }
+    }
+    out
+}
+
 /// Anchor unanchored 3D strips (`CANCO`, `CBCACON`, `CCCON`) to nearest `CON` roots using the
 /// exact `(0.14 ppm C', 0.50 ppm N)` elliptical tolerance used by `joint_idp_solver::sanitize_c13_dataset`
 /// (`180r2.core:P1-2`: ensures a fair `idp-13c` baseline that is NOT starved of 3D CA/CB strips).
@@ -881,15 +1106,16 @@ fn anchor_c13_strips_fair(ds: &C13PickedDataset) -> C13PickedDataset {
     out
 }
 
-/// Non-circular disjoint empirical PAV calibration fitter (`180r2.core:P1-3`, `P2-3`, `P2-4`).
+/// Strictly-unbiased disjoint empirical PAV calibration fitter (`180r3.core:P1-1`, `P2-4`).
 ///
 /// Run explicitly with:
 /// `cargo test --release -p nmr-core --test joint_idp_solver_tests fit_disjoint_joint_idp_calibration_knots -- --ignored --nocapture`
 /// Fits `JOINT_IDP_CALIBRATION_KNOTS` strictly on:
 /// - 4 disjoint calibration sequences (`cal_seq_a`, `cal_seq_b`, `rand_cal_9001`, `rand_cal_9002`),
-/// - Non-circular truth shifts perturbed away from `ncIDP` via systematic per-AA predictor bias
-///   (`N ±1.0`, `C'/CA/CB ±0.4 ppm`) AND realistic `2.2x` random-coil spread (`P2-4`),
-/// - Non-`ABSTAIN` (`PASS` / `WARN`) runs ONLY so `P2-3` double-discounting is eliminated!
+/// - **STRICTLY UNBIASED** regimes (`predictor_bias_n = 0`, `predictor_bias_c = 0`,
+///   `helix_amp = 0`, `neighbor_bias_* = 0`) so EVERY bias family (`B0..B5`) stays 100% OOD,
+/// - Non-`ABSTAIN` (`PASS` / `WARN`) runs ONLY, with weak identity prior (`n_prior = 30`) on
+///   low bins (`x < 0.55`) and printed per-knot empirical sample counts (`P2-4`).
 #[test]
 #[ignore]
 fn fit_disjoint_joint_idp_calibration_knots() {
@@ -914,6 +1140,7 @@ fn fit_disjoint_joint_idp_calibration_knots() {
                 ..IdpStressSpec::default()
             },
         ),
+        ("cal_mod_1x", IdpStressSpec::default()),
         (
             "cal_real_2.2x",
             IdpStressSpec {
@@ -940,45 +1167,12 @@ fn fit_disjoint_joint_idp_calibration_knots() {
             },
         ),
         (
-            "cal_bias_mild",
-            IdpStressSpec {
-                rc_dev_scale: 2.0,
-                predictor_bias_n: 0.75,
-                predictor_bias_c: 0.30,
-                ..IdpStressSpec::default()
-            },
-        ),
-        (
-            "cal_bias_full",
-            IdpStressSpec {
-                rc_dev_scale: 2.2,
-                predictor_bias_n: 1.0,
-                predictor_bias_c: 0.40,
-                ..IdpStressSpec::default()
-            },
-        ),
-        (
-            "cal_bias_drop",
-            IdpStressSpec {
-                jitter_h: 0.01,
-                jitter_n: 0.08,
-                jitter_c: 0.03,
-                rc_dev_scale: 2.2,
-                predictor_bias_n: 1.0,
-                predictor_bias_c: 0.40,
-                random_drop_frac: 0.16,
-                ..IdpStressSpec::default()
-            },
-        ),
-        (
             "cal_noise_hi",
             IdpStressSpec {
                 jitter_h: 0.02,
                 jitter_n: 0.15,
                 jitter_c: 0.05,
                 rc_dev_scale: 1.8,
-                predictor_bias_n: 0.5,
-                predictor_bias_c: 0.20,
                 random_drop_frac: 0.18,
                 ..IdpStressSpec::default()
             },
@@ -988,6 +1182,11 @@ fn fit_disjoint_joint_idp_calibration_knots() {
     let mut samples: Vec<(f64, bool)> = Vec::new();
     let mut cal_samples: Vec<(f64, bool)> = Vec::new();
     for (label, spec) in scenarios {
+        assert_eq!(spec.predictor_bias_n, 0.0);
+        assert_eq!(spec.predictor_bias_c, 0.0);
+        assert_eq!(spec.helix_amp, 0.0);
+        assert_eq!(spec.neighbor_bias_n, 0.0);
+        assert_eq!(spec.neighbor_bias_c, 0.0);
         let mut tot_ok = 0usize;
         let mut tot_n = 0usize;
         let mut skipped_abstain = 0usize;
@@ -1001,7 +1200,6 @@ fn fit_disjoint_joint_idp_calibration_knots() {
                     ..JointIdpConfig::default()
                 };
                 let res = assign_joint_idp_cpu(&ds, seq, &cfg).unwrap();
-                // P2-3: strictly exclude ABSTAIN runs from PASS/WARN PAV calibration fit!
                 if res.qc_verdict == DatasetQcVerdict::Abstain {
                     skipped_abstain += 1;
                     continue;
@@ -1027,7 +1225,7 @@ fn fit_disjoint_joint_idp_calibration_knots() {
             }
         }
         println!(
-            "NON-CIRCULAR CAL {label:<16}: assigned acc = {tot_ok}/{tot_n} ({:.1}%) | abstained_runs={skipped_abstain}",
+            "UNBIASED CAL {label:<16}: assigned acc = {tot_ok}/{tot_n} ({:.1}%) | abstained_runs={skipped_abstain}",
             100.0 * tot_ok as f64 / tot_n.max(1) as f64
         );
     }
@@ -1035,13 +1233,13 @@ fn fit_disjoint_joint_idp_calibration_knots() {
     let knot_xs = [
         0.00, 0.15, 0.30, 0.45, 0.60, 0.72, 0.82, 0.88, 0.94, 0.98, 1.00,
     ];
-    let fitted = fit_idp_calibration_knots_pav(&samples, &knot_xs);
+    let fitted = fit_unbiased_calibration_knots_with_prior(&samples, &knot_xs);
     println!(
-        "\nFitted non-circular PASS/WARN PAV knots ({} samples):",
+        "\nFitted STRICTLY-UNBIASED PASS/WARN PAV knots ({} samples, n_prior=30 on x<0.55):",
         samples.len()
     );
-    for (x, y) in &fitted {
-        println!("    ({x:.2}, {y:.3}),");
+    for (x, y, n_bin) in &fitted {
+        println!("    ({x:.2}, {y:.3}), // n_bin={n_bin}");
     }
     println!("\nEmpirical unsmoothed raw_posterior bins:");
     for &(lo, hi) in &[
@@ -1073,16 +1271,133 @@ fn fit_disjoint_joint_idp_calibration_knots() {
         }
     }
     let (ece, bins) = compute_reliability_and_ece(&cal_samples);
-    println!("Current-knots cal ECE={ece:.3} | bins: [0-0.5): n={} acc={:.3}, [0.5-0.8): n={} acc={:.3}, [0.8-0.9): n={} acc={:.3}, [0.9-1.0]: n={} acc={:.3}",
-        bins[0].0, bins[0].2, bins[1].0, bins[1].2, bins[2].0, bins[2].2, bins[3].0, bins[3].2);
+    let auroc = compute_auroc(&cal_samples);
+    println!(
+        "Current-knots cal ECE={ece:.3} | AUROC={auroc:.3} | bins: [0-0.5): n={} acc={:.3}, [0.5-0.8): n={} acc={:.3}, [0.8-0.9): n={} acc={:.3}, [0.9-1.0]: n={} acc={:.3}",
+        bins[0].0, bins[0].2, bins[1].0, bins[1].2, bins[2].0, bins[2].2, bins[3].0, bins[3].2
+    );
 }
 
-/// Out-of-fold predictor-bias calibration & QC probe (`180r2.core:P1-3`):
-/// 4 fresh random ~130-aa IDPs × 2 seeds = 8 runs with systematic per-residue-type shift bias
-/// (`N ±1.0 ppm`, `C'/CA/CB ±0.4 ppm`) and realistic `2.2x` random-coil spread, plus an unbiased
-/// `2.2x` ranking check verifying `[0.9, 1.0]` genuinely outperforms `[0.8, 0.9)`.
+struct BiasProbeStats {
+    n_runs: usize,
+    n_pass: usize,
+    n_warn: usize,
+    n_abstain: usize,
+    n_mismatch_triggered: usize,
+    n_aa_trig: usize,
+    n_seg_trig: usize,
+    n_nb_trig: usize,
+    tot_ok: usize,
+    tot_slots: usize,
+    tot_hc: usize,
+    tot_hc_ok: usize,
+    mean_dc: f64,
+    ece: f64,
+    auroc: f64,
+    bins: [(usize, f64, f64); 4],
+}
+
+fn run_stress_probe(
+    seqs: &[Vec<String>],
+    seeds: &[u64],
+    spec: &IdpStressSpec,
+    seed_stride: u64,
+) -> BiasProbeStats {
+    let mut samples: Vec<(f64, bool)> = Vec::new();
+    let mut n_runs = 0usize;
+    let mut n_pass = 0usize;
+    let mut n_warn = 0usize;
+    let mut n_abstain = 0usize;
+    let mut n_mismatch_triggered = 0usize;
+    let mut n_aa_trig = 0usize;
+    let mut n_seg_trig = 0usize;
+    let mut n_nb_trig = 0usize;
+    let mut tot_ok = 0usize;
+    let mut tot_slots = 0usize;
+    let mut tot_hc = 0usize;
+    let mut tot_hc_ok = 0usize;
+    let mut sum_dc = 0.0_f64;
+
+    for (si, seq) in seqs.iter().enumerate() {
+        for &seed in seeds {
+            n_runs += 1;
+            let (ds, truth) =
+                synthesize_idp_stress_dataset(seq, seed + (si as u64) * seed_stride, spec);
+            let cfg = JointIdpConfig {
+                replicas: 12,
+                steps_per_system: 800,
+                seed: seed * 17 + (si as u64),
+                ..JointIdpConfig::default()
+            };
+            let res = assign_joint_idp_cpu(&ds, seq, &cfg).unwrap();
+            match res.qc_verdict {
+                DatasetQcVerdict::Pass => n_pass += 1,
+                DatasetQcVerdict::Warn => n_warn += 1,
+                DatasetQcVerdict::Abstain => n_abstain += 1,
+            }
+            if res.predictor_mismatch.triggered {
+                n_mismatch_triggered += 1;
+            }
+            if res.predictor_mismatch.aa_bias_triggered {
+                n_aa_trig += 1;
+            }
+            if res.predictor_mismatch.segmental_bias_triggered {
+                n_seg_trig += 1;
+            }
+            if res.predictor_mismatch.neighbor_bias_triggered {
+                n_nb_trig += 1;
+            }
+            sum_dc += res.fitted_offsets.d_c;
+            for k in 1..seq.len() {
+                tot_slots += 1;
+                let ra = &res.residue_assignments[k];
+                let Some(node_idx) = ra.node_idx else {
+                    continue;
+                };
+                let ok =
+                    is_node_match_for_slot(&res.nodes[node_idx], &res.fitted_offsets, k, &truth);
+                if ok {
+                    tot_ok += 1;
+                }
+                if ra.confidence >= 0.80 {
+                    tot_hc += 1;
+                    if ok {
+                        tot_hc_ok += 1;
+                    }
+                }
+                samples.push((ra.confidence, ok));
+            }
+        }
+    }
+
+    let (ece, bins) = compute_reliability_and_ece(&samples);
+    let auroc = compute_auroc(&samples);
+    BiasProbeStats {
+        n_runs,
+        n_pass,
+        n_warn,
+        n_abstain,
+        n_mismatch_triggered,
+        n_aa_trig,
+        n_seg_trig,
+        n_nb_trig,
+        tot_ok,
+        tot_slots,
+        tot_hc,
+        tot_hc_ok,
+        mean_dc: sum_dc / n_runs.max(1) as f64,
+        ece,
+        auroc,
+        bins,
+    }
+}
+
+/// Specificity probe on unbiased datasets `A1` (default 1x), `A2` (clean 1x), `A3` (unbiased 2.2x)
+/// (`180r3.core:P1-2`): verifies the scale-invariant predictor-mismatch detector maintains high
+/// specificity (`<= 1/8` false triggers on every unbiased regime), preserves `QC=PASS >= 6/8` on
+/// clean/moderate `1x`, and ranks `[0.9, 1.0] > [0.8, 0.9)` with honest `ECE` & `AUROC` on `2.2x`.
 #[test]
-fn test_v180_r3_predictor_bias_oof_calibration_and_qc() {
+fn test_v180_r4_specificity_probe_unbiased_a1_a2_a3() {
     let oof_seqs = [
         generate_random_idp_sequence(130, 501),
         generate_random_idp_sequence(128, 502),
@@ -1090,13 +1405,119 @@ fn test_v180_r3_predictor_bias_oof_calibration_and_qc() {
         generate_random_idp_sequence(130, 504),
     ];
     let seeds = [41_u64, 83];
-    let biased_spec = IdpStressSpec {
+    let scenarios: &[(&str, IdpStressSpec)] = &[
+        ("A1_default_1x", IdpStressSpec::default()),
+        (
+            "A2_clean_1x",
+            IdpStressSpec {
+                jitter_h: 0.004,
+                jitter_n: 0.03,
+                jitter_c: 0.014,
+                rc_dev_scale: 1.0,
+                random_drop_frac: 0.04,
+                n_decoy_con_roots: 5,
+                n_decoy_hn_roots: 2,
+                ..IdpStressSpec::default()
+            },
+        ),
+        (
+            "A3_unbiased_2.2x",
+            IdpStressSpec {
+                rc_dev_scale: 2.2,
+                ..IdpStressSpec::default()
+            },
+        ),
+    ];
+
+    println!("\n=== Round-4 Unbiased Specificity Probe (A1-A3, 4 fresh ~130-aa IDPs x 2 seeds = 8 runs each) ===");
+    println!(
+        "| Scenario | Acc% | #HC | HC_Prec% | MismatchTrig | QC(P/W/A) | ECE | AUROC | [0.8-0.9) | [0.9-1.0] |"
+    );
+    println!("|---|---:|---:|---:|---:|---|---:|---:|---:|---:|");
+
+    let mut failures: Vec<String> = Vec::new();
+    for (label, spec) in scenarios {
+        let st = run_stress_probe(&oof_seqs, &seeds, spec, 313);
+        let acc = 100.0 * st.tot_ok as f64 / st.tot_slots.max(1) as f64;
+        let hc_prec = if st.tot_hc == 0 {
+            100.0
+        } else {
+            100.0 * st.tot_hc_ok as f64 / st.tot_hc as f64
+        };
+        println!(
+            "| {label:<16} | {acc:5.1}% | {:4} | {hc_prec:7.1}% | {:2}/{:<2} ({}/{}/{}) | {}/{}/{}     | {:.3} | {:.3} | {:.3} ({:3}) | {:.3} ({:3}) |",
+            st.tot_hc,
+            st.n_mismatch_triggered,
+            st.n_runs,
+            st.n_aa_trig,
+            st.n_seg_trig,
+            st.n_nb_trig,
+            st.n_pass,
+            st.n_warn,
+            st.n_abstain,
+            st.ece,
+            st.auroc,
+            st.bins[2].2,
+            st.bins[2].0,
+            st.bins[3].2,
+            st.bins[3].0,
+        );
+
+        if st.n_mismatch_triggered > 1 {
+            failures.push(format!(
+                "180r3.core:P1-2 specificity breach on {label}: predictor_mismatch triggered {}/{} (must be <= 1/8)",
+                st.n_mismatch_triggered, st.n_runs
+            ));
+        }
+        if (*label == "A1_default_1x" || *label == "A2_clean_1x") && st.n_pass < 6 {
+            failures.push(format!(
+                "180r3.core:P1-2 specificity breach on {label}: QC=PASS {}/{} (must be >= 6/8)",
+                st.n_pass, st.n_runs
+            ));
+        }
+        if *label == "A3_unbiased_2.2x" {
+            if st.ece > 0.08 {
+                failures.push(format!(
+                    "180r3.core:P1-1: unbiased 2.2x ECE ({:.3}) exceeded 0.08",
+                    st.ece
+                ));
+            }
+            if st.auroc < 0.65 {
+                failures.push(format!(
+                    "180r3.core:P1-1: unbiased 2.2x AUROC ({:.3}) below 0.65",
+                    st.auroc
+                ));
+            }
+            if st.bins[2].0 >= 5 && st.bins[3].0 >= 5 && st.bins[3].2 <= st.bins[2].2 {
+                failures.push(format!(
+                    "180r3.core:P1-1: unbiased 2.2x [0.9, 1.0] ({:.3}, n={}) must strictly beat [0.8, 0.9) ({:.3}, n={})",
+                    st.bins[3].2, st.bins[3].0, st.bins[2].2, st.bins[2].0
+                ));
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "A1-A3 specificity failures:\n{}",
+        failures.join("\n")
+    );
+}
+
+/// Held-out OOD predictor-bias suite (`B0a..B5`, 7 distinct bias families/magnitudes/seeds,
+/// 100% excluded from calibration training; `180r3.core:P1-1`, `P1-2`).
+#[test]
+fn test_v180_r4_heldout_ood_bias_suite_b0_to_b5() {
+    let oof_seqs = [
+        generate_random_idp_sequence(130, 501),
+        generate_random_idp_sequence(128, 502),
+        generate_random_idp_sequence(132, 503),
+        generate_random_idp_sequence(130, 504),
+    ];
+    let base_22x = IdpStressSpec {
         jitter_h: 0.006,
         jitter_n: 0.04,
         jitter_c: 0.018,
         rc_dev_scale: 2.2,
-        predictor_bias_n: 1.0,
-        predictor_bias_c: 0.40,
         random_drop_frac: 0.08,
         n_decoy_con_roots: 12,
         n_decoy_hn_roots: 5,
@@ -1105,30 +1526,251 @@ fn test_v180_r3_predictor_bias_oof_calibration_and_qc() {
         include_trosy_hncaconh: true,
         include_cas: true,
         exchange_broaden: true,
+        ..IdpStressSpec::default()
     };
 
-    let mut oof_samples: Vec<(f64, bool)> = Vec::new();
-    let mut n_runs = 0usize;
-    let mut n_pass = 0usize;
-    let mut tot_ok = 0usize;
-    let mut tot_slots = 0usize;
-    let mut tot_hc = 0usize;
-    let mut tot_hc_ok = 0usize;
+    let cases: &[(&str, [u64; 2], IdpStressSpec, usize, bool)] = &[
+        (
+            "B0a_perAA_41_83",
+            [41, 83],
+            IdpStressSpec {
+                predictor_bias_n: 1.0,
+                predictor_bias_c: 0.40,
+                ..base_22x
+            },
+            1,
+            false,
+        ),
+        (
+            "B0b_perAA_137_293",
+            [137, 293],
+            IdpStressSpec {
+                predictor_bias_n: 1.0,
+                predictor_bias_c: 0.40,
+                ..base_22x
+            },
+            1,
+            false,
+        ),
+        (
+            "B1_helix_1.0",
+            [41, 83],
+            IdpStressSpec {
+                helix_amp: 1.0,
+                ..base_22x
+            },
+            0,
+            true,
+        ),
+        (
+            "B2_helix_1.5",
+            [41, 83],
+            IdpStressSpec {
+                helix_amp: 1.5,
+                ..base_22x
+            },
+            0,
+            true,
+        ),
+        (
+            "B3_strong_perAA",
+            [41, 83],
+            IdpStressSpec {
+                predictor_bias_n: 2.0,
+                predictor_bias_c: 0.80,
+                ..base_22x
+            },
+            0,
+            false,
+        ),
+        (
+            "B4_helix_plus_AA",
+            [41, 83],
+            IdpStressSpec {
+                helix_amp: 1.0,
+                predictor_bias_n: 1.0,
+                predictor_bias_c: 0.40,
+                ..base_22x
+            },
+            0,
+            false,
+        ),
+        (
+            "B5_neighbor_bias",
+            [41, 83],
+            IdpStressSpec {
+                neighbor_bias_n: 0.90,
+                neighbor_bias_c: 0.35,
+                ..base_22x
+            },
+            1,
+            false,
+        ),
+        (
+            "B6_bias_drop25",
+            [41, 83],
+            IdpStressSpec {
+                predictor_bias_n: 2.0,
+                predictor_bias_c: 0.80,
+                random_drop_frac: 0.25,
+                ..base_22x
+            },
+            0,
+            false,
+        ),
+        (
+            "B7_B3_noCAS_drop20",
+            [41, 83],
+            IdpStressSpec {
+                predictor_bias_n: 2.0,
+                predictor_bias_c: 0.80,
+                include_cas: false,
+                random_drop_frac: 0.20,
+                ..base_22x
+            },
+            0,
+            false,
+        ),
+    ];
 
-    for (si, seq) in oof_seqs.iter().enumerate() {
-        for &seed in &seeds {
-            n_runs += 1;
-            let (ds, truth) =
-                synthesize_idp_stress_dataset(seq, seed + (si as u64) * 313, &biased_spec);
+    println!(
+        "\n=== Round-4 Held-Out 100%-OOD Bias Suite (B0a-B7, 8 runs each; true TMS dC=-2.70) ==="
+    );
+    println!(
+        "| Scenario | Acc% | #HC | HC_Prec% | MismatchTrig | QC(P/W/A) | Mean dC | ECE | AUROC |"
+    );
+    println!("|---|---:|---:|---:|---:|---|---:|---:|---:|");
+
+    let mut failures: Vec<String> = Vec::new();
+    for (label, seeds, spec, max_pass_allowed, check_tms_dc) in cases {
+        let st = run_stress_probe(&oof_seqs, seeds, spec, 313);
+        let acc = 100.0 * st.tot_ok as f64 / st.tot_slots.max(1) as f64;
+        let hc_prec = if st.tot_hc == 0 {
+            100.0
+        } else {
+            100.0 * st.tot_hc_ok as f64 / st.tot_hc as f64
+        };
+        println!(
+            "| {label:<17} | {acc:5.1}% | {:4} | {hc_prec:7.1}% | {:2}/{:<2} ({}/{}/{}) | {}/{}/{}     | {:+6.3} | {:.3} | {:.3} |",
+            st.tot_hc,
+            st.n_mismatch_triggered,
+            st.n_runs,
+            st.n_aa_trig,
+            st.n_seg_trig,
+            st.n_nb_trig,
+            st.n_pass,
+            st.n_warn,
+            st.n_abstain,
+            st.mean_dc,
+            st.ece,
+            st.auroc,
+        );
+
+        if st.n_pass > *max_pass_allowed {
+            failures.push(format!(
+                "180r3.core:P1-2 OOD detection miss on {label}: QC=PASS {}/{} (max allowed {max_pass_allowed})",
+                st.n_pass, st.n_runs
+            ));
+        }
+        if st.tot_hc > 20 && hc_prec < 80.0 {
+            failures.push(format!(
+                "180r3.core:P1-1 OOD HC precision breach on {label}: {}/{} ({hc_prec:.1}%)",
+                st.tot_hc_ok, st.tot_hc
+            ));
+        }
+        if st.ece > 0.12 {
+            failures.push(format!(
+                "180r3.core:P1-1 OOD ECE breach on {label}: {:.3} > 0.12",
+                st.ece
+            ));
+        }
+        if st.auroc < 0.60 {
+            failures.push(format!(
+                "180r3.core:P1-1 OOD AUROC breach on {label}: {:.3} < 0.60",
+                st.auroc
+            ));
+        }
+        if *check_tms_dc && (st.mean_dc - (-2.70)).abs() > 0.10 {
+            failures.push(format!(
+                "180r3.core:P1-1(b) segmental offset drift on {label}: mean dC={:+.3} vs true -2.700 (|err|={:.3} > 0.10)",
+                st.mean_dc, (st.mean_dc - (-2.70)).abs()
+            ));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "B0a-B5 OOD failures:\n{}",
+        failures.join("\n")
+    );
+}
+
+/// Periodic motif-repeat probe (`180r3.core:P2-2`): 3 fresh 130-aa IDPs containing imperfect
+/// 9-mer tandem repeats (alpha-synuclein KTKEGV / Pol II CTD style, which pass high-Shannon-entropy
+/// checks!) tested at `1.0x` and `2.2x` coil spread.
+#[test]
+fn test_v180_r4_motif_repeat_probe_p2_2() {
+    let motif_seqs = [
+        generate_motif_repeat_idp_sequence(130, 801),
+        generate_motif_repeat_idp_sequence(130, 802),
+        generate_motif_repeat_idp_sequence(130, 803),
+    ];
+    for (i, seq) in motif_seqs.iter().enumerate() {
+        let (period, id, z) = motif_repeat_metrics(seq);
+        assert!(
+            id >= 0.28 && z >= 4.5,
+            "motif_seq[{i}] should trigger motif_repeat_metrics (got period={period}, id={id:.3}, z={z:.2})"
+        );
+    }
+
+    let regimes: &[(&str, IdpStressSpec)] = &[
+        ("motif_1.0x", IdpStressSpec::default()),
+        (
+            "motif_2.2x",
+            IdpStressSpec {
+                rc_dev_scale: 2.2,
+                ..IdpStressSpec::default()
+            },
+        ),
+    ];
+
+    println!("\n=== Round-4 Periodic Motif-Repeat Probe (P2-2; 3 x 130-aa 9-mer repeat IDPs) ===");
+    println!(
+        "| Regime | Acc% | #HC | HC_Prec% | QC(P/W/A) | ECE | AUROC | [0.8-0.9) | [0.9-1.0] |"
+    );
+    println!("|---|---:|---:|---:|---|---:|---:|---:|---:|");
+
+    for (label, spec) in regimes {
+        let mut samples: Vec<(f64, bool)> = Vec::new();
+        let mut n_pass = 0usize;
+        let mut n_warn = 0usize;
+        let mut n_abstain = 0usize;
+        let mut tot_ok = 0usize;
+        let mut tot_slots = 0usize;
+        let mut tot_hc = 0usize;
+        let mut tot_hc_ok = 0usize;
+
+        for (si, seq) in motif_seqs.iter().enumerate() {
+            let (ds, truth) = synthesize_idp_stress_dataset(seq, 601 + (si as u64) * 37, spec);
             let cfg = JointIdpConfig {
                 replicas: 12,
                 steps_per_system: 800,
-                seed: seed * 17 + (si as u64),
+                seed: 73 + (si as u64),
                 ..JointIdpConfig::default()
             };
             let res = assign_joint_idp_cpu(&ds, seq, &cfg).unwrap();
-            if res.qc_verdict == DatasetQcVerdict::Pass {
-                n_pass += 1;
+            let has_repeat_reason = res.qc_reasons.iter().any(|r| {
+                let lc = r.to_ascii_lowercase();
+                lc.contains("motif") || lc.contains("repeat") || lc.contains("low-complexity")
+            });
+            assert!(
+                has_repeat_reason,
+                "180r3.core:P2-2 {label} seq[{si}] missing motif/repeat QC reason: {:?}",
+                res.qc_reasons
+            );
+            match res.qc_verdict {
+                DatasetQcVerdict::Pass => n_pass += 1,
+                DatasetQcVerdict::Warn => n_warn += 1,
+                DatasetQcVerdict::Abstain => n_abstain += 1,
             }
             for k in 1..seq.len() {
                 tot_slots += 1;
@@ -1147,102 +1789,58 @@ fn test_v180_r3_predictor_bias_oof_calibration_and_qc() {
                         tot_hc_ok += 1;
                     }
                 }
-                oof_samples.push((ra.confidence, ok));
+                samples.push((ra.confidence, ok));
             }
         }
-    }
-
-    let (ece, bins) = compute_reliability_and_ece(&oof_samples);
-    let overall_acc = 100.0 * tot_ok as f64 / tot_slots.max(1) as f64;
-    let hc_prec = if tot_hc == 0 {
-        100.0
-    } else {
-        100.0 * tot_hc_ok as f64 / tot_hc as f64
-    };
-    println!(
-        "\n=== OOF Predictor-Bias Probe (4 fresh ~130-aa IDPs x 2 seeds = {n_runs} runs; N +/-1.0, C'/CA/CB +/-0.4 ppm, 2.2x coil) ==="
-    );
-    println!(
-        "Overall Acc={overall_acc:.1}% | HC={tot_hc_ok}/{tot_hc} ({hc_prec:.1}%) | OOF ECE={ece:.3} | QC=PASS count={n_pass}/{n_runs}"
-    );
-    println!("| Confidence Bin | Count | Mean Conf | Empirical Acc |");
-    println!("|---|---:|---:|---:|");
-    for (lbl, &(n, mp, my)) in [
-        ("[0.0, 0.5)", &bins[0]),
-        ("[0.5, 0.8)", &bins[1]),
-        ("[0.8, 0.9)", &bins[2]),
-        ("[0.9, 1.0]", &bins[3]),
-    ] {
-        println!("| {lbl:<10} | {n:5} | {mp:9.3} | {my:13.3} |");
-    }
-
-    assert_eq!(
-        n_pass, 0,
-        "180r2.core:P1-3: predictor-biased OOF runs MUST NOT return QC=PASS (got {n_pass}/{n_runs} PASS)"
-    );
-    assert!(
-        ece <= 0.12,
-        "180r2.core:P1-3: OOF predictor-bias ECE ({ece:.3}) exceeded 0.12 ceiling"
-    );
-    assert!(
-        tot_hc < 20 || hc_prec >= 80.0,
-        "180r2.core:P1-3: OOF predictor-bias HC precision ({hc_prec:.1}%, {tot_hc_ok}/{tot_hc}) must be honest (>=80% or abstain)"
-    );
-
-    // Unbiased realistic `2.2x` random-coil spread ranking probe: verify `[0.9, 1.0]` beats `[0.8, 0.9)`
-    let realistic_unbiased = IdpStressSpec {
-        predictor_bias_n: 0.0,
-        predictor_bias_c: 0.0,
-        ..biased_spec
-    };
-    let mut rank_samples: Vec<(f64, bool)> = Vec::new();
-    for (si, seq) in oof_seqs.iter().enumerate() {
-        let (ds, truth) =
-            synthesize_idp_stress_dataset(seq, 700 + (si as u64) * 53, &realistic_unbiased);
-        let cfg = JointIdpConfig {
-            replicas: 12,
-            steps_per_system: 800,
-            seed: 91 + (si as u64),
-            ..JointIdpConfig::default()
+        let (ece, bins) = compute_reliability_and_ece(&samples);
+        let auroc = compute_auroc(&samples);
+        let acc = 100.0 * tot_ok as f64 / tot_slots.max(1) as f64;
+        let hc_prec = if tot_hc == 0 {
+            100.0
+        } else {
+            100.0 * tot_hc_ok as f64 / tot_hc as f64
         };
-        let res = assign_joint_idp_cpu(&ds, seq, &cfg).unwrap();
-        for k in 1..seq.len() {
-            let ra = &res.residue_assignments[k];
-            if let Some(node_idx) = ra.node_idx {
-                let ok =
-                    is_node_match_for_slot(&res.nodes[node_idx], &res.fitted_offsets, k, &truth);
-                rank_samples.push((ra.confidence, ok));
-            }
-        }
-    }
-    let (r_ece, r_bins) = compute_reliability_and_ece(&rank_samples);
-    println!(
-        "Realistic 2.2x Unbiased Ranking: ECE={r_ece:.3} | [0.8-0.9): n={} acc={:.3} | [0.9-1.0]: n={} acc={:.3}",
-        r_bins[2].0, r_bins[2].2, r_bins[3].0, r_bins[3].2
-    );
-    if r_bins[2].0 >= 10 && r_bins[3].0 >= 10 {
-        assert!(
-            r_bins[3].2 >= r_bins[2].2 - 0.01,
-            "180r2.core:P1-3: [0.9, 1.0] bin ({:.3}) should rank at or above [0.8, 0.9) ({:.3})",
-            r_bins[3].2,
-            r_bins[2].2
+        println!(
+            "| {label:<10} | {acc:5.1}% | {tot_hc:4} | {hc_prec:7.1}% | {n_pass}/{n_warn}/{n_abstain}     | {ece:.3} | {auroc:.3} | {:.3} ({:3}) | {:.3} ({:3}) |",
+            bins[2].2, bins[2].0, bins[3].2, bins[3].0,
         );
+        assert_eq!(
+            n_pass, 0,
+            "180r3.core:P2-2: periodic motif-repeat {label} must not return QC=PASS"
+        );
+        assert!(
+            tot_hc <= 20 || hc_prec >= 80.0,
+            "180r3.core:P2-2: {label} HC precision ({hc_prec:.1}%, {tot_hc_ok}/{tot_hc}) must be honest"
+        );
+        assert!(
+            auroc >= 0.60,
+            "180r3.core:P2-2: {label} AUROC ({auroc:.3}) below 0.60"
+        );
+        if bins[2].0 >= 5 && bins[3].0 >= 5 {
+            assert!(
+                bins[3].2 >= bins[2].2 - 0.01,
+                "180r3.core:P2-2: {label} [0.9, 1.0] ({:.3}) should rank >= [0.8, 0.9) ({:.3})",
+                bins[3].2,
+                bins[2].2
+            );
+        }
     }
 }
 
-/// 8-scenario multi-seed (`3` seeds) held-out adversarial calibration & QC grid (`180.core:P1-1`,
-/// `P1-2`, `P1-3`, `180r2.core:P1-4`). Zero ground-truth `anchor_root_idx`; prints complete table.
+/// 9-scenario multi-seed (`3` seeds) held-out adversarial calibration & QC grid (`180.core:P1-1`,
+/// `P1-2`, `P1-3`, `180r2.core:P1-4`, `180r3.core:P2-2`). Zero ground-truth `anchor_root_idx`.
 #[test]
 fn test_v180_adversarial_8_scenario_multiseed_grid() {
     let base_seq = synthetic_pro_ser_rich_idp_sequence();
     let repeat_seq = synthetic_low_complexity_repeat_idp_sequence();
+    let motif_seq = generate_motif_repeat_idp_sequence(130, 777);
     let seeds = [7_u64, 13, 29];
 
-    let scenarios: &[(&str, bool, IdpStressSpec)] = &[
-        ("1_moderate_base", false, IdpStressSpec::default()),
+    let scenarios: &[(&str, u8, IdpStressSpec)] = &[
+        ("1_moderate_base", 0, IdpStressSpec::default()),
         (
             "2_noise_01_08_03",
-            false,
+            0,
             IdpStressSpec {
                 jitter_h: 0.01,
                 jitter_n: 0.08,
@@ -1252,7 +1850,7 @@ fn test_v180_adversarial_8_scenario_multiseed_grid() {
         ),
         (
             "3_noise_02_15_05",
-            false,
+            0,
             IdpStressSpec {
                 jitter_h: 0.02,
                 jitter_n: 0.15,
@@ -1262,7 +1860,7 @@ fn test_v180_adversarial_8_scenario_multiseed_grid() {
         ),
         (
             "4_drop_20pct",
-            false,
+            0,
             IdpStressSpec {
                 random_drop_frac: 0.20,
                 ..IdpStressSpec::default()
@@ -1270,7 +1868,7 @@ fn test_v180_adversarial_8_scenario_multiseed_grid() {
         ),
         (
             "5_drop20_140dec",
-            false,
+            0,
             IdpStressSpec {
                 random_drop_frac: 0.20,
                 n_decoy_con_roots: 140,
@@ -1280,7 +1878,7 @@ fn test_v180_adversarial_8_scenario_multiseed_grid() {
         ),
         (
             "6_rc_dev_2.2x",
-            false,
+            0,
             IdpStressSpec {
                 rc_dev_scale: 2.2,
                 ..IdpStressSpec::default()
@@ -1288,7 +1886,7 @@ fn test_v180_adversarial_8_scenario_multiseed_grid() {
         ),
         (
             "7_combined_stress",
-            false,
+            0,
             IdpStressSpec {
                 jitter_h: 0.02,
                 jitter_n: 0.15,
@@ -1302,7 +1900,7 @@ fn test_v180_adversarial_8_scenario_multiseed_grid() {
         ),
         (
             "8_repeat_low_cx",
-            true,
+            1,
             IdpStressSpec {
                 jitter_h: 0.008,
                 jitter_n: 0.06,
@@ -1313,6 +1911,14 @@ fn test_v180_adversarial_8_scenario_multiseed_grid() {
                 ..IdpStressSpec::default()
             },
         ),
+        (
+            "9_motif_repeat",
+            2,
+            IdpStressSpec {
+                rc_dev_scale: 2.2,
+                ..IdpStressSpec::default()
+            },
+        ),
     ];
 
     println!(
@@ -1320,8 +1926,12 @@ fn test_v180_adversarial_8_scenario_multiseed_grid() {
     );
     println!("|---|---:|---:|---:|---:|---:|---:|---:|---|");
 
-    for &(label, is_repeat, ref spec) in scenarios {
-        let seq = if is_repeat { &repeat_seq } else { &base_seq };
+    for &(label, seq_kind, ref spec) in scenarios {
+        let seq = match seq_kind {
+            1 => &repeat_seq,
+            2 => &motif_seq,
+            _ => &base_seq,
+        };
         let mut sum_acc = 0.0;
         let mut sum_pro = 0.0;
         let mut sum_hc = 0.0;

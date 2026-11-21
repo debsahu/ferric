@@ -107,6 +107,12 @@ pub struct NefMetaData {
     pub creation_date: String,
     pub uuid: String,
     pub coordinate_file_name: Option<String>,
+    /// Optional FERRIC unlabelled QC verdict (`PASS`/`WARN`/`ABSTAIN`, `180r3.cli:P2-1`).
+    #[serde(default)]
+    pub ferric_qc_verdict: Option<String>,
+    /// Optional FERRIC provisional-output notice persisted in structured NEF metadata (`180r3.cli:P2-1`).
+    #[serde(default)]
+    pub ferric_provisional_status: Option<String>,
 }
 
 impl Default for NefMetaData {
@@ -119,6 +125,8 @@ impl Default for NefMetaData {
             creation_date: "2026-01-01T00:00:00Z".to_string(),
             uuid: "ferric-1.1-0001".to_string(),
             coordinate_file_name: None,
+            ferric_qc_verdict: None,
+            ferric_provisional_status: None,
         }
     }
 }
@@ -1655,6 +1663,12 @@ pub fn read_nef_str(text: &str) -> Result<NefDocument, String> {
             if let Some(v) = sf.tags.get("_nef_nmr_meta_data.coordinate_file_name") {
                 doc.meta_data.coordinate_file_name = opt_str(v);
             }
+            if let Some(v) = sf.tags.get("_nef_nmr_meta_data.ferric_qc_verdict") {
+                doc.meta_data.ferric_qc_verdict = opt_str(v);
+            }
+            if let Some(v) = sf.tags.get("_nef_nmr_meta_data.ferric_provisional_status") {
+                doc.meta_data.ferric_provisional_status = opt_str(v);
+            }
         } else if cat == "nef_molecular_system"
             || sf.name.eq_ignore_ascii_case("nef_molecular_system")
         {
@@ -2876,6 +2890,18 @@ pub fn write_nef_str(doc: &NefDocument) -> String {
             fmt_val(coord)
         ));
     }
+    if let Some(ref qc) = doc.meta_data.ferric_qc_verdict {
+        out.push_str(&format!(
+            "   _nef_nmr_meta_data.ferric_qc_verdict     {}\n",
+            fmt_val(qc)
+        ));
+    }
+    if let Some(ref prov) = doc.meta_data.ferric_provisional_status {
+        out.push_str(&format!(
+            "   _nef_nmr_meta_data.ferric_provisional_status {}\n",
+            fmt_val(prov)
+        ));
+    }
     out.push_str("save_\n\n");
 
     // 2. save_nef_molecular_system
@@ -3890,5 +3916,29 @@ save_
             roundtripped.rdc_restraint_lists[0].restraints[0].insertion_code_1,
             Some('A')
         );
+    }
+
+    #[test]
+    fn test_nef_ferric_qc_metadata_roundtrip_after_stripping_comments() {
+        let mut doc = NefDocument::new("idp_joint_provisional");
+        doc.meta_data.ferric_qc_verdict = Some("ABSTAIN".to_string());
+        doc.meta_data.ferric_provisional_status =
+            Some("PROVISIONAL (QC=ABSTAIN): do not treat as validated assignments".to_string());
+        let raw = format!("# PROVISIONAL (QC=ABSTAIN)\n{}", write_nef_str(&doc));
+        let stripped: String = raw
+            .lines()
+            .filter(|l| !l.trim_start().starts_with('#'))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let parsed = read_nef_str(&stripped).expect("comment-stripped NEF must parse cleanly");
+        assert_eq!(
+            parsed.meta_data.ferric_qc_verdict.as_deref(),
+            Some("ABSTAIN")
+        );
+        assert!(parsed
+            .meta_data
+            .ferric_provisional_status
+            .as_deref()
+            .is_some_and(|s| s.contains("PROVISIONAL (QC=ABSTAIN)")));
     }
 }

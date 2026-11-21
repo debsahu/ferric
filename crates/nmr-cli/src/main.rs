@@ -3193,6 +3193,12 @@ fn write_joint_idp_star(path: &Path, wf: &JointIdpWorkflowOutput) -> Result<(), 
     let raw =
         fs::read_to_string(path).map_err(|e| format!("failed to read {}: {e}", path.display()))?;
     let anchor = "   _Assigned_chem_shift_list.Sf_category  assigned_chemical_shifts";
+    if !raw.contains(anchor) {
+        return Err(format!(
+            "cannot inject _Assigned_chem_shift_list.Details into {}: anchor tag missing",
+            path.display()
+        ));
+    }
     let patched = raw.replacen(
         anchor,
         &format!(
@@ -3226,25 +3232,32 @@ fn write_joint_shifts_tsv(path: &Path, wf: &JointIdpWorkflowOutput) -> Result<()
     fs::write(path, tsv_lines.join("\n") + "\n").map_err(|e| format!("{e}"))
 }
 
-/// Write NEF v1.1 output for `idp-joint`, prepending an explicit `PROVISIONAL (QC=ABSTAIN)`
-/// header comment under `Abstain` (`180r2.core:P1-4`).
+/// Write NEF v1.1 output for `idp-joint`, persisting `ferric_qc_verdict` &
+/// `ferric_provisional_status` inside structured `save_nef_nmr_meta_data` tags AND prepending
+/// a comment header (`180r2.core:P1-4`, `180r3.cli:P2-1`).
 fn write_joint_idp_nef(
     path: &Path,
     project_name: &str,
     wf: &JointIdpWorkflowOutput,
     hn_peaks: &[Peak],
 ) -> Result<(), String> {
-    let nef_doc =
+    let mut nef_doc =
         NefDocument::from_reference_and_peaks(project_name, &wf.pred, Some(&wf.conf), hn_peaks);
+    let reasons = joint_qc_reasons_summary(wf);
+    nef_doc.meta_data.ferric_qc_verdict = Some(wf.result.qc_verdict.as_str().to_string());
+    nef_doc.meta_data.ferric_provisional_status = match wf.result.qc_verdict {
+        nmr_core::qc::DatasetQcVerdict::Abstain => Some(format!(
+            "PROVISIONAL (QC=ABSTAIN): {reasons}; do not treat as validated assignments"
+        )),
+        nmr_core::qc::DatasetQcVerdict::Warn => Some(format!("QC=WARN: {reasons}")),
+        nmr_core::qc::DatasetQcVerdict::Pass => Some("QC=PASS".to_string()),
+    };
     let body = nmr_core::nef::write_nef_str(&nef_doc);
     let text = match wf.result.qc_verdict {
         nmr_core::qc::DatasetQcVerdict::Abstain => format!(
-            "# PROVISIONAL (QC=ABSTAIN): {}; do not treat as validated assignments\n{body}",
-            joint_qc_reasons_summary(wf)
+            "# PROVISIONAL (QC=ABSTAIN): {reasons}; do not treat as validated assignments\n{body}"
         ),
-        nmr_core::qc::DatasetQcVerdict::Warn => {
-            format!("# QC=WARN: {}\n{body}", joint_qc_reasons_summary(wf))
-        }
+        nmr_core::qc::DatasetQcVerdict::Warn => format!("# QC=WARN: {reasons}\n{body}"),
         nmr_core::qc::DatasetQcVerdict::Pass => body,
     };
     fs::write(path, text).map_err(|e| format!("failed to write NEF file {}: {e}", path.display()))
@@ -4336,7 +4349,8 @@ fn cmd_assign(args: &[String]) -> Result<(), String> {
             }
             emit_joint_abstain_advisory(&wf);
             if let Some(ref rp) = report_out_path {
-                let mut rep = ReportInput::new("idp_joint", wf.pred.clone(), wf.conf.clone());
+                let mut rep = ReportInput::new("idp_joint", wf.pred.clone(), wf.conf.clone())
+                    .with_qc_status(wf.result.qc_verdict, wf.result.qc_reasons.clone());
                 rep.n_peaks = Some(
                     dataset.hn_peaks.len()
                         + dataset.c13_dataset.con_roots.len()
@@ -4346,8 +4360,10 @@ fn cmd_assign(args: &[String]) -> Result<(), String> {
                 rep.solver_score = Some(wf.result.score);
                 rep.elapsed_secs = Some(dt_solve);
                 rep.engine_label = Some(wf.engine_label.clone());
-                let prop_cfg = build_propensity_config(temp_k, ph_opt)?;
-                rep = rep.with_propensity_report(compute_idp_propensity(&wf.pred, &prop_cfg));
+                if wf.result.qc_verdict != nmr_core::qc::DatasetQcVerdict::Abstain {
+                    let prop_cfg = build_propensity_config(temp_k, ph_opt)?;
+                    rep = rep.with_propensity_report(compute_idp_propensity(&wf.pred, &prop_cfg));
+                }
                 write_quality_report_html(rp, &rep)?;
             }
 
@@ -8359,10 +8375,15 @@ fn cmd_pipeline(args: &[String]) -> Result<(), String> {
 
         let prop_cfg = build_propensity_config(report_opts.temp_k, report_opts.ph)?;
         let prop_rep = compute_idp_propensity(&wf.pred, &prop_cfg);
-        fs::write(&prop_out, format!("{}\n", format_propensity_tsv(&prop_rep)))
-            .map_err(|e| format!("{e}"))?;
+        let prop_tsv = nmr_core::idp_propensity::format_propensity_tsv_with_qc(
+            &prop_rep,
+            wf.result.qc_verdict,
+            &wf.result.qc_reasons,
+        );
+        fs::write(&prop_out, format!("{prop_tsv}\n")).map_err(|e| format!("{e}"))?;
 
-        let mut rep = ReportInput::new(&project_name, wf.pred.clone(), wf.conf.clone());
+        let mut rep = ReportInput::new(&project_name, wf.pred.clone(), wf.conf.clone())
+            .with_qc_status(wf.result.qc_verdict, wf.result.qc_reasons.clone());
         rep.n_peaks = Some(
             dataset.hn_peaks.len()
                 + dataset.c13_dataset.con_roots.len()
@@ -8372,8 +8393,10 @@ fn cmd_pipeline(args: &[String]) -> Result<(), String> {
         rep.solver_score = Some(wf.result.score);
         rep.elapsed_secs = Some(dt_solve);
         rep.engine_label = Some(wf.engine_label.clone());
-        rep.dihedrals = predict_csi_dihedrals(&wf.pred);
-        rep = rep.with_propensity_report(prop_rep);
+        if wf.result.qc_verdict != nmr_core::qc::DatasetQcVerdict::Abstain {
+            rep.dihedrals = predict_csi_dihedrals(&wf.pred);
+            rep = rep.with_propensity_report(prop_rep);
+        }
         write_quality_report_html(&html_out, &rep)?;
 
         let dt_total = t_total.elapsed().as_secs_f64();
@@ -11577,6 +11600,7 @@ seq#\tresidue\tH\tN\tC\tCA\tsidechains
         let out_prefix = dir.join("abstain_out");
         let json_out = dir.join("abstain.json");
         let nef_out = dir.join("abstain.nef");
+        let report_out = dir.join("abstain_report.html");
 
         cmd_assign(&[
             "--regime".into(),
@@ -11597,6 +11621,8 @@ seq#\tresidue\tH\tN\tC\tCA\tsidechains
             json_out.to_string_lossy().into_owned(),
             "--nef-out".into(),
             nef_out.to_string_lossy().into_owned(),
+            "--report-out".into(),
+            report_out.to_string_lossy().into_owned(),
             "--out".into(),
             out_prefix.to_string_lossy().into_owned(),
         ])
@@ -11630,6 +11656,33 @@ seq#\tresidue\tH\tN\tC\tCA\tsidechains
             nef_txt.contains("PROVISIONAL (QC=ABSTAIN)"),
             "180r2.core:P1-4: NEF must mark PROVISIONAL (QC=ABSTAIN)"
         );
+        // P2-1: structured NEF metadata must survive stripping `#` comments!
+        let nef_stripped: String = nef_txt
+            .lines()
+            .filter(|l| !l.trim_start().starts_with('#'))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let parsed_nef = nmr_core::nef::read_nef_str(&nef_stripped)
+            .expect("comment-stripped assign NEF must parse");
+        assert_eq!(
+            parsed_nef.meta_data.ferric_qc_verdict.as_deref(),
+            Some("ABSTAIN")
+        );
+        assert!(parsed_nef
+            .meta_data
+            .ferric_provisional_status
+            .as_deref()
+            .is_some_and(|s| s.contains("PROVISIONAL (QC=ABSTAIN)")));
+
+        // P1-3: assign --report-out HTML must display red #qc-status-banner and withhold propensity
+        let assign_html = fs::read_to_string(&report_out).unwrap();
+        assert!(
+            assign_html.contains("id=\"qc-status-banner\"")
+                && assign_html.contains("PROVISIONAL_OUTPUT: QC=ABSTAIN")
+                && !assign_html.contains("id=\"section-idp-propensity\"")
+                && !assign_html.contains("id=\"svg-idp-propensity-track\""),
+            "180r3.cli:P1-3: assign HTML report must show QC=ABSTAIN banner and withhold propensity"
+        );
 
         // Also verify `cmd_pipeline` auto-selects `idp-joint` and writes identical provisional flags
         let pipe_dir = dir.join("pipe_abstain");
@@ -11653,6 +11706,8 @@ seq#\tresidue\tH\tN\tC\tCA\tsidechains
 
         let p_star = fs::read_to_string(pipe_dir.join("shifts.str")).unwrap();
         let p_tsv = fs::read_to_string(pipe_dir.join("shifts.tsv")).unwrap();
+        let p_prop = fs::read_to_string(pipe_dir.join("propensity.tsv")).unwrap();
+        let p_html = fs::read_to_string(pipe_dir.join("report.html")).unwrap();
         let p_json: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(pipe_dir.join("joint_summary.json")).unwrap())
                 .unwrap();
@@ -11661,9 +11716,38 @@ seq#\tresidue\tH\tN\tC\tCA\tsidechains
         assert!(p_star.contains("PROVISIONAL (QC=ABSTAIN)"));
         assert!(p_tsv.starts_with("# PROVISIONAL_OUTPUT: QC=ABSTAIN"));
         assert!(p_tsv.contains("\tABSTAIN"));
+        assert!(
+            p_prop.starts_with("# PROVISIONAL_OUTPUT: QC=ABSTAIN")
+                && p_prop.contains("\tqc_verdict\n")
+                && p_prop.contains("\tABSTAIN\n"),
+            "180r3.cli:P1-3: pipeline propensity.tsv must carry PROVISIONAL header & qc_verdict=ABSTAIN"
+        );
+        assert!(
+            p_html.contains("id=\"qc-status-banner\"")
+                && p_html.contains("PROVISIONAL_OUTPUT: QC=ABSTAIN")
+                && !p_html.contains("id=\"section-idp-propensity\"")
+                && !p_html.contains("id=\"svg-idp-propensity-track\""),
+            "180r3.cli:P1-3: pipeline report.html must show QC=ABSTAIN banner and withhold propensity"
+        );
         assert_eq!(p_json["qc_verdict"], "ABSTAIN");
         assert_eq!(p_json["provisional"], true);
         assert!(p_nef.contains("PROVISIONAL (QC=ABSTAIN)"));
+        let p_nef_stripped: String = p_nef
+            .lines()
+            .filter(|l| !l.trim_start().starts_with('#'))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let p_parsed_nef = nmr_core::nef::read_nef_str(&p_nef_stripped)
+            .expect("comment-stripped pipeline NEF must parse");
+        assert_eq!(
+            p_parsed_nef.meta_data.ferric_qc_verdict.as_deref(),
+            Some("ABSTAIN")
+        );
+        assert!(p_parsed_nef
+            .meta_data
+            .ferric_provisional_status
+            .as_deref()
+            .is_some_and(|s| s.contains("PROVISIONAL (QC=ABSTAIN)")));
 
         let _ = fs::remove_dir_all(&dir);
     }

@@ -5298,6 +5298,20 @@ impl NmrWorkbenchApp {
     }
 
     fn refresh_propensity_report(&mut self) {
+        // Under `IdpJoint` + `QC=ABSTAIN`, withhold secondary-structure propensity even if a prior
+        // reference STAR is still loaded (`180r3.cli:P1-3` / Wave 2 Round-4).
+        if self.regime_kind == GuiRegimeKind::IdpJoint
+            && self
+                .joint_idp_result
+                .as_ref()
+                .is_some_and(|jr| jr.qc_verdict == DatasetQcVerdict::Abstain)
+        {
+            self.propensity_report = None;
+            self.ss_ribbon_state.cached_propensity = None;
+            self.sync_ss_ribbon_and_concordance();
+            self.mol3d_panel.flush_pending_updates();
+            return;
+        }
         let Some(src_ref) = self.pred_ref.as_ref().or(self.reference.as_ref()) else {
             self.propensity_report = None;
             self.sync_ss_ribbon_and_concordance();
@@ -14401,6 +14415,132 @@ impl NmrWorkbenchApp {
         self.status_msg = msg;
     }
 
+    /// Build a [`ReportInput`] shared by both GUI `ExportQualityReportHtml` and MCP `"html"`
+    /// exports, propagating `IdpJoint` `QC=ABSTAIN` / `QC=WARN` / `QC=PASS` status and withholding
+    /// dihedrals & SSP propensity whenever `QC=ABSTAIN` (`180r3.cli:P1-3`, Wave 2 Round-4).
+    fn build_quality_report_input(&mut self) -> Option<ReportInput> {
+        if self.regime_kind == GuiRegimeKind::IdpJoint {
+            if let Some(jr) = self.joint_idp_result.clone() {
+                let is_abstain = jr.qc_verdict == DatasetQcVerdict::Abstain;
+                let (pred, conf) = if is_abstain {
+                    (
+                        Reference {
+                            sequence: self.sequence.clone(),
+                            seq_ids: self.seq_ids.clone(),
+                            shifts: BTreeMap::new(),
+                            ambiguity_codes: BTreeMap::new(),
+                        },
+                        BTreeMap::new(),
+                    )
+                } else {
+                    if self.show_propensity_panel && self.propensity_report.is_none() {
+                        self.refresh_propensity_report();
+                    }
+                    let pred = self.pred_ref.clone().unwrap_or_else(|| {
+                        joint_idp_to_reference(&jr, &self.sequence, &self.seq_ids).0
+                    });
+                    (pred, self.pred_conf.clone())
+                };
+                let mut inp =
+                    ReportInput::new(self.session.state.protein_name.clone(), pred.clone(), conf)
+                        .with_qc_status(jr.qc_verdict, jr.qc_reasons.clone());
+                let c13_peaks = self
+                    .c13_picked_dataset
+                    .as_ref()
+                    .map(|ds| ds.con_roots.len() + ds.strip_peaks.len())
+                    .unwrap_or(0);
+                inp.n_peaks = Some(self.peaks.len() + c13_peaks);
+                inp.n_spin_systems = Some(jr.nodes.len());
+                inp.solver_score = Some(jr.score);
+                inp.axis_rescue_records = self.axis_rescue_audits.clone();
+                inp.engine_label = Some(if is_abstain {
+                    "IDP-Joint (PROVISIONAL - QC=ABSTAIN)".to_string()
+                } else {
+                    format!("IDP-Joint (QC={})", jr.qc_verdict.as_str())
+                });
+                if is_abstain {
+                    inp.dihedrals.clear();
+                    inp.propensity_report = None;
+                } else {
+                    inp.dihedrals = predict_csi_dihedrals(&pred);
+                    if self.show_propensity_panel {
+                        inp.propensity_report = self.propensity_report.clone();
+                    }
+                }
+                return Some(inp);
+            }
+        }
+
+        let pred = self.pred_ref.clone().or_else(|| self.reference.clone())?;
+        if (self.regime_kind == GuiRegimeKind::Idp13C || self.show_propensity_panel)
+            && self.propensity_report.is_none()
+        {
+            self.refresh_propensity_report();
+        }
+        let mut inp = ReportInput::new(
+            self.session.state.protein_name.clone(),
+            pred.clone(),
+            self.pred_conf.clone(),
+        );
+        inp.n_peaks = Some(self.peaks.len());
+        inp.n_spin_systems = Some(self.systems.len());
+        inp.dihedrals = predict_csi_dihedrals(&pred);
+        inp.axis_rescue_records = self.axis_rescue_audits.clone();
+        if let Some(res) = &self.assign_res {
+            inp.solver_score = Some(res.score);
+            inp.systems_and_assignment = Some((self.systems.clone(), res.clone()));
+        }
+        if let Some((t_crit, max_cv, mu_null)) = self.last_bayes_sa_telemetry {
+            inp.engine_label = Some(format!(
+                "{} [T_crit={t_crit:.4} | max_Cv={max_cv:.3} | mu_null={mu_null:.4}]",
+                self.solver_kind.label()
+            ));
+        } else {
+            inp.engine_label = Some(self.solver_kind.label().to_string());
+        }
+        if self.regime_kind == GuiRegimeKind::Idp13C || self.show_propensity_panel {
+            inp.propensity_report = self.propensity_report.clone();
+        }
+        Some(inp)
+    }
+
+    /// Format the NEF session text, injecting structured `_nef_nmr_meta_data.ferric_qc_verdict`
+    /// and `_nef_nmr_meta_data.ferric_provisional_status` whenever `IdpJoint` has a live result
+    /// (`180r3.cli:P2-1`, Wave 2 Round-4).
+    fn format_session_nef_with_joint_qc(&mut self) -> String {
+        let raw = self.session.save_to_nef_string();
+        if self.regime_kind != GuiRegimeKind::IdpJoint {
+            return raw;
+        }
+        let Some(ref jr) = self.joint_idp_result else {
+            return raw;
+        };
+        let Ok(mut doc) = read_nef_str(&raw) else {
+            return raw;
+        };
+        let reasons = if jr.qc_reasons.is_empty() {
+            "no QC anomalies reported".to_string()
+        } else {
+            jr.qc_reasons.join("; ")
+        };
+        doc.meta_data.ferric_qc_verdict = Some(jr.qc_verdict.as_str().to_string());
+        doc.meta_data.ferric_provisional_status = match jr.qc_verdict {
+            DatasetQcVerdict::Abstain => Some(format!(
+                "PROVISIONAL (QC=ABSTAIN): {reasons}; do not treat as validated assignments"
+            )),
+            DatasetQcVerdict::Warn => Some(format!("QC=WARN: {reasons}")),
+            DatasetQcVerdict::Pass => Some("QC=PASS".to_string()),
+        };
+        let body = nmr_core::nef::write_nef_str(&doc);
+        match jr.qc_verdict {
+            DatasetQcVerdict::Abstain => format!(
+                "# PROVISIONAL (QC=ABSTAIN): {reasons}; do not treat as validated assignments\n{body}"
+            ),
+            DatasetQcVerdict::Warn => format!("# QC=WARN: {reasons}\n{body}"),
+            DatasetQcVerdict::Pass => body,
+        }
+    }
+
     fn save_session_nef_action(&mut self, ctx: &egui::Context) {
         self.session.state.sequence = self.sequence.clone();
         self.session.state.seq_ids = self.seq_ids.clone();
@@ -14419,7 +14559,7 @@ impl NmrWorkbenchApp {
         hsqc_params.ppm_nudge = self.primary_ppm_nudge;
         self.session.state.contour_layers = vec![hsqc_params];
 
-        let nef_text = self.session.save_to_nef_string();
+        let nef_text = self.format_session_nef_with_joint_qc();
         self.export_text_buf = nef_text.clone();
         self.exported_in_session = true;
 
@@ -14428,7 +14568,17 @@ impl NmrWorkbenchApp {
             let _ = ctx;
             let p = Path::new(self.export_prefix.trim()).with_extension("nef");
             match self.session.save_to_path(&p) {
-                Ok(msg) => self.status_msg = msg,
+                Ok(msg) => {
+                    if self.regime_kind == GuiRegimeKind::IdpJoint
+                        && self.joint_idp_result.is_some()
+                    {
+                        if let Err(e) = std::fs::write(&p, &nef_text) {
+                            self.status_msg = format!("NEF session save failed: {e}");
+                            return;
+                        }
+                    }
+                    self.status_msg = msg;
+                }
                 Err(e) => self.status_msg = format!("NEF session save failed: {e}"),
             }
         }
@@ -15488,36 +15638,7 @@ impl NmrWorkbenchApp {
                 self.export_results(ctx);
             }
             WorkbenchAction::ExportQualityReportHtml => {
-                if let Some(pred) = self.pred_ref.clone().or_else(|| self.reference.clone()) {
-                    if (self.regime_kind == GuiRegimeKind::Idp13C || self.show_propensity_panel)
-                        && self.propensity_report.is_none()
-                    {
-                        self.refresh_propensity_report();
-                    }
-                    let mut inp = ReportInput::new(
-                        self.session.state.protein_name.clone(),
-                        pred.clone(),
-                        self.pred_conf.clone(),
-                    );
-                    inp.n_peaks = Some(self.peaks.len());
-                    inp.n_spin_systems = Some(self.systems.len());
-                    inp.dihedrals = predict_csi_dihedrals(&pred);
-                    inp.axis_rescue_records = self.axis_rescue_audits.clone();
-                    if let Some(res) = &self.assign_res {
-                        inp.solver_score = Some(res.score);
-                        inp.systems_and_assignment = Some((self.systems.clone(), res.clone()));
-                    }
-                    if let Some((t_crit, max_cv, mu_null)) = self.last_bayes_sa_telemetry {
-                        inp.engine_label = Some(format!(
-                            "{} [T_crit={t_crit:.4} | max_Cv={max_cv:.3} | mu_null={mu_null:.4}]",
-                            self.solver_kind.label()
-                        ));
-                    } else {
-                        inp.engine_label = Some(self.solver_kind.label().to_string());
-                    }
-                    if self.regime_kind == GuiRegimeKind::Idp13C || self.show_propensity_panel {
-                        inp.propensity_report = self.propensity_report.clone();
-                    }
+                if let Some(inp) = self.build_quality_report_input() {
                     let html = generate_quality_report_html(&inp);
                     self.export_text_buf = html.clone();
                     self.exported_in_session = true;
@@ -18919,8 +19040,18 @@ impl NmrWorkbenchApp {
                                 self.session.state.sequence = self.sequence.clone();
                                 self.session.state.seq_ids = self.seq_ids.clone();
                                 self.session.state.peaks = self.peaks.clone();
+                                let nef_text = self.format_session_nef_with_joint_qc();
                                 match self.session.save_to_path(out_p) {
                                     Ok(msg) => {
+                                        if self.regime_kind == GuiRegimeKind::IdpJoint
+                                            && self.joint_idp_result.is_some()
+                                        {
+                                            if let Err(e) = std::fs::write(out_p, &nef_text) {
+                                                self.status_msg =
+                                                    format!("MCP NEF export failed: {e}");
+                                                continue;
+                                            }
+                                        }
                                         self.export_prefix = canonical_prefix;
                                         self.mcp_bridge
                                             .set_current_export_prefix(&self.export_prefix);
@@ -18933,22 +19064,7 @@ impl NmrWorkbenchApp {
                                 }
                             }
                             "html" => {
-                                if let Some(pred) =
-                                    self.pred_ref.clone().or_else(|| self.reference.clone())
-                                {
-                                    let mut inp = ReportInput::new(
-                                        self.session.state.protein_name.clone(),
-                                        pred,
-                                        self.pred_conf.clone(),
-                                    );
-                                    inp.n_peaks = Some(self.peaks.len());
-                                    inp.n_spin_systems = Some(self.systems.len());
-                                    if let Some(res) = &self.assign_res {
-                                        inp.solver_score = Some(res.score);
-                                        inp.systems_and_assignment =
-                                            Some((self.systems.clone(), res.clone()));
-                                    }
-                                    inp.engine_label = Some(self.solver_kind.label().to_string());
+                                if let Some(inp) = self.build_quality_report_input() {
                                     let html = generate_quality_report_html(&inp);
                                     match std::fs::write(out_p, &html) {
                                         Ok(()) => {
@@ -26809,6 +26925,138 @@ CBCACON\t175.41\t122.09\t30.40\t1\t520.0
         assert!(
             !app.show_mcp_bridge_window,
             "clicking desktop MCP footer pill a second time must toggle show_mcp_bridge_window off"
+        );
+    }
+
+    #[test]
+    fn test_v180_r4_joint_qc_html_and_nef_exports_abstain_warn_pass() {
+        use crate::WorkbenchAction;
+        use eframe::egui;
+        use nmr_core::nef::read_nef_str;
+        use nmr_core::qc::DatasetQcVerdict;
+        use nmr_core::report::generate_quality_report_html;
+        use nmr_gui::idp_joint_panel::IdpJointAction;
+
+        let mut app = make_headless_test_app();
+        app.handle_idp_joint_action(IdpJointAction::LoadSyntheticDemo, None);
+        assert_eq!(app.regime_kind, GuiRegimeKind::IdpJoint);
+        let base_res = app
+            .joint_idp_result
+            .clone()
+            .expect("synthetic demo produces JointIdpAssignResult");
+
+        // Keep an old reference loaded to prove QC=ABSTAIN does not fall back to stale shifts/propensity
+        app.reference = app.pred_ref.clone();
+
+        // 1. QC=ABSTAIN: withhold propensity + dihedrals, emit #qc-status-banner + PROVISIONAL_OUTPUT: QC=ABSTAIN,
+        //    and stamp structured NEF metadata tags surviving comment stripping.
+        let mut abstain_res = base_res.clone();
+        abstain_res.qc_verdict = DatasetQcVerdict::Abstain;
+        abstain_res.qc_reasons = vec![
+            "extreme repeat ambiguity".to_string(),
+            "segmental predictor mismatch".to_string(),
+        ];
+        app.apply_joint_idp_result(abstain_res, 11.0);
+        assert!(
+            app.propensity_report.is_none(),
+            "QC=ABSTAIN must clear propensity_report even when a prior reference is loaded"
+        );
+
+        let abstain_inp = app
+            .build_quality_report_input()
+            .expect("QC=ABSTAIN must still produce provisional ReportInput");
+        assert_eq!(abstain_inp.qc_verdict, Some(DatasetQcVerdict::Abstain));
+        assert!(abstain_inp.dihedrals.is_empty());
+        assert!(abstain_inp.propensity_report.is_none());
+
+        let tmp_prefix =
+            std::env::temp_dir().join(format!("ferric_v180_r4_qc_export_{}", std::process::id()));
+        let html_path = tmp_prefix.with_extension("html");
+        let nef_path = tmp_prefix.with_extension("nef");
+        app.export_prefix = tmp_prefix.display().to_string();
+
+        let ctx = egui::Context::default();
+        app.dispatch_workbench_action(&ctx, WorkbenchAction::ExportQualityReportHtml);
+        let exported_html = app.export_text_buf.clone();
+        assert!(
+            exported_html.contains("id=\"qc-status-banner\""),
+            "GUI ExportQualityReportHtml under QC=ABSTAIN must emit #qc-status-banner"
+        );
+        assert!(
+            exported_html.contains("PROVISIONAL_OUTPUT: QC=ABSTAIN"),
+            "GUI ExportQualityReportHtml under QC=ABSTAIN must emit PROVISIONAL_OUTPUT: QC=ABSTAIN"
+        );
+        assert!(
+            exported_html.contains("[PROVISIONAL &mdash; QC=ABSTAIN]"),
+            "GUI ExportQualityReportHtml under QC=ABSTAIN must mark CSI/Ramachandran headings provisional"
+        );
+        assert!(
+            !exported_html.contains("id=\"section-idp-propensity\"")
+                && !exported_html.contains("id=\"svg-idp-propensity-track\""),
+            "GUI ExportQualityReportHtml under QC=ABSTAIN must withhold propensity sections"
+        );
+
+        app.dispatch_workbench_action(&ctx, WorkbenchAction::SaveSessionNef);
+        let nef_txt = app.export_text_buf.clone();
+        assert!(nef_txt.contains("PROVISIONAL (QC=ABSTAIN)"));
+        let nef_stripped: String = nef_txt
+            .lines()
+            .filter(|l| !l.trim_start().starts_with('#'))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let parsed_nef = read_nef_str(&nef_stripped).expect("comment-stripped NEF must parse");
+        assert_eq!(
+            parsed_nef.meta_data.ferric_qc_verdict.as_deref(),
+            Some("ABSTAIN")
+        );
+        assert!(parsed_nef
+            .meta_data
+            .ferric_provisional_status
+            .as_deref()
+            .is_some_and(|s| s.contains("PROVISIONAL (QC=ABSTAIN)")));
+        let _ = std::fs::remove_file(&html_path);
+        let _ = std::fs::remove_file(&nef_path);
+
+        // 2. QC=WARN propagates QC=WARN banner & NEF metadata cleanly
+        let mut warn_res = base_res.clone();
+        warn_res.qc_verdict = DatasetQcVerdict::Warn;
+        warn_res.qc_reasons = vec!["segmental CA-CB mismatch detected".to_string()];
+        app.apply_joint_idp_result(warn_res, 9.0);
+        let warn_inp = app
+            .build_quality_report_input()
+            .expect("QC=WARN ReportInput");
+        assert_eq!(warn_inp.qc_verdict, Some(DatasetQcVerdict::Warn));
+        let warn_html = generate_quality_report_html(&warn_inp);
+        assert!(warn_html.contains("id=\"qc-status-banner\""));
+        assert!(warn_html.contains("QC=WARN"));
+        let warn_nef = app.format_session_nef_with_joint_qc();
+        let parsed_warn = read_nef_str(&warn_nef).expect("WARN NEF parses");
+        assert_eq!(
+            parsed_warn.meta_data.ferric_qc_verdict.as_deref(),
+            Some("WARN")
+        );
+
+        // 3. QC=PASS propagates QC=PASS banner & NEF metadata cleanly
+        let mut pass_res = base_res;
+        pass_res.qc_verdict = DatasetQcVerdict::Pass;
+        pass_res.qc_reasons.clear();
+        app.apply_joint_idp_result(pass_res, 8.0);
+        let pass_inp = app
+            .build_quality_report_input()
+            .expect("QC=PASS ReportInput");
+        assert_eq!(pass_inp.qc_verdict, Some(DatasetQcVerdict::Pass));
+        let pass_html = generate_quality_report_html(&pass_inp);
+        assert!(pass_html.contains("id=\"qc-status-banner\""));
+        assert!(pass_html.contains("QC=PASS"));
+        let pass_nef = app.format_session_nef_with_joint_qc();
+        let parsed_pass = read_nef_str(&pass_nef).expect("PASS NEF parses");
+        assert_eq!(
+            parsed_pass.meta_data.ferric_qc_verdict.as_deref(),
+            Some("PASS")
+        );
+        assert_eq!(
+            parsed_pass.meta_data.ferric_provisional_status.as_deref(),
+            Some("QC=PASS")
         );
     }
 }
