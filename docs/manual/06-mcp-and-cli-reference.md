@@ -305,7 +305,7 @@ Add the following block to your client's `mcpServers` configuration file (for **
 
 #### 2. Live `nmr-gui` Desktop Loopback Bridge Mode (`HttpBridge`)
 
-1. Open `ferric-gui` on your desktop, navigate to the **`MCP Bridge`** panel, choose **`ReadOnly`** (default) or **`ReadWrite`**, review/configure **Approved Workspace Roots** (fail-closed / empty by default until a non-`$HOME` study folder is open or explicit roots are added; optional CWD fallback is off by default and excludes `$HOME` and its ancestors), and click **Start Local Bridge**.
+1. Open `ferric-gui` on your desktop, navigate to the **`MCP Bridge`** panel — or click the desktop-only (`#[cfg(not(target_arch = "wasm32"))]`) clickable **MCP footer status pill** in the bottom status bar (`MCP Off`, `MCP :<port> RO`, `MCP :<port> RW`, or `MCP :<port> RW!` when destructive actions are enabled, with endpoint and mode hover tooltip) to toggle the **`MCP Bridge`** window directly — choose **`ReadOnly`** (default) or **`ReadWrite`**, review/configure **Approved Workspace Roots** (fail-closed / empty by default until a non-`$HOME` study folder is open or explicit roots are added; optional CWD fallback is off by default and excludes `$HOME` and its ancestors), and click **Start Local Bridge**.
 2. `nmr-gui` binds strictly to `127.0.0.1:<port>` (ephemeral loopback port by default) and generates a fresh 256-bit OS CSPRNG session bearer token (`nmr_mcp_<64-hex>`, drawn from `/dev/urandom` on Unix and Windows CNG `BCryptGenRandom` on Windows). Enabling **Show JSON** displays the client snippet with the bearer token masked (`••••••••••••`) unless **Reveal Token** is explicitly checked.
 3. Click **Copy MCP Config** (or run `ferric mcp-config --client <antigravity|claude-desktop|cursor> --bridge-port <port>`), which emits the identical canonical `"ferric-workbench"` entry for your selected host client:
 
@@ -415,7 +415,7 @@ Every `MCP` request passes through defense-in-depth security checks (`McpSecurit
   - `load_study_folder`: `path` (existing directory inside **Approved Workspace Roots** with no escaping nested symlinks), optional `run_full_pipeline` (`bool`), and `confirm: true` (destructive; requires enabling **Allow destructive MCP actions** in the **MCP Bridge** panel).
   - `set_sequence`: inline `sequence` (1-letter or FASTA) or sandboxed `sequence_path` (`<= 16 MiB` regular file inside approved roots); requires `confirm: true` plus **Allow destructive MCP actions** when replacing existing sequence or assignment state.
   - `pick_peaks`: optional `snr_threshold`, `auto_threshold`, `picker_mode` (`"classical"` \| `"neural"`).
-  - `run_assignment`: optional `solver` (`"evo-graph"` \| `"standard"` \| `"bayes-sa"`), `engine` (`"cpu"` \| `"gpu"`).
+  - `run_assignment`: optional `solver` (`"evo-graph"` \| `"standard"` \| `"bayes-sa"`), `engine` (`"cpu"` \| `"gpu"`). Fails closed with an explicit denial error when the active regime is `IdpJoint` and `engine` is `"gpu"` (matching CLI `--regime idp-joint --engine gpu` fail-closed policy).
   - `select_workbook_page`: `page_index` (`>= 0`) and/or `page_name`.
   - `set_contour_level`: optional `contour_base`, `multiplier`, `show_negative`.
   - `set_viewport_bounds`: `h_left`, `h_right`, `n_top`, `n_bottom`.
