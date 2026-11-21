@@ -46,16 +46,23 @@ impl AssignSolverEngine {
 pub enum AssignProteinRegime {
     #[default]
     Globular,
+    IdpJoint,
     Idp13C,
     Paramagnetic,
 }
 
 impl AssignProteinRegime {
-    pub const ALL: [Self; 3] = [Self::Globular, Self::Idp13C, Self::Paramagnetic];
+    pub const ALL: [Self; 4] = [
+        Self::Globular,
+        Self::IdpJoint,
+        Self::Idp13C,
+        Self::Paramagnetic,
+    ];
 
     pub const fn label(self) -> &'static str {
         match self {
             Self::Globular => "Globular",
+            Self::IdpJoint => "IDP Joint",
             Self::Idp13C => "13C-IDP",
             Self::Paramagnetic => "Paramagnetic",
         }
@@ -276,6 +283,8 @@ pub enum AssignSetupAction {
     },
     /// User clicked a post-run confidence pill or residue chip to jump to `0`-based residue index.
     JumpToResidue(usize),
+    /// User clicked `IDP Joint & CAS Mapper...` to open the unified HN + 13C IDP panel (`T23.3`).
+    OpenIdpJointPanel,
 }
 
 /// Interactive 7-slot 3D data-input mapper actions emitted by Step 2 of [`AssignSetupDrawerState`],
@@ -919,6 +928,20 @@ impl AssignSetupDrawerState {
                         {
                             self.regime = reg;
                         }
+                    }
+                    if matches!(
+                        self.regime,
+                        AssignProteinRegime::IdpJoint | AssignProteinRegime::Idp13C
+                    ) && ui
+                        .add(egui::Button::new(
+                            egui::RichText::new("CAS & Joint IDP...").size(TYPE_CAPTION_PX),
+                        ))
+                        .on_hover_text(
+                            "Open Unified Joint HN + 13C IDP panel and --cas slot mapper",
+                        )
+                        .clicked()
+                    {
+                        actions.push(AssignSetupAction::OpenIdpJointPanel);
                     }
                 });
 

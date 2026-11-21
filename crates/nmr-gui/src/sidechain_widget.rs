@@ -14,6 +14,7 @@ use eframe::egui;
 use nmr_core::aromatic::{
     classify_his_state, HisStateClassification, HisTautomer, HisTautomerEvidence,
 };
+use nmr_core::joint_idp_solver::JointRouteSupport;
 use nmr_core::nmrstar::Reference;
 use nmr_core::priors::{three_to_one, Priors};
 use nmr_core::topology::{
@@ -23,6 +24,7 @@ use nmr_core::topology::{
 };
 
 use crate::contour_painter::SyncCrosshair;
+use crate::idp_joint_panel::{joint_route_color, joint_route_description, joint_route_short_code};
 
 /// Visual classification of an atom node in the 2D covalent sidechain inspector.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -541,6 +543,9 @@ pub struct SequenceRibbonState {
     pub last_variant_button_rects: BTreeMap<ResidueVariant, egui::Rect>,
     /// Screen-space bounding rectangle of the 2D covalent diagram canvas from the most recent frame.
     pub last_canvas_rect: Option<egui::Rect>,
+    /// Optional per-residue joint `HN + 13C` route support (`XVal`, `HN`, `[Pro]`, `CON`) from
+    /// [`nmr_core::joint_idp_solver::JointIdpAssignResult`] (`T23.3`).
+    pub joint_route_by_res: BTreeMap<usize, JointRouteSupport>,
 }
 
 /// Alias for [`SequenceRibbonState`] representing the persistent state of the 2D sidechain inspector.
@@ -567,6 +572,7 @@ impl SequenceRibbonState {
             last_atom_hit_rects: BTreeMap::new(),
             last_variant_button_rects: BTreeMap::new(),
             last_canvas_rect: None,
+            joint_route_by_res: BTreeMap::new(),
         }
     }
 
@@ -1066,7 +1072,10 @@ impl SidechainInspectorPanel {
                             (0, 0)
                         };
 
-                        let fill = if let Some(&conf) = input.backbone_confidences.get(&k) {
+                        let route_opt = state.joint_route_by_res.get(&k).copied();
+                        let fill = if route_opt == Some(JointRouteSupport::ConProBridge) {
+                            egui::Color32::from_rgb(84, 48, 122)
+                        } else if let Some(&conf) = input.backbone_confidences.get(&k) {
                             if conf >= 0.80 {
                                 egui::Color32::from_rgb(28, 125, 82)
                             } else if conf >= 0.50 {
@@ -1093,14 +1102,21 @@ impl SidechainInspectorPanel {
                             egui::Stroke::new(2.0, egui::Color32::from_rgb(120, 235, 255))
                         } else if is_locked {
                             egui::Stroke::new(1.8, egui::Color32::from_rgb(255, 215, 90))
+                        } else if let Some(route) = route_opt {
+                            egui::Stroke::new(1.5, joint_route_color(route, false))
                         } else {
                             egui::Stroke::new(1.0, egui::Color32::from_rgb(65, 76, 98))
                         };
 
-                        let label = if is_locked {
+                        let base_label = if is_locked {
                             format!("*{one}{seq_id}")
                         } else {
                             format!("{one}{seq_id}")
+                        };
+                        let label = if let Some(route) = route_opt {
+                            format!("{base_label} {}", joint_route_short_code(route))
+                        } else {
+                            base_label
                         };
 
                         let btn = egui::Button::new(
@@ -1111,9 +1127,19 @@ impl SidechainInspectorPanel {
                         )
                         .fill(fill)
                         .stroke(stroke)
-                        .min_size(egui::vec2(36.0, 28.0));
+                        .min_size(egui::vec2(
+                            if route_opt.is_some() { 58.0 } else { 36.0 },
+                            28.0,
+                        ));
 
-                        let resp = ui.add(btn);
+                        let mut resp = ui.add(btn);
+                        if let Some(route) = route_opt {
+                            resp = resp.on_hover_text(format!(
+                                "{three}{seq_id} [{}]: {}",
+                                joint_route_short_code(route),
+                                joint_route_description(route)
+                            ));
+                        }
                         state.last_ribbon_cell_rects.push(resp.rect);
 
                         if resp.clicked() {

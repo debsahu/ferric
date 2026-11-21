@@ -41,6 +41,10 @@ use nmr_core::priors::{one_to_three, three_to_one};
 use nmr_core::session::read_session_nef_str;
 use nmr_core::spectrum::{AxisPpm, MAX_SPECTRUM_POINTS};
 
+use crate::idp_joint_panel::{
+    CasAxisConsistency, CasDirection, CasResidueType, CasSlotEntry, MAX_CAS_SLOTS,
+};
+
 /// Maximum retained payload bytes across in-memory / browser drops on `wasm32` (`256 MiB`, aligned
 /// with the JS drop/picker `MAX_TOTAL_BYTES` and `MAX_INMEMORY_ARCHIVE_INFLATE_BYTES_WASM`).
 pub const MAX_BROWSER_RETAINED_BYTES_WASM: usize = 256 * 1024 * 1024;
@@ -735,6 +739,115 @@ pub struct IngestExecutionPlan {
     pub in_memory_files: Arc<BTreeMap<String, Vec<u8>>>,
 }
 
+fn is_hn_backbone_class(cls: PulseSequenceClass) -> bool {
+    matches!(
+        cls,
+        PulseSequenceClass::N15Hsqc
+            | PulseSequenceClass::Hnco
+            | PulseSequenceClass::Hncaco
+            | PulseSequenceClass::Hnca
+            | PulseSequenceClass::Hncoca
+            | PulseSequenceClass::Hncacb
+            | PulseSequenceClass::Cbcaconh
+            | PulseSequenceClass::Hncaconh
+    )
+}
+
+fn is_c13_idp_class(cls: PulseSequenceClass) -> bool {
+    matches!(
+        cls,
+        PulseSequenceClass::Con2D
+            | PulseSequenceClass::Caco2D
+            | PulseSequenceClass::Canco3D
+            | PulseSequenceClass::Cbcaco3D
+            | PulseSequenceClass::Cccon3D
+            | PulseSequenceClass::Hncacon3D
+            | PulseSequenceClass::CasCacon2D
+            | PulseSequenceClass::CasCanco2D
+    )
+}
+
+fn cas_slot_from_classified(
+    id: usize,
+    exp: &ClassifiedExperiment,
+    effective_class: PulseSequenceClass,
+    resolved_path: Option<&PathBuf>,
+) -> Option<CasSlotEntry> {
+    let direction = match effective_class {
+        PulseSequenceClass::CasCacon2D => CasDirection::Cacon,
+        PulseSequenceClass::CasCanco2D => CasDirection::Canco,
+        _ => return None,
+    };
+    let (residue_type, custom_residues) = if let Some(filter) = exp.cas_residue_filter() {
+        CasResidueType::from_filter_tag(&filter.filter_tag, &filter.residue_types)
+    } else {
+        (CasResidueType::Other, String::new())
+    };
+    let path_str = resolved_path
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| exp.relative_path.clone());
+    let mut entry = CasSlotEntry::new(id, residue_type, direction, path_str)
+        .with_custom_residues(custom_residues);
+    if let Some(pp) = &exp.pulse_program {
+        entry.notes = format!("PULPROG: {pp}");
+    }
+    // Live axis validation from classified header axes when sweep & carrier metadata exist (`P2-7`).
+    if exp.axes.len() >= 2 {
+        let f2 = &exp.axes[0];
+        let f1 = &exp.axes[1];
+        if let (Some(sw2), Some(car2), Some(sw1), Some(car1)) =
+            (f2.sw_ppm, f2.carrier_ppm, f1.sw_ppm, f1.carrier_ppm)
+        {
+            entry.axis_consistency = CasAxisConsistency::validate_axes(
+                &f2.nucleus,
+                car2 + 0.5 * sw2,
+                car2 - 0.5 * sw2,
+                &f1.nucleus,
+                car1 + 0.5 * sw1,
+                car1 - 0.5 * sw1,
+            );
+        }
+    }
+    Some(entry)
+}
+
+impl IngestExecutionPlan {
+    /// True when the execution plan contains BOTH `1H`-amide backbone experiments (`HSQC`/`HNCO`/
+    /// `HNCACB`/...) AND `13C`-detected IDP experiments (`2D CON`/`CAS`/`CANCO`/`(H)N(CA)CON`/...),
+    /// recommending the unified `idp-joint` regime (`180.gui:P1-5`).
+    pub fn has_joint_hn_con_suite(&self) -> bool {
+        let has_hn = self
+            .selected_experiments
+            .iter()
+            .any(|s| is_hn_backbone_class(s.effective_class));
+        let has_c13 = self
+            .selected_experiments
+            .iter()
+            .any(|s| is_c13_idp_class(s.effective_class));
+        has_hn && has_c13
+    }
+
+    /// Extract [`CasSlotEntry`] definitions (capped at [`MAX_CAS_SLOTS`]) for every selected
+    /// `CasCacon2D` / `CasCanco2D` experiment in this execution plan.
+    pub fn extract_cas_slot_entries(&self) -> Vec<CasSlotEntry> {
+        let mut out = Vec::new();
+        for spec in &self.selected_experiments {
+            if out.len() >= MAX_CAS_SLOTS {
+                break;
+            }
+            if let Some(entry) = cas_slot_from_classified(
+                out.len() + 1,
+                &spec.experiment,
+                spec.effective_class,
+                spec.resolved_path.as_ref(),
+            ) {
+                out.push(entry);
+            }
+        }
+        out
+    }
+}
+
 /// User action emitted by [`IngestPanelState::show`].
 #[derive(Clone, Debug, PartialEq)]
 pub enum IngestAction {
@@ -1059,6 +1172,48 @@ impl IngestPanelState {
                 }
             })
             .collect()
+    }
+
+    /// True when the current selected matrix rows contain BOTH `1H`-amide backbone spectra
+    /// (`HSQC`/`HNCO`/`HNCACB`/...) AND `13C`-detected IDP spectra (`2D CON`/`CAS`/`CANCO`/
+    /// `(H)N(CA)CON`/...), qualifying for unified `idp-joint` assignment (`180.gui:P1-5`).
+    pub fn is_joint_hn_con_study(&self) -> bool {
+        let mut has_hn = false;
+        let mut has_c13 = false;
+        for (idx, &sel) in self.selected.iter().enumerate() {
+            if !sel {
+                continue;
+            }
+            if let Some(&cls) = self.effective_classes.get(idx) {
+                has_hn |= is_hn_backbone_class(cls);
+                has_c13 |= is_c13_idp_class(cls);
+            }
+        }
+        has_hn && has_c13
+    }
+
+    /// Extract [`CasSlotEntry`] definitions for every selected `CasCacon2D`/`CasCanco2D` row in
+    /// the current ingest matrix (capped at [`MAX_CAS_SLOTS`]).
+    pub fn extract_cas_slot_entries(&self) -> Vec<CasSlotEntry> {
+        let mut out = Vec::new();
+        for (idx, exp) in self.inventory.experiments.iter().enumerate() {
+            if out.len() >= MAX_CAS_SLOTS {
+                break;
+            }
+            if !self.selected.get(idx).copied().unwrap_or(false) {
+                continue;
+            }
+            let cls = self
+                .effective_classes
+                .get(idx)
+                .copied()
+                .unwrap_or(exp.pulse_class);
+            let resolved = self.row_resolved_paths.get(idx).and_then(|p| p.as_ref());
+            if let Some(entry) = cas_slot_from_classified(out.len() + 1, exp, cls, resolved) {
+                out.push(entry);
+            }
+        }
+        out
     }
 
     /// Build a concrete [`IngestExecutionPlan`] from the current matrix state.
@@ -1989,6 +2144,20 @@ impl IngestPanelState {
                                     ))
                                     .small()
                                     .color(egui::Color32::from_rgb(210, 225, 245)),
+                                );
+                            }
+                            if self.is_joint_hn_con_study() {
+                                let n_cas = self.extract_cas_slot_entries().len();
+                                let joint_lbl = if n_cas > 0 {
+                                    format!("+ Joint HN + 13C IDP (idp-joint, {n_cas} CAS)")
+                                } else {
+                                    "+ Joint HN + 13C IDP (idp-joint)".to_string()
+                                };
+                                ui.label(
+                                    egui::RichText::new(joint_lbl)
+                                        .small()
+                                        .strong()
+                                        .color(egui::Color32::from_rgb(112, 232, 178)),
                                 );
                             }
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {

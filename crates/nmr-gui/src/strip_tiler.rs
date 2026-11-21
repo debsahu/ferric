@@ -12,12 +12,14 @@ use std::collections::BTreeMap;
 use std::f64::consts::TAU;
 
 use eframe::egui;
+use nmr_core::joint_idp_solver::JointRouteSupport;
 use nmr_core::priors::three_to_one;
 use nmr_core::solver::{Matrix2D, ScoreConfig, FORBID};
 use nmr_core::spectrum::{AxisPpm, Spectrum3D};
 use nmr_core::spinsystems::SpinSystem;
 
 use crate::contour_painter::SyncCrosshair;
+use crate::idp_joint_panel::{joint_route_color, joint_route_short_code};
 use crate::workbench_mode::TYPE_CAPTION_PX;
 use crate::workbook::{infer_3d_cube_nuclei, pretty_nucleus};
 
@@ -651,6 +653,9 @@ pub struct StripTilerPanel {
     pub show_competitors: bool,
     /// Number of ranked predecessors/successors returned by the last frame's match-finder run.
     pub last_competitor_counts: (usize, usize),
+    /// Optional per-residue joint `HN + 13C` route support (`XVal`, `HN`, `[Pro]`, `CON`) from
+    /// [`nmr_core::joint_idp_solver::JointIdpAssignResult`] displayed on strip column headers (`T23.3`).
+    pub joint_route_by_res: BTreeMap<usize, JointRouteSupport>,
     rank_root: Option<usize>,
     user_resized_height: bool,
     zoom_drag_start_ppm: Option<f64>,
@@ -688,6 +693,7 @@ impl Default for StripTilerPanel {
             succ_display_rank: 0,
             show_competitors: false,
             last_competitor_counts: (0, 0),
+            joint_route_by_res: BTreeMap::new(),
             rank_root: None,
             user_resized_height: false,
             zoom_drag_start_ppm: None,
@@ -1591,7 +1597,8 @@ impl StripTilerPanel {
                 }
 
                 // Column header & score subtitle (zero emojis; >= 11 px font)
-                let res_badge = Self::residue_badge(ctx, ss_idx);
+                let route_opt = self.route_support_for_ss(ctx, ss_idx);
+                let res_badge = self.residue_badge_with_route(ctx, ss_idx);
 
                 let compact_hdr = self.compact_dock_mode || eff_col_w < 130.0;
                 let (top_label, sub_label, sub_col) = match col {
@@ -1674,12 +1681,15 @@ impl StripTilerPanel {
                     ),
                 };
 
+                let top_col = route_opt
+                    .map(|r| joint_route_color(r, false))
+                    .unwrap_or(egui::Color32::from_rgb(232, 242, 255));
                 painter.text(
                     egui::pos2(cx, col_hdr_top + 7.5),
                     egui::Align2::CENTER_CENTER,
                     top_label,
                     egui::FontId::monospace(TYPE_CAPTION_PX),
-                    egui::Color32::from_rgb(232, 242, 255),
+                    top_col,
                 );
                 painter.text(
                     egui::pos2(cx, col_hdr_top + 20.5),
@@ -2167,6 +2177,45 @@ impl StripTilerPanel {
             .max(matches.successors.len())
             .min(COMPETITOR_VISIBLE_ROWS);
         header + COMPETITOR_ROW_PX + 4.0 + rows as f32 * COMPETITOR_ROW_PX + 8.0
+    }
+
+    /// Set per-residue joint `HN + 13C` route support (`XVal`, `HN`, `[Pro]`, `CON`) displayed in
+    /// strip column headers (`T23.3`).
+    pub fn set_joint_route_support(&mut self, map: BTreeMap<usize, JointRouteSupport>) {
+        self.joint_route_by_res = map;
+    }
+
+    /// Clear joint `HN + 13C` route indicators from strip column headers.
+    pub fn clear_joint_route_support(&mut self) {
+        self.joint_route_by_res.clear();
+    }
+
+    fn route_support_for_ss(
+        &self,
+        ctx: &StripTilerContext<'_>,
+        ss_idx: usize,
+    ) -> Option<JointRouteSupport> {
+        if self.joint_route_by_res.is_empty() {
+            return None;
+        }
+        let res_k = ctx
+            .locks
+            .and_then(|m| m.get(&ss_idx).copied())
+            .or_else(|| {
+                ctx.assignments
+                    .and_then(|a| a.get(ss_idx).copied())
+                    .and_then(|k| (k >= 0).then_some(k as usize))
+            })?;
+        self.joint_route_by_res.get(&res_k).copied()
+    }
+
+    fn residue_badge_with_route(&self, ctx: &StripTilerContext<'_>, ss_idx: usize) -> String {
+        let base = Self::residue_badge(ctx, ss_idx);
+        if let Some(route) = self.route_support_for_ss(ctx, ss_idx) {
+            format!("{base} {}", joint_route_short_code(route))
+        } else {
+            base
+        }
     }
 
     /// Short residue/spin-system badge (`[L]K12`, `K12`, or `SS#4`) for a strip column or list row.

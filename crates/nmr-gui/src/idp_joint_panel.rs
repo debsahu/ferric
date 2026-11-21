@@ -1,23 +1,25 @@
 //! Modular Unified Joint `HN + 13C` IDP Assignment Panel & Interactive `--cas` Slot Mapper
 //! (`T23.3`, `v0.18.0`, native & `wasm32-unknown-unknown`).
 //!
-//! Provides a calm, zero-emoji `egui` panel and action-emitting state machine for configuring
-//! and inspecting unified `HN + 2D CON + Proline-Bridge + N-N + CAS` intrinsically disordered
-//! protein (IDP) backbone assignments:
-//! 1. **Regime & Root/Calibration Controls**: Switch between `Auto (Joint)`, `IDP Joint`,
+//! Directly consumes canonical `nmr_core::joint_idp_solver` types, constants, and solver results
+//! (zero duplicated route enums or TROSY math) to provide a calm, zero-emoji `egui` panel and
+//! action-emitting state machine for unified `HN + 2D CON + Proline-Bridge + N-N + CAS`
+//! intrinsically disordered protein (IDP) backbone assignments:
+//! 1. **Regime & Channel Calibration Controls**: Switch between `Auto (Joint)`, `IDP Joint`,
 //!    `IDP 13C-Only`, and `Globular` regimes; toggle `--roots hnco`, `NH2` sidechain doublet
-//!    filtering, field-scaled TROSY `1/2 1J_HN` (`+/-46 Hz / MHz`) cross-spectrum offset
-//!    calibration, `F1(C')` NUS sidelobe pruning, `Gly CB` bleed-through guard, C-terminal
-//!    `COO-` shift prior, and conservative 2-pass anchor-lock propagation.
-//! 2. **Interactive `--cas` (`CACON` / `CANCO`) Slot Mapper**: Add, remove, enable/disable,
-//!    and re-type amino-acid-selective 2D `(C'(i-1), N(i))` experiment slots (`Ala`, `Gly`,
-//!    `Ser`, `Thr`, `Tavi`, `Other`) with explicit `Cacon (i-1)` vs `Canco (i)` coherence
-//!    direction, `(13C', 15N)` axis-consistency indicator, loaded/peak-count badges, and
-//!    reproducible CLI `--cas` flag preview.
+//!    filtering, field-scaled TROSY `46 Hz (1/2 1J_NH)` cross-spectrum offset calibration,
+//!    `F1(C')` NUS sidelobe pruning, `Gly CB` bleed-through guard, C-terminal `COO-` shift
+//!    prior, and conservative 2-pass anchor-lock propagation; preview a strictly runnable
+//!    `ferric assign` CLI command matching `crates/nmr-cli/src/main.rs`.
+//! 2. **Interactive `--cas` (`CACON` / `CANCO`) Slot Mapper**: Add (bounded by [`MAX_CAS_SLOTS`]),
+//!    remove, enable/disable, edit paths, and re-type amino-acid-selective 2D `(C'(i-1), N(i))`
+//!    experiment slots (`Ala`, `Gly`, `Ser`, `Thr`, `Tavi`, `Other`) with explicit `Cacon (i-1)`
+//!    vs `Canco (i)` direction, live `(13C', 15N)` axis-consistency validation, loaded/peak-count
+//!    badges, and direct conversion to [`CasSpectrum`] for [`JointIdpDataset`].
 //! 3. **Proline Bridges, C-Terminal `COO-` Anchor Hints & `HN <-> CON` Route Concordance**:
-//!    Inspect resolved `X-Pro` bridges (with interactive anchor lock toggles), C-terminal
-//!    carboxylate anchor hints (~179 ppm DSS), and per-residue `HN <-> CON` cross-route
-//!    agreement (`CrossValidatedHnAndCon`, `HnOnly`, `ConProBridge`, `ConOnly`).
+//!    Populated directly from real [`JointIdpAssignResult`] via [`IdpJointPanelState::sync_from_joint_result`],
+//!    inspecting resolved `X-Pro` bridges (`131.5-144.5 ppm` DSS), C-terminal `COO-` anchors
+//!    (`~179.0 ppm` DSS), QC verdicts/reasons, and per-residue [`JointRouteSupport`] concordance.
 //!
 //! # Provenance & Clean-Room Statement
 //! Original clean-room human-computer interaction and state-machine architecture
@@ -31,28 +33,99 @@
 //!   Bermel, W. et al. (*J. Biomol. NMR* **2012**, 53, 293-301) — amino-acid-selective
 //!   `CAS-NMR` (`CACON` `i-1` / `CANCO` `i`) editing in IDPs.
 //! - Pervushin, K., Riek, R., Wider, G. & Wuthrich, K. (*Proc. Natl. Acad. Sci. U.S.A.*
-//!   **1997**, 94, 12366-12371) — TROSY `1/2 1J_HN` cross-spectrum offset calibration.
+//!   **1997**, 94, 12366-12371) — TROSY `46 Hz (1/2 1J_NH)` cross-spectrum offset calibration.
 //! - Tamiola, K., Acar, B. & Mulder, F. A. A. (*J. Am. Chem. Soc.* **2010**, 132,
 //!   18000-18003) & Platzer, G., Okon, M. & McIntosh, L. P. (*J. Biomol. NMR* **2014**, 60,
 //!   109-129) — `ncIDP` coil shifts and C-terminal `COO-` pH-dependent shift priors.
 
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
 use eframe::egui;
-use nmr_core::c13_detected::{parse_cas_residue_set, CasMode};
+use nmr_core::c13_detected::{
+    parse_cas_residue_set, C13DetectedExp, C13PickedDataset, C13Strip3DPeak, CasMode, CasPeak,
+    CasSpectrum, Con2DPeak,
+};
+use nmr_core::idp_solver::IdpShiftOffsets;
+use nmr_core::joint_idp_solver::predict_joint_ncidp_shifts;
+pub use nmr_core::joint_idp_solver::{
+    assign_joint_idp_cpu, joint_idp_to_reference, trosy_expected_shift_ppm, CTermAnchorSummary,
+    JointIdpAssignResult, JointIdpConfig, JointIdpDataset, JointIdpResult, JointRouteSupport,
+    ProlineBridgeSummary, TrosyOffsetCalibration, CANONICAL_TROSY_FALLBACK_MHZ,
+    CTERM_COO_DSS_CENTER_PPM, PROLINE_N15_MAX_PPM, PROLINE_N15_MIN_PPM, TROSY_HALF_J_HN_HZ,
+};
+use nmr_core::peaks::Peak;
+use nmr_core::qc::DatasetQcVerdict;
+use nmr_core::spinsystems::HncacbPolarity;
 
 use crate::workbench_mode::{TYPE_BODY_PX, TYPE_CAPTION_PX, TYPE_HEADER_PX};
 
-/// Default `1/2 1J_HN` TROSY shift magnitude in Hz (`92 Hz / 2 = 46 Hz`).
-pub const TROSY_HALF_J_HN_HZ: f64 = 46.0;
-/// `15N / 1H` gyromagnetic ratio (`gamma_N / gamma_H`) for converting `15N` Hz offsets to ppm.
-pub const GAMMA_N15_OVER_H1: f64 = 0.101_329_118;
-/// Nominal DSS carbonyl chemical shift (ppm) of a deprotonated C-terminal `COO-` group.
-pub const C_TERM_COO_NOMINAL_PPM: f64 = 179.2;
 /// Expected `13C'` chemical-shift window `(min_ppm, max_ppm)` for `2D CON` / `CAS` spectra.
 pub const CAS_C_PRIME_RANGE_PPM: (f64, f64) = (165.0, 185.0);
 /// Expected `15N` chemical-shift window `(min_ppm, max_ppm)` for `2D CON` / `CAS` (incl. Pro).
 pub const CAS_N15_RANGE_PPM: (f64, f64) = (95.0, 148.0);
+/// Hard upper bound on interactive `--cas` slots to keep UI/solver work bounded (`P2-8`).
+pub const MAX_CAS_SLOTS: usize = 16;
+
+/// All four canonical [`JointRouteSupport`] categories in display order.
+pub const ALL_JOINT_ROUTE_SUPPORTS: [JointRouteSupport; 4] = [
+    JointRouteSupport::CrossValidatedHnAndCon,
+    JointRouteSupport::HnRoute,
+    JointRouteSupport::ConProBridge,
+    JointRouteSupport::ConRouteOnly,
+];
+
+/// Human-readable label for a canonical [`JointRouteSupport`] variant.
+pub const fn joint_route_label(route: JointRouteSupport) -> &'static str {
+    match route {
+        JointRouteSupport::CrossValidatedHnAndCon => "HN + CON Cross-Validated",
+        JointRouteSupport::HnRoute => "HN Only",
+        JointRouteSupport::ConProBridge => "CON Pro Bridge",
+        JointRouteSupport::ConRouteOnly => "CON Only",
+    }
+}
+
+/// Compact pill code for sequence ribbons, strip headers, and concordance tables.
+pub const fn joint_route_short_code(route: JointRouteSupport) -> &'static str {
+    match route {
+        JointRouteSupport::CrossValidatedHnAndCon => "XVal",
+        JointRouteSupport::HnRoute => "HN",
+        JointRouteSupport::ConProBridge => "[Pro]",
+        JointRouteSupport::ConRouteOnly => "CON",
+    }
+}
+
+/// Scientific hover description for a canonical [`JointRouteSupport`] variant.
+pub const fn joint_route_description(route: JointRouteSupport) -> &'static str {
+    match route {
+        JointRouteSupport::CrossValidatedHnAndCon => {
+            "Both amide HN and 13C-detected 2D CON routes corroborate this residue assignment."
+        }
+        JointRouteSupport::HnRoute => {
+            "Supported by amide HN triple-resonance spectra only (CON peak absent or overlapped)."
+        }
+        JointRouteSupport::ConProBridge => {
+            "Proline imino 2D CON bridge (15N 131.5-144.5 ppm DSS) spanning an HN chain break."
+        }
+        JointRouteSupport::ConRouteOnly => {
+            "Supported by protonless 2D CON route only (exchange-broadened or missing amide HN)."
+        }
+    }
+}
+
+/// Theme-aware accent color for a canonical [`JointRouteSupport`] variant.
+pub const fn joint_route_color(route: JointRouteSupport, paper_white: bool) -> egui::Color32 {
+    match (route, paper_white) {
+        (JointRouteSupport::CrossValidatedHnAndCon, false) => egui::Color32::from_rgb(76, 214, 148),
+        (JointRouteSupport::CrossValidatedHnAndCon, true) => egui::Color32::from_rgb(20, 128, 76),
+        (JointRouteSupport::HnRoute, false) => egui::Color32::from_rgb(98, 184, 255),
+        (JointRouteSupport::HnRoute, true) => egui::Color32::from_rgb(28, 102, 184),
+        (JointRouteSupport::ConProBridge, false) => egui::Color32::from_rgb(204, 138, 255),
+        (JointRouteSupport::ConProBridge, true) => egui::Color32::from_rgb(122, 52, 182),
+        (JointRouteSupport::ConRouteOnly, false) => egui::Color32::from_rgb(248, 178, 68),
+        (JointRouteSupport::ConRouteOnly, true) => egui::Color32::from_rgb(176, 108, 12),
+    }
+}
 
 /// Assignment solver regime selection for the Unified Joint `HN + 13C` IDP workbench.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -97,13 +170,14 @@ impl IdpRegimeSelection {
         }
     }
 
-    /// Corresponding `--regime` CLI value.
-    pub const fn cli_flag(self) -> &'static str {
+    /// Corresponding valid `--regime` CLI value (`None` for `AutoJoint`, which omits `--regime`
+    /// so `ferric assign` auto-selects when both HN and `--con` inputs are supplied).
+    pub const fn cli_regime_arg(self) -> Option<&'static str> {
         match self {
-            Self::AutoJoint => "auto",
-            Self::IdpJoint => "idp-joint",
-            Self::Idp13cOnly => "idp-13c",
-            Self::Globular => "globular",
+            Self::AutoJoint => None,
+            Self::IdpJoint => Some("idp-joint"),
+            Self::Idp13cOnly => Some("idp-13c"),
+            Self::Globular => Some("globular"),
         }
     }
 
@@ -188,20 +262,50 @@ impl CasResidueType {
         }
     }
 
-    /// CLI token used in `--cas <dir>:<token>=<path>`.
-    pub fn cli_token(self, custom_residues: &str) -> String {
-        match self {
-            Self::Ala => "ala".to_string(),
-            Self::Gly => "gly".to_string(),
-            Self::Ser => "ser".to_string(),
-            Self::Thr => "thr".to_string(),
-            Self::Tavi => "tavi".to_string(),
-            Self::Other => {
-                let trimmed = custom_residues.trim();
-                if trimmed.is_empty() {
-                    "custom".to_string()
+    /// Map a classifier tag or canonical 3-letter residue list to `(CasResidueType, custom_str)`.
+    pub fn from_filter_tag(tag: &str, residue_types: &[String]) -> (Self, String) {
+        let up = tag.trim().to_ascii_uppercase();
+        match up.as_str() {
+            "ALA" => (Self::Ala, String::new()),
+            "GLY" => (Self::Gly, String::new()),
+            "SER" => (Self::Ser, String::new()),
+            "THR" => (Self::Thr, String::new()),
+            "TAVI" => (Self::Tavi, String::new()),
+            _ => {
+                if residue_types.len() == 1 {
+                    match residue_types[0].as_str() {
+                        "ALA" => return (Self::Ala, String::new()),
+                        "GLY" => return (Self::Gly, String::new()),
+                        "SER" => return (Self::Ser, String::new()),
+                        "THR" => return (Self::Thr, String::new()),
+                        _ => {}
+                    }
+                }
+                let custom = if !residue_types.is_empty() {
+                    residue_types.join("+")
                 } else {
-                    trimmed.to_ascii_lowercase()
+                    tag.trim().to_string()
+                };
+                (Self::Other, custom)
+            }
+        }
+    }
+
+    /// Valid CLI token used in `--cas <dir>:<token>=<path>`, returning `None` when `Other` is empty
+    /// or fails `parse_cas_residue_set` validation.
+    pub fn cli_token(self, custom_residues: &str) -> Option<String> {
+        match self {
+            Self::Ala => Some("ala".to_string()),
+            Self::Gly => Some("gly".to_string()),
+            Self::Ser => Some("ser".to_string()),
+            Self::Thr => Some("thr".to_string()),
+            Self::Tavi => Some("tavi".to_string()),
+            Self::Other => {
+                let parsed = parse_cas_residue_set(custom_residues).ok()?;
+                if parsed.is_empty() {
+                    None
+                } else {
+                    Some(parsed.join("+").to_ascii_lowercase())
                 }
             }
         }
@@ -303,7 +407,9 @@ impl CasAxisConsistency {
     /// Detailed hover explanation.
     pub const fn description(self) -> &'static str {
         match self {
-            Self::Unchecked => "Axis nuclei and ppm bounds have not been verified yet.",
+            Self::Unchecked => {
+                "Axis nuclei and ppm bounds have not been verified yet; load spectrum or peak list to validate."
+            }
             Self::Consistent => {
                 "Verified F2=13C' (165-185 ppm) and F1=15N (95-148 ppm) aligned with 2D CON."
             }
@@ -319,7 +425,7 @@ impl CasAxisConsistency {
         }
     }
 
-    /// True if axes are strictly verified consistent.
+    /// True only when axes have been explicitly validated consistent.
     pub const fn is_consistent(self) -> bool {
         matches!(self, Self::Consistent)
     }
@@ -386,6 +492,42 @@ impl CasAxisConsistency {
             Self::WrongNuclei
         }
     }
+
+    /// Validate observed `(c_prime_ppm, n_ppm)` peak coordinates when loading a peak TSV without
+    /// binary spectrum axis headers.
+    pub fn validate_peaks(peaks: &[CasPeak]) -> Self {
+        if peaks.is_empty() {
+            return Self::Unchecked;
+        }
+        let mut c_min = f64::INFINITY;
+        let mut c_max = f64::NEG_INFINITY;
+        let mut n_min = f64::INFINITY;
+        let mut n_max = f64::NEG_INFINITY;
+        for p in peaks {
+            if !p.c_prime_ppm.is_finite() || !p.n_ppm.is_finite() {
+                return Self::OutOfRange;
+            }
+            c_min = c_min.min(p.c_prime_ppm);
+            c_max = c_max.max(p.c_prime_ppm);
+            n_min = n_min.min(p.n_ppm);
+            n_max = n_max.max(p.n_ppm);
+        }
+        // Detect transposed peak columns (15N in C' column and 13C' in N column).
+        let c_looks_like_n =
+            c_min >= CAS_N15_RANGE_PPM.0 - 5.0 && c_max <= CAS_N15_RANGE_PPM.1 + 5.0;
+        let n_looks_like_c =
+            n_min >= CAS_C_PRIME_RANGE_PPM.0 - 5.0 && n_max <= CAS_C_PRIME_RANGE_PPM.1 + 5.0;
+        if c_looks_like_n && n_looks_like_c {
+            return Self::SwappedAxes;
+        }
+        let c_ok = c_min >= CAS_C_PRIME_RANGE_PPM.0 - 5.0 && c_max <= CAS_C_PRIME_RANGE_PPM.1 + 5.0;
+        let n_ok = n_min >= CAS_N15_RANGE_PPM.0 - 5.0 && n_max <= CAS_N15_RANGE_PPM.1 + 5.0;
+        if c_ok && n_ok {
+            Self::Consistent
+        } else {
+            Self::OutOfRange
+        }
+    }
 }
 
 /// One configured `--cas` amino-acid-selective 2D `(C'(i-1), N(i))` experiment slot.
@@ -407,6 +549,8 @@ pub struct CasSlotEntry {
     pub loaded: bool,
     /// Number of picked 2D `(C', N)` peaks currently loaded in this slot.
     pub peak_count: usize,
+    /// Loaded 2D `(C'(i-1), N(i))` peaks consumed directly by [`assign_joint_idp_cpu`].
+    pub peaks: Vec<CasPeak>,
     /// Whether this slot is active for the next assignment run.
     pub enabled: bool,
     /// Optional provenance or diagnostic note (e.g., Bruker `PULPROG` name).
@@ -430,6 +574,7 @@ impl CasSlotEntry {
             path: path.into(),
             loaded: false,
             peak_count: 0,
+            peaks: Vec::new(),
             enabled: true,
             notes: String::new(),
         }
@@ -451,6 +596,24 @@ impl CasSlotEntry {
         self.loaded = loaded;
         self.peak_count = peak_count;
         self.axis_consistency = axis_consistency;
+        self
+    }
+
+    /// Populate loaded peaks and run live axis validation.
+    pub fn with_peaks_validated(
+        mut self,
+        peaks: Vec<CasPeak>,
+        axis_override: Option<(&str, f64, f64, &str, f64, f64)>,
+    ) -> Self {
+        self.peak_count = peaks.len();
+        self.loaded = !peaks.is_empty();
+        self.axis_consistency = match axis_override {
+            Some((f2_nuc, f2_hi, f2_lo, f1_nuc, f1_hi, f1_lo)) => {
+                CasAxisConsistency::validate_axes(f2_nuc, f2_hi, f2_lo, f1_nuc, f1_hi, f1_lo)
+            }
+            None => CasAxisConsistency::validate_peaks(&peaks),
+        };
+        self.peaks = peaks;
         self
     }
 
@@ -487,124 +650,83 @@ impl CasSlotEntry {
         }
     }
 
-    /// Format the exact repeatable `--cas` CLI argument for this slot.
-    pub fn to_cli_arg(&self) -> String {
-        let token = self.residue_type.cli_token(&self.custom_residues);
-        let path_part = if self.path.trim().is_empty() {
-            "<unassigned_path>"
-        } else {
-            self.path.trim()
-        };
-        format!("{}:{}={}", self.direction.cli_prefix(), token, path_part)
+    /// Format a strictly valid, runnable repeatable `--cas` CLI argument for this slot, or `None`
+    /// if the slot is not ready, has an empty path, or has an invalid/empty `Other` selector (`P1-7`).
+    pub fn to_cli_arg(&self) -> Option<String> {
+        if !self.is_ready_for_solve() {
+            return None;
+        }
+        let path_part = self.path.trim();
+        if path_part.is_empty() {
+            return None;
+        }
+        let token = self.residue_type.cli_token(&self.custom_residues)?;
+        Some(format!(
+            "{}:{}={}",
+            self.direction.cli_prefix(),
+            token,
+            path_part
+        ))
     }
 
-    /// True when enabled, loaded, residue selector valid, and axis consistency is not an error.
+    /// True ONLY when enabled, loaded with >= 1 peak, residue selector is valid, and axis
+    /// consistency has been explicitly verified as [`CasAxisConsistency::Consistent`] (`P2-7`).
     pub fn is_ready_for_solve(&self) -> bool {
         self.enabled
             && self.loaded
-            && !self.axis_consistency.is_error()
+            && self.peak_count > 0
+            && self.axis_consistency.is_consistent()
             && self.resolved_residues().is_ok()
     }
-}
 
-/// Cross-route assignment provenance badge comparing amide `HN` and `13C`-detected `CON` routes.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum JointRouteBadge {
-    /// Assigned consistently by both amide `HN` (`HSQC`/`HNCO`) and protonless `2D CON` routes.
-    CrossValidatedHnAndCon,
-    /// Assigned via amide `HN` route only (missing or overlapped in `2D CON`).
-    HnOnly,
-    /// Proline imino `2D CON` bridge (`N ~ 132-143 ppm`) spanning `X(i-1)-Pro(i)` without an `HN`.
-    ConProBridge,
-    /// Non-Proline residue assigned via protonless `2D CON` only (e.g., exchange-broadened amide).
-    ConOnly,
-}
-
-impl JointRouteBadge {
-    /// All four route badges in display order.
-    pub const ALL: [Self; 4] = [
-        Self::CrossValidatedHnAndCon,
-        Self::HnOnly,
-        Self::ConProBridge,
-        Self::ConOnly,
-    ];
-
-    /// Human-readable route badge label.
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::CrossValidatedHnAndCon => "HN + CON Cross-Validated",
-            Self::HnOnly => "HN Only",
-            Self::ConProBridge => "CON Pro Bridge",
-            Self::ConOnly => "CON Only",
+    /// Build a [`CasSpectrum`] ready for [`JointIdpDataset::cas_spectra`] when valid and loaded.
+    pub fn to_cas_spectrum(&self) -> Option<CasSpectrum> {
+        if !self.is_ready_for_solve() || self.peaks.is_empty() {
+            return None;
         }
-    }
-
-    /// Compact pill code suitable for sequence ribbons, strip headers, and narrow table columns.
-    pub const fn short_code(self) -> &'static str {
-        match self {
-            Self::CrossValidatedHnAndCon => "HN+CON",
-            Self::HnOnly => "HN",
-            Self::ConProBridge => "PRO-CON",
-            Self::ConOnly => "CON",
-        }
-    }
-
-    /// Concise scientific tooltip text.
-    pub const fn description(self) -> &'static str {
-        match self {
-            Self::CrossValidatedHnAndCon => {
-                "Both amide HN and 13C-detected 2D CON routes agree on this residue assignment."
-            }
-            Self::HnOnly => "Supported by amide HN spectra only (CON peak absent or overlapped).",
-            Self::ConProBridge => {
-                "Proline imino 2D CON bridge (15N 132-143 ppm) linking across an HN chain break."
-            }
-            Self::ConOnly => {
-                "Supported by protonless 2D CON route only (exchange-broadened or missing HN)."
-            }
-        }
-    }
-
-    /// Theme-aware badge accent color.
-    pub const fn color(self, paper_white: bool) -> egui::Color32 {
-        match (self, paper_white) {
-            (Self::CrossValidatedHnAndCon, false) => egui::Color32::from_rgb(76, 214, 148),
-            (Self::CrossValidatedHnAndCon, true) => egui::Color32::from_rgb(20, 128, 76),
-            (Self::HnOnly, false) => egui::Color32::from_rgb(98, 184, 255),
-            (Self::HnOnly, true) => egui::Color32::from_rgb(28, 102, 184),
-            (Self::ConProBridge, false) => egui::Color32::from_rgb(204, 138, 255),
-            (Self::ConProBridge, true) => egui::Color32::from_rgb(122, 52, 182),
-            (Self::ConOnly, false) => egui::Color32::from_rgb(248, 178, 68),
-            (Self::ConOnly, true) => egui::Color32::from_rgb(176, 108, 12),
-        }
+        let residues = self.resolved_residues().ok()?;
+        let tag = self
+            .residue_type
+            .cli_token(&self.custom_residues)
+            .unwrap_or_else(|| "cas".to_string());
+        Some(CasSpectrum {
+            name: format!("{}_{}", self.direction.cli_prefix(), tag),
+            mode: self.direction.to_core_mode(),
+            residues,
+            peaks: self.peaks.clone(),
+        })
     }
 }
 
 /// Resolved `X-Pro(-Y)` bridge spanning a Proline via `2D CON` imino nitrogen and `13C`/`CAS` links.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ProlineBridgeEntry {
+    /// 0-based sequence index of the bridged Proline residue.
+    pub pro_seq_idx: usize,
     /// 1-based sequence ID of the bridged Proline residue.
     pub pro_seq_id: i32,
-    /// Preceding residue label (`i - 1`, e.g., `"S41"`).
+    /// Preceding residue label (`i - 1`, e.g., `"SER13"`).
     pub prev_label: String,
-    /// Proline residue label (`i`, e.g., `"P42"`).
+    /// Proline residue label (`i`, e.g., `"PRO14"`).
     pub pro_label: String,
-    /// Optional following residue label (`i + 1`, e.g., `"G43"`).
+    /// Optional following residue label (`i + 1`, e.g., `"GLY15"`).
     pub next_label: Option<String>,
-    /// Proline imino `15N` chemical shift (ppm, typically `132-143 ppm`).
-    pub con_n_ppm: f64,
+    /// Proline imino `15N` chemical shift (ppm, canonical `131.5-144.5 ppm` DSS).
+    pub con_n_ppm: Option<f64>,
     /// Preceding `C'(i-1)` chemical shift (ppm) at the `CON(C'_{i-1}, N_i)` root.
-    pub con_c_prime_ppm: f64,
+    pub con_c_prime_ppm: Option<f64>,
     /// Posterior bridge confidence in `[0.0, 1.0]`.
     pub confidence: f64,
+    /// True when the Proline residue was bridged by a `2D CON` node.
+    pub bridged: bool,
     /// True when locked as a hard anchor for Pass-2 joint re-solving.
     pub locked: bool,
-    /// Supporting experimental channels (e.g., `"CON"`, `"H(CC)CON"`, `"CAS-SER(i-1)"`).
+    /// Supporting experimental channels (e.g., `"CON"`, `"CANCO"`, `"CAS"`).
     pub supporting_channels: Vec<String>,
 }
 
 impl ProlineBridgeEntry {
-    /// Format the sequential chain motif (e.g., `"S41 - P42 - G43"`).
+    /// Format the sequential chain motif (e.g., `"SER13 - PRO14 - GLY15"`).
     pub fn chain_label(&self) -> String {
         match &self.next_label {
             Some(next) if !next.trim().is_empty() => {
@@ -613,63 +735,143 @@ impl ProlineBridgeEntry {
             _ => format!("{} - {}", self.prev_label, self.pro_label),
         }
     }
+
+    /// Construct directly from a core [`ProlineBridgeSummary`].
+    pub fn from_core_summary(
+        summary: &ProlineBridgeSummary,
+        seq_ids: &[i32],
+        locked: bool,
+        supporting_channels: Vec<String>,
+    ) -> Self {
+        let pro_id = seq_ids
+            .get(summary.pro_seq_idx)
+            .copied()
+            .unwrap_or((summary.pro_seq_idx + 1) as i32);
+        let prev_id = summary
+            .pro_seq_idx
+            .checked_sub(1)
+            .and_then(|i| seq_ids.get(i).copied())
+            .unwrap_or(pro_id - 1);
+        let next_label = summary.next_residue.as_ref().map(|r| {
+            let next_id = seq_ids
+                .get(summary.pro_seq_idx + 1)
+                .copied()
+                .unwrap_or(pro_id + 1);
+            format!("{r}{next_id}")
+        });
+        Self {
+            pro_seq_idx: summary.pro_seq_idx,
+            pro_seq_id: pro_id,
+            prev_label: format!("{}{}", summary.prev_residue, prev_id),
+            pro_label: format!("PRO{pro_id}"),
+            next_label,
+            con_n_ppm: summary.n_pro_ppm,
+            con_c_prime_ppm: summary.c_prev_ppm,
+            confidence: summary.confidence,
+            bridged: summary.bridged,
+            locked,
+            supporting_channels,
+        }
+    }
 }
 
-/// C-terminal `COO-` anchor hint (~179 ppm DSS, Platzer et al. 2014 / `ncIDP`).
+/// C-terminal `COO-` anchor hint (`~179.0 ppm` DSS, Platzer et al. 2014 / `ncIDP`).
 #[derive(Clone, Debug, PartialEq)]
 pub struct CTermAnchorHint {
-    /// 1-based sequence ID of the C-terminal residue.
+    /// 0-based sequence index of the C-terminal candidate residue.
+    pub seq_idx: usize,
+    /// 1-based sequence ID of the C-terminal candidate residue.
     pub seq_id: i32,
-    /// Residue label (e.g., `"A112"`).
+    /// Residue label (e.g., `"ALA22 (C-term)"`).
     pub residue_label: String,
-    /// Observed terminal carbonyl `C'` chemical shift (ppm DSS).
+    /// Observed terminal carbonyl `C'` chemical shift (ppm).
     pub observed_c_prime_ppm: f64,
-    /// Expected `ncIDP` / Platzer C-terminal `COO-` reference shift (ppm DSS).
+    /// Offset-corrected DSS carbonyl shift (ppm).
+    pub observed_c_prime_dss_ppm: f64,
+    /// Expected `ncIDP` / Platzer C-terminal `COO-` reference shift (`CTERM_COO_DSS_CENTER_PPM`).
     pub expected_coo_ppm: f64,
     /// Optional associated amide `15N` shift (ppm).
     pub n_ppm: Option<f64>,
     /// Anchor posterior confidence in `[0.0, 1.0]`.
     pub confidence: f64,
-    /// True when a matching downfield `COO-` peak was found in `HN(CA)CO` / `CACO` / `CON`.
-    pub detected: bool,
+    /// True when the solver assigned this candidate node to the C-terminal residue.
+    pub assigned_to_cterm: bool,
     /// Human-readable diagnostic note.
     pub note: String,
 }
 
 impl CTermAnchorHint {
-    /// Signed offset `observed_c_prime_ppm - expected_coo_ppm` in ppm.
+    /// Signed offset `observed_c_prime_dss_ppm - expected_coo_ppm` in ppm.
     pub fn delta_ppm(&self) -> f64 {
-        self.observed_c_prime_ppm - self.expected_coo_ppm
+        self.observed_c_prime_dss_ppm - self.expected_coo_ppm
+    }
+
+    /// Construct directly from a core [`CTermAnchorSummary`].
+    pub fn from_core_summary(
+        summary: &CTermAnchorSummary,
+        seq_ids: &[i32],
+        n_ppm: Option<f64>,
+    ) -> Self {
+        let seq_id = seq_ids
+            .get(summary.seq_idx)
+            .copied()
+            .unwrap_or((summary.seq_idx + 1) as i32);
+        let suffix = if summary.assigned_to_cterm {
+            " (C-term)"
+        } else {
+            ""
+        };
+        let note = if summary.assigned_to_cterm {
+            format!(
+                "Node #{} assigned to C-terminus (DSS C' = {:.2} ppm vs {:.1} ppm COO- center).",
+                summary.node_idx, summary.c_curr_dss_ppm, CTERM_COO_DSS_CENTER_PPM
+            )
+        } else {
+            format!(
+                "Node #{} exhibits downfield C' ({:.2} ppm DSS); inspect as C-term candidate.",
+                summary.node_idx, summary.c_curr_dss_ppm
+            )
+        };
+        Self {
+            seq_idx: summary.seq_idx,
+            seq_id,
+            residue_label: format!("{}{seq_id}{suffix}", summary.residue),
+            observed_c_prime_ppm: summary.c_curr_ppm,
+            observed_c_prime_dss_ppm: summary.c_curr_dss_ppm,
+            expected_coo_ppm: CTERM_COO_DSS_CENTER_PPM,
+            n_ppm,
+            confidence: summary.confidence,
+            assigned_to_cterm: summary.assigned_to_cterm,
+            note,
+        }
     }
 }
 
-/// Per-residue `HN <-> CON` cross-route concordance summary row.
+/// Per-residue `HN <-> CON` cross-route concordance summary row backed by [`JointRouteSupport`].
 #[derive(Clone, Debug, PartialEq)]
 pub struct ResidueRouteConcordance {
+    /// 0-based residue sequence index.
+    pub seq_idx: usize,
     /// 1-based residue sequence ID.
     pub seq_id: i32,
     /// 3-letter residue name (e.g., `"SER"`, `"PRO"`, `"ALA"`).
     pub res_name: String,
-    /// Route provenance badge.
-    pub badge: JointRouteBadge,
-    /// Optional amide `HN`-only route confidence (`0..1`).
-    pub hn_conf: Option<f64>,
-    /// Optional protonless `CON`-only route confidence (`0..1`).
-    pub con_conf: Option<f64>,
-    /// Joint fused posterior confidence (`0..1`).
+    /// Canonical core route provenance tag.
+    pub route: JointRouteSupport,
+    /// Raw pre-calibration posterior (`0..1`).
+    pub raw_posterior: f64,
+    /// Calibrated joint posterior confidence (`0..1`).
     pub joint_conf: f64,
     /// Optional `N_HN - N_CON` cross-route shift residual (ppm).
     pub delta_n_ppm: Option<f64>,
-    /// Optional `C'_HNCO - C'_CON` cross-route shift residual (ppm).
-    pub delta_c_prime_ppm: Option<f64>,
     /// True if residue is Proline.
     pub is_proline: bool,
-    /// True if residue is the C-terminus.
+    /// True if residue exhibits a C-terminal `COO-` anchor.
     pub is_c_term: bool,
-    /// Active CAS residue-filter tags corroborating this residue (e.g., `"CAS-SER(i-1)"`).
-    pub cas_tags: Vec<String>,
     /// True when locked as a Pass-2 anchor.
     pub locked: bool,
+    /// Assigned joint node index.
+    pub node_idx: Option<usize>,
 }
 
 /// Aggregated cross-route concordance statistics over [`IdpJointPanelState::concordance_rows`].
@@ -683,7 +885,6 @@ pub struct ConcordanceSummaryStats {
     pub high_conf_count: usize,
     pub mean_joint_conf: f64,
     pub max_abs_delta_n_ppm: f64,
-    pub max_abs_delta_c_prime_ppm: f64,
 }
 
 /// Sub-tabs inside [`IdpJointPanelState`] keeping desktop (`1280x800` / `1440x900`) and docked
@@ -712,8 +913,8 @@ impl IdpJointSubTab {
     }
 }
 
-/// Clean event enum emitted by [`IdpJointPanelState::show`] so `main.rs` can wire `v0.18.0`
-/// solver execution, native/WASM CAS file dialogs, and sequence-ribbon / strip-tiler navigation.
+/// Clean event enum emitted by [`IdpJointPanelState::show`]; every variant is consumed live by
+/// `NmrWorkbenchApp` in `crates/nmr-gui/src/main.rs` (`180.gui:P1-5`).
 #[derive(Clone, Debug, PartialEq)]
 pub enum IdpJointAction {
     /// User selected a new solver regime (`AutoJoint`, `IdpJoint`, `Idp13cOnly`, `Globular`).
@@ -722,7 +923,7 @@ pub enum IdpJointAction {
     ToggleRootsHnco(bool),
     /// User toggled `NH2` sidechain pair filtering.
     ToggleNh2Filtering(bool),
-    /// User toggled TROSY `1/2 1J_HN` (`+/-46 Hz / MHz`) cross-spectrum calibration.
+    /// User toggled TROSY `46 Hz (1/2 1J_NH)` cross-spectrum calibration.
     ToggleTrosyCalibration(bool),
     /// User toggled `F1(C')` NUS sidelobe pruning.
     ToggleNusSidelobePruning(bool),
@@ -732,7 +933,7 @@ pub enum IdpJointAction {
     ToggleCTermCooPrior(bool),
     /// User toggled conservative 2-pass anchor-lock propagation.
     ToggleTwoPassAnchorLock(bool),
-    /// User adjusted spectrometer proton frequency (MHz) used for `1/2 1J_HN` calibration preview.
+    /// User adjusted spectrometer proton frequency (MHz) used for `46 Hz (1/2 1J_NH)` scaling.
     SpectrometerMhzChanged(f64),
     /// User added a new `--cas` experiment slot.
     AddCasSlot(CasSlotEntry),
@@ -742,15 +943,18 @@ pub enum IdpJointAction {
     UpdateCasSlot(CasSlotEntry),
     /// User requested loading a spectrum/peak list into the given CAS slot `id`.
     RequestLoadCasSlot(usize),
-    /// User clicked the primary Run Assignment button.
+    /// User clicked the primary Run IDP Assignment button.
     RunJointAssignment,
     /// User clicked a residue row or Proline bridge to focus it in the sequence ribbon / strip tiler.
-    InspectResidue { seq_id: i32, badge: JointRouteBadge },
+    InspectResidue {
+        seq_id: i32,
+        route: JointRouteSupport,
+    },
     /// User toggled anchor lock on a resolved `X-Pro` bridge.
     ToggleProBridgeLock { pro_seq_id: i32, locked: bool },
     /// User clicked a C-terminal `COO-` anchor hint to inspect its carbonyl shift in the strip view.
     FocusCTermAnchor { seq_id: i32, c_prime_ppm: f64 },
-    /// User loaded the built-in synthetic Pro/Ser-rich IDP demonstration dataset.
+    /// User loaded and solved the built-in clean-room synthetic Pro/Ser-rich IDP demonstration.
     LoadSyntheticDemo,
 }
 
@@ -799,18 +1003,35 @@ impl IdpJointPanelTheme {
     }
 }
 
+/// Optional input file path hints mirrored in [`IdpJointPanelState::cli_preview_command`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct JointCliPathHints {
+    pub seq_path: String,
+    pub out_prefix: String,
+    pub peaks_path: String,
+    pub con_path: String,
+    pub cccon_path: String,
+    pub hncacon_path: String,
+    pub hncaconh_path: String,
+}
+
 /// Complete state for the Unified Joint `HN + 13C` IDP Workbench & Interactive `--cas` Slot Mapper.
 #[derive(Clone, Debug, PartialEq)]
 pub struct IdpJointPanelState {
+    pub open: bool,
     pub regime: IdpRegimeSelection,
     pub roots_hnco: bool,
     pub filter_nh2_pairs: bool,
     pub trosy_half_j_calibration: bool,
     pub spectrometer_mhz: f64,
+    pub temperature_k: f64,
+    pub ph: f64,
+    pub hncacb_polarity: HncacbPolarity,
     pub f1_nus_sidelobe_pruning: bool,
     pub gly_cb_bleed_guard: bool,
     pub c_term_coo_prior: bool,
     pub two_pass_anchor_lock: bool,
+    pub cli_paths: JointCliPathHints,
     pub cas_slots: Vec<CasSlotEntry>,
     pub next_slot_id: usize,
     pub draft_residue_type: CasResidueType,
@@ -820,8 +1041,14 @@ pub struct IdpJointPanelState {
     pub proline_bridges: Vec<ProlineBridgeEntry>,
     pub c_term_hints: Vec<CTermAnchorHint>,
     pub concordance_rows: Vec<ResidueRouteConcordance>,
+    pub last_qc_verdict: Option<DatasetQcVerdict>,
+    pub last_qc_reasons: Vec<String>,
+    pub last_trosy_calibration: Option<TrosyOffsetCalibration>,
+    pub last_fusion_rms_ppm: Option<(f64, f64)>,
+    pub last_fitted_offsets: Option<IdpShiftOffsets>,
+    pub last_n_nodes: usize,
     pub active_tab: IdpJointSubTab,
-    pub route_filter: Option<JointRouteBadge>,
+    pub route_filter: Option<JointRouteSupport>,
     pub selected_residue: Option<i32>,
     pub status_message: String,
     pub solver_running: bool,
@@ -835,18 +1062,23 @@ impl Default for IdpJointPanelState {
 }
 
 impl IdpJointPanelState {
-    /// Create a fresh `IdpJointPanelState` with sensible `idp-joint` defaults.
+    /// Create a fresh `IdpJointPanelState` with canonical `idp-joint` defaults.
     pub fn new() -> Self {
         Self {
+            open: false,
             regime: IdpRegimeSelection::AutoJoint,
             roots_hnco: true,
             filter_nh2_pairs: true,
             trosy_half_j_calibration: true,
-            spectrometer_mhz: 800.0,
+            spectrometer_mhz: CANONICAL_TROSY_FALLBACK_MHZ,
+            temperature_k: 298.15,
+            ph: 6.5,
+            hncacb_polarity: HncacbPolarity::Auto,
             f1_nus_sidelobe_pruning: true,
             gly_cb_bleed_guard: true,
             c_term_coo_prior: true,
             two_pass_anchor_lock: true,
+            cli_paths: JointCliPathHints::default(),
             cas_slots: Vec::new(),
             next_slot_id: 1,
             draft_residue_type: CasResidueType::Ser,
@@ -856,30 +1088,43 @@ impl IdpJointPanelState {
             proline_bridges: Vec::new(),
             c_term_hints: Vec::new(),
             concordance_rows: Vec::new(),
+            last_qc_verdict: None,
+            last_qc_reasons: Vec::new(),
+            last_trosy_calibration: None,
+            last_fusion_rms_ppm: None,
+            last_fitted_offsets: None,
+            last_n_nodes: 0,
             active_tab: IdpJointSubTab::RegimeAndCas,
             route_filter: None,
             selected_residue: None,
-            status_message: "Ready: configure regime and CAS slots, or load synthetic demo."
-                .to_string(),
+            status_message: "Ready: configure regime and CAS slots, or run idp-joint.".to_string(),
             solver_running: false,
             synthetic_demo_loaded: false,
         }
     }
 
-    /// Add a new `--cas` slot and return its stable slot `id`.
+    /// Add a new `--cas` slot bounded by [`MAX_CAS_SLOTS`] (`P2-8`), returning its stable `id` or
+    /// an explicit error when the cap is reached.
     pub fn add_cas_slot(
         &mut self,
         residue_type: CasResidueType,
         custom_residues: impl Into<String>,
         direction: CasDirection,
         path: impl Into<String>,
-    ) -> usize {
+    ) -> Result<usize, String> {
+        if self.cas_slots.len() >= MAX_CAS_SLOTS {
+            let msg = format!(
+                "Cannot add CAS slot: limit of {MAX_CAS_SLOTS} slots reached (remove an existing slot first)."
+            );
+            self.status_message = msg.clone();
+            return Err(msg);
+        }
         let id = self.next_slot_id;
         self.next_slot_id = self.next_slot_id.saturating_add(1);
         let entry = CasSlotEntry::new(id, residue_type, direction, path)
             .with_custom_residues(custom_residues);
         self.cas_slots.push(entry);
-        id
+        Ok(id)
     }
 
     /// Remove a `--cas` slot by its stable `id`. Returns `true` if a slot was removed.
@@ -917,6 +1162,60 @@ impl IdpJointPanelState {
         }
     }
 
+    /// Update the path of an existing `--cas` slot and reset its loaded / axis-consistency state
+    /// to [`CasAxisConsistency::Unchecked`] until re-validated (`P2-7`).
+    pub fn set_cas_slot_path(&mut self, slot_id: usize, new_path: impl Into<String>) -> bool {
+        if let Some(slot) = self.cas_slots.iter_mut().find(|s| s.id == slot_id) {
+            slot.path = new_path.into();
+            slot.loaded = false;
+            slot.peak_count = 0;
+            slot.peaks.clear();
+            slot.axis_consistency = CasAxisConsistency::Unchecked;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Validate `(f2, f1)` axis nuclei and ppm bounds live for an existing `--cas` slot (`P2-7`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn set_cas_slot_axis_window(
+        &mut self,
+        slot_id: usize,
+        f2_nuc: &str,
+        f2_hi: f64,
+        f2_lo: f64,
+        f1_nuc: &str,
+        f1_hi: f64,
+        f1_lo: f64,
+    ) -> Option<CasAxisConsistency> {
+        let slot = self.cas_slots.iter_mut().find(|s| s.id == slot_id)?;
+        let status = CasAxisConsistency::validate_axes(f2_nuc, f2_hi, f2_lo, f1_nuc, f1_hi, f1_lo);
+        slot.axis_consistency = status;
+        Some(status)
+    }
+
+    /// Load 2D CAS peaks into an existing slot and run live axis validation (`P2-7`).
+    pub fn load_cas_slot_from_peaks(
+        &mut self,
+        slot_id: usize,
+        peaks: Vec<CasPeak>,
+        axis_override: Option<(&str, f64, f64, &str, f64, f64)>,
+    ) -> Option<CasAxisConsistency> {
+        let slot = self.cas_slots.iter_mut().find(|s| s.id == slot_id)?;
+        let status = match axis_override {
+            Some((f2_nuc, f2_hi, f2_lo, f1_nuc, f1_hi, f1_lo)) => {
+                CasAxisConsistency::validate_axes(f2_nuc, f2_hi, f2_lo, f1_nuc, f1_hi, f1_lo)
+            }
+            None => CasAxisConsistency::validate_peaks(&peaks),
+        };
+        slot.peak_count = peaks.len();
+        slot.loaded = !peaks.is_empty();
+        slot.peaks = peaks;
+        slot.axis_consistency = status;
+        Some(status)
+    }
+
     /// Update the loaded flag, peak count, and axis-consistency badge for a `--cas` slot.
     pub fn set_cas_slot_loaded(
         &mut self,
@@ -935,7 +1234,32 @@ impl IdpJointPanelState {
         }
     }
 
-    /// Count of enabled, loaded, valid `--cas` slots ready for the solver.
+    /// Replace CAS slots from an ingest execution plan while respecting [`MAX_CAS_SLOTS`].
+    pub fn sync_cas_slots_from_ingest(&mut self, incoming: Vec<CasSlotEntry>) -> usize {
+        self.cas_slots.clear();
+        self.next_slot_id = 1;
+        let mut added = 0usize;
+        for mut slot in incoming {
+            if self.cas_slots.len() >= MAX_CAS_SLOTS {
+                break;
+            }
+            slot.id = self.next_slot_id;
+            self.next_slot_id = self.next_slot_id.saturating_add(1);
+            self.cas_slots.push(slot);
+            added += 1;
+        }
+        added
+    }
+
+    /// Collect all enabled, loaded, axis-consistent CAS slots as [`CasSpectrum`] objects for the solver.
+    pub fn build_ready_cas_spectra(&self) -> Vec<CasSpectrum> {
+        self.cas_slots
+            .iter()
+            .filter_map(CasSlotEntry::to_cas_spectrum)
+            .collect()
+    }
+
+    /// Count of enabled, loaded, axis-consistent `--cas` slots ready for the solver.
     pub fn ready_cas_slot_count(&self) -> usize {
         self.cas_slots
             .iter()
@@ -943,16 +1267,160 @@ impl IdpJointPanelState {
             .count()
     }
 
-    /// Field-scaled TROSY `1/2 1J_HN` (`46 Hz / MHz`) magnitude in ppm `(delta_1h_ppm, delta_15n_ppm)`.
+    /// Canonical field-scaled TROSY `46 Hz (1/2 1J_NH)` signed shift `(d1H_ppm, d15N_ppm)` directly
+    /// delegated to [`nmr_core::joint_idp_solver::trosy_expected_shift_ppm`] (`180.gui:P1-6`).
     pub fn trosy_half_j_offsets_ppm(&self) -> (f64, f64) {
-        let mhz = if self.spectrometer_mhz.is_finite() && self.spectrometer_mhz >= 100.0 {
-            self.spectrometer_mhz
-        } else {
-            800.0
+        trosy_expected_shift_ppm(self.spectrometer_mhz)
+    }
+
+    /// Build a [`JointIdpConfig`] mirroring the panel's current toggles and conditions.
+    pub fn build_joint_config(&self, seed: u64) -> JointIdpConfig {
+        #[allow(unused_mut)]
+        let mut cfg = JointIdpConfig {
+            temperature_k: if self.temperature_k.is_finite() {
+                self.temperature_k.clamp(250.0, 360.0)
+            } else {
+                298.15
+            },
+            ph: if self.ph.is_finite() {
+                self.ph.clamp(1.0, 12.0)
+            } else {
+                6.5
+            },
+            proton_mhz: if self.spectrometer_mhz.is_finite() && self.spectrometer_mhz > 50.0 {
+                self.spectrometer_mhz
+            } else {
+                CANONICAL_TROSY_FALLBACK_MHZ
+            },
+            hncacb_polarity: self.hncacb_polarity,
+            auto_trosy_calibration: self.trosy_half_j_calibration,
+            enable_nus_sidelobe_pruning: self.f1_nus_sidelobe_pruning,
+            enable_gly_cb_guard: self.gly_cb_bleed_guard,
+            enable_cterm_coo_prior: self.c_term_coo_prior,
+            enable_two_pass_anchor_lock: self.two_pass_anchor_lock,
+            include_hsqc_without_hnco: !self.roots_hnco,
+            seed,
+            ..JointIdpConfig::default()
         };
-        let dh = TROSY_HALF_J_HN_HZ / mhz;
-        let dn = TROSY_HALF_J_HN_HZ / (mhz * GAMMA_N15_OVER_H1);
-        (dh, dn)
+        #[cfg(target_arch = "wasm32")]
+        {
+            cfg.replicas = cfg.replicas.min(12);
+            cfg.generations = cfg.generations.min(2);
+            cfg.steps_per_system = cfg.steps_per_system.min(450);
+        }
+        cfg
+    }
+
+    /// Populate Proline bridges, C-terminal `COO-` anchor hints, residue route concordance, and QC
+    /// diagnostics directly from a real [`JointIdpAssignResult`] (`180.gui:P1-6`).
+    pub fn sync_from_joint_result(&mut self, result: &JointIdpAssignResult, seq_ids: &[i32]) {
+        self.last_qc_verdict = Some(result.qc_verdict);
+        self.last_qc_reasons = result.qc_reasons.clone();
+        self.last_trosy_calibration = Some(result.trosy_calibration.clone());
+        self.last_fusion_rms_ppm = Some(result.fusion_rms_ppm);
+        self.last_fitted_offsets = Some(result.fitted_offsets);
+        self.last_n_nodes = result.nodes.len();
+
+        let locked_nodes: BTreeMap<usize, bool> = result
+            .pass1_locked_anchors
+            .iter()
+            .map(|&(_nid, k)| (k, true))
+            .collect();
+
+        // 1. Proline bridges from core `proline_bridge_summaries()`
+        self.proline_bridges = result
+            .proline_bridge_summaries()
+            .iter()
+            .map(|summary| {
+                let mut channels = Vec::new();
+                if let Some(nid) = summary.pro_node_idx {
+                    if let Some(node) = result.nodes.get(nid) {
+                        if node.con_matched {
+                            channels.push("CON".to_string());
+                        }
+                        if !node.ca_curr.is_empty() || !node.ca_prev.is_empty() {
+                            channels.push("CANCO/CA".to_string());
+                        }
+                        if !node.cb_prev.is_empty() || !node.sidechain_c_prev.is_empty() {
+                            channels.push("H(CC)CON".to_string());
+                        }
+                        if !node.nn_prev_cands.is_empty() {
+                            channels.push("(H)N(CA)CON".to_string());
+                        }
+                    }
+                }
+                let locked = locked_nodes
+                    .get(&summary.pro_seq_idx)
+                    .copied()
+                    .unwrap_or(false);
+                ProlineBridgeEntry::from_core_summary(summary, seq_ids, locked, channels)
+            })
+            .collect();
+
+        // 2. C-terminal `COO-` anchors from core `cterm_anchor_summaries()`
+        self.c_term_hints = result
+            .cterm_anchor_summaries()
+            .iter()
+            .map(|summary| {
+                let n_ppm = result.nodes.get(summary.node_idx).map(|n| n.n_curr);
+                CTermAnchorHint::from_core_summary(summary, seq_ids, n_ppm)
+            })
+            .collect();
+
+        // 3. Per-residue `HN <-> CON` cross-route concordance directly from `residue_assignments`
+        self.concordance_rows = result
+            .residue_assignments
+            .iter()
+            .filter_map(|ra| {
+                let route = ra.route_support?;
+                let seq_id = seq_ids
+                    .get(ra.seq_idx)
+                    .copied()
+                    .unwrap_or((ra.seq_idx + 1) as i32);
+                let delta_n_ppm = ra.node_idx.and_then(|nid| {
+                    let node = result.nodes.get(nid)?;
+                    if node.hn_matched && node.con_matched {
+                        node.hn_n_curr.map(|hn_n| hn_n - node.n_curr)
+                    } else {
+                        None
+                    }
+                });
+                Some(ResidueRouteConcordance {
+                    seq_idx: ra.seq_idx,
+                    seq_id,
+                    res_name: ra.residue.clone(),
+                    route,
+                    raw_posterior: ra.raw_posterior,
+                    joint_conf: ra.confidence,
+                    delta_n_ppm,
+                    is_proline: ra.is_proline,
+                    is_c_term: ra.is_cterm_coo,
+                    locked: ra.anchor_locked,
+                    node_idx: ra.node_idx,
+                })
+            })
+            .collect();
+
+        let (pro_ok, pro_tot) = result.proline_bridge_recovery;
+        self.status_message = format!(
+            "Joint IDP solved: {} nodes, {} assigned ({} XVal, {} Pro/{pro_tot}, {} CON-only, {} HN-only), QC={:?}",
+            result.nodes.len(),
+            self.concordance_rows.len(),
+            result.n_cross_validated_hn_con,
+            pro_ok,
+            result.n_con_route_only,
+            result.n_hn_route_only,
+            result.qc_verdict
+        );
+    }
+
+    /// Build a `0`-based residue index -> [`JointRouteSupport`] lookup map for the sequence ribbon
+    /// and strip tiler.
+    pub fn route_map_by_res_idx(&self) -> BTreeMap<usize, JointRouteSupport> {
+        self.concordance_rows
+            .iter()
+            .map(|row| (row.seq_idx, row.route))
+            .collect()
     }
 
     /// Aggregate cross-route concordance statistics over `self.concordance_rows`.
@@ -966,11 +1434,11 @@ impl IdpJointPanelState {
         }
         let mut conf_sum = 0.0_f64;
         for row in &self.concordance_rows {
-            match row.badge {
-                JointRouteBadge::CrossValidatedHnAndCon => stats.cross_validated += 1,
-                JointRouteBadge::HnOnly => stats.hn_only += 1,
-                JointRouteBadge::ConProBridge => stats.con_pro_bridge += 1,
-                JointRouteBadge::ConOnly => stats.con_only += 1,
+            match row.route {
+                JointRouteSupport::CrossValidatedHnAndCon => stats.cross_validated += 1,
+                JointRouteSupport::HnRoute => stats.hn_only += 1,
+                JointRouteSupport::ConProBridge => stats.con_pro_bridge += 1,
+                JointRouteSupport::ConRouteOnly => stats.con_only += 1,
             }
             if row.joint_conf >= 0.80 {
                 stats.high_conf_count += 1;
@@ -981,317 +1449,299 @@ impl IdpJointPanelState {
                     stats.max_abs_delta_n_ppm = stats.max_abs_delta_n_ppm.max(dn.abs());
                 }
             }
-            if let Some(dc) = row.delta_c_prime_ppm {
-                if dc.is_finite() {
-                    stats.max_abs_delta_c_prime_ppm = stats.max_abs_delta_c_prime_ppm.max(dc.abs());
-                }
-            }
         }
         stats.mean_joint_conf = conf_sum / (self.concordance_rows.len() as f64);
         stats
     }
 
-    /// Build a reproducible CLI flag preview mirroring the current GUI settings.
+    /// Build a strictly valid, runnable `ferric assign` CLI command mirroring current GUI state
+    /// (`180.gui:P1-7`). Emits ONLY real flags parsed by `crates/nmr-cli/src/main.rs::cmd_assign`,
+    /// skips unloaded / unchecked / invalid / empty-path CAS slots, and never emits placeholder
+    /// paths like `<unassigned_path>` or invalid tokens like `"custom"`.
     pub fn cli_preview_command(&self) -> String {
-        let mut out = format!("ferric assign --regime {}", self.regime.cli_flag());
+        let mut out = String::from("ferric assign");
+        if let Some(regime_arg) = self.regime.cli_regime_arg() {
+            let _ = write!(out, " --regime {regime_arg}");
+        }
+        let seq_arg = if self.cli_paths.seq_path.trim().is_empty() {
+            "sequence.fasta"
+        } else {
+            self.cli_paths.seq_path.trim()
+        };
+        let out_arg = if self.cli_paths.out_prefix.trim().is_empty() {
+            "idp_joint_out"
+        } else {
+            self.cli_paths.out_prefix.trim()
+        };
+        let _ = write!(out, " --seq {seq_arg} --out {out_arg} --engine cpu");
+
+        if !self.cli_paths.peaks_path.trim().is_empty() && self.regime.uses_hn_route() {
+            let _ = write!(out, " --peaks {}", self.cli_paths.peaks_path.trim());
+        }
+        if !self.cli_paths.con_path.trim().is_empty() && self.regime.uses_con_route() {
+            let _ = write!(out, " --con {}", self.cli_paths.con_path.trim());
+        }
+        if !self.cli_paths.cccon_path.trim().is_empty() && self.regime.uses_con_route() {
+            let _ = write!(out, " --cccon {}", self.cli_paths.cccon_path.trim());
+        }
+        if !self.cli_paths.hncacon_path.trim().is_empty() && self.regime.uses_con_route() {
+            let _ = write!(out, " --hncacon {}", self.cli_paths.hncacon_path.trim());
+        }
+        if !self.cli_paths.hncaconh_path.trim().is_empty() && self.regime.uses_hn_route() {
+            let _ = write!(out, " --hncaconh {}", self.cli_paths.hncaconh_path.trim());
+        }
         if self.roots_hnco && self.regime.uses_hn_route() {
             out.push_str(" --roots hnco");
         }
-        if !self.filter_nh2_pairs {
-            out.push_str(" --no-nh2-filter");
+        if self.hncacb_polarity != HncacbPolarity::Auto && self.regime.uses_hn_route() {
+            let _ = write!(out, " --hncacb-polarity {}", self.hncacb_polarity.as_str());
         }
-        if self.trosy_half_j_calibration && self.regime.uses_hn_route() {
-            out.push_str(" --trosy-calibrate");
+        if self.regime.uses_con_route() {
+            let t_k = if self.temperature_k.is_finite() {
+                self.temperature_k.clamp(250.0, 360.0)
+            } else {
+                298.15
+            };
+            let ph = if self.ph.is_finite() {
+                self.ph.clamp(1.0, 12.0)
+            } else {
+                6.5
+            };
+            let _ = write!(out, " --temp-k {t_k:.2} --ph {ph:.2}");
         }
         for slot in &self.cas_slots {
-            if slot.enabled {
-                let _ = write!(out, " --cas {}", slot.to_cli_arg());
+            if let Some(cas_arg) = slot.to_cli_arg() {
+                let _ = write!(out, " --cas {cas_arg}");
             }
         }
         out
     }
 
-    /// Populate a clean-room synthetic Pro/Ser-rich IDP dataset preview (`wasm32`-clean, no disk I/O).
-    pub fn load_synthetic_idp_demo(&mut self) {
+    /// Synthesize a clean-room 22-residue Pro/Ser-rich IDP dataset, run the REAL
+    /// [`assign_joint_idp_cpu`] solver (fast, `wasm32`-clean, zero hardcoded fake results), and
+    /// populate this panel via [`Self::sync_from_joint_result`] (`180.gui:P1-6`).
+    pub fn load_synthetic_idp_demo(
+        &mut self,
+    ) -> Result<(Vec<String>, Vec<i32>, JointIdpDataset, JointIdpAssignResult), String> {
         self.regime = IdpRegimeSelection::IdpJoint;
         self.roots_hnco = true;
         self.filter_nh2_pairs = true;
         self.trosy_half_j_calibration = true;
-        self.spectrometer_mhz = 800.0;
+        self.spectrometer_mhz = CANONICAL_TROSY_FALLBACK_MHZ;
+        self.temperature_k = 298.15;
+        self.ph = 6.5;
         self.f1_nus_sidelobe_pruning = true;
         self.gly_cb_bleed_guard = true;
         self.c_term_coo_prior = true;
         self.two_pass_anchor_lock = true;
+
+        let seq: Vec<String> = [
+            "MET", "ALA", "SER", "PRO", "GLY", "SER", "THR", "VAL", "ASP", "GLU", "ALA", "PRO",
+            "PRO", "THR", "LEU", "LYS", "ASN", "GLY", "SER", "ILE", "GLN", "ALA",
+        ]
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+        let seq_ids: Vec<i32> = (1..=(seq.len() as i32)).collect();
+        let n_res = seq.len();
+
+        let mut cfg = self.build_joint_config(42);
+        cfg.replicas = 12;
+        cfg.generations = 2;
+        cfg.steps_per_system = 300;
+
+        // Compute clean-room ncIDP coil shifts with pre-Pro corrections and C-term COO- shift.
+        let preds = predict_joint_ncidp_shifts(&seq, &cfg);
+        let mut h_sh = vec![8.20_f64; n_res];
+        let mut n_sh = vec![120.0_f64; n_res];
+        let mut c_sh = vec![174.0_f64; n_res];
+        let mut ca_sh = vec![55.0_f64; n_res];
+        let mut cb_sh: Vec<Option<f64>> = vec![None; n_res];
+        for (k, sh) in preds.iter().enumerate() {
+            // Deterministic slight site dispersion so peaks are distinct without any RNG dependency.
+            let spread = ((k as f64) * 1.618_033_988_7).sin();
+            h_sh[k] = 8.15 + 0.35 * spread;
+            n_sh[k] = sh.n_ppm + 0.45 * spread;
+            c_sh[k] = if k + 1 == n_res {
+                CTERM_COO_DSS_CENTER_PPM + 0.35
+            } else {
+                sh.c_ppm + 0.25 * spread
+            };
+            ca_sh[k] = sh.ca_ppm + 0.30 * spread;
+            cb_sh[k] = sh.cb_ppm.map(|v| v + 0.28 * spread);
+        }
+
+        let mut hn_peaks = Vec::new();
+        let mut con_roots = Vec::new();
+        let mut strip_peaks = Vec::new();
+        let mut ser_peaks = Vec::new();
+        let mut ala_peaks = Vec::new();
+        let mut gly_peaks = Vec::new();
+
+        for k in 1..n_res {
+            let is_pro = seq[k] == "PRO";
+            // Simulate one exchange-broadened amide (k == 5, SER6) seen only in CON,
+            // and one CON-missing amide (k == 14, LEU15) seen only in HN so all 4 route badges appear.
+            let has_hn = !is_pro && k != 5;
+            let has_con = k != 14;
+
+            if has_hn {
+                let h = h_sh[k];
+                let n = n_sh[k];
+                let mk_peak = |exp: &str, c: Option<f64>, sign: i32, amp: f64| Peak {
+                    exp: exp.to_string(),
+                    h,
+                    n,
+                    c,
+                    sign,
+                    height: Some(amp),
+                    volume: Some(amp),
+                    h2: None,
+                };
+                hn_peaks.push(mk_peak("HSQC", None, 1, 1.0));
+                hn_peaks.push(mk_peak("HNCO", Some(c_sh[k - 1]), 1, 1.0));
+                hn_peaks.push(mk_peak("HNCACO", Some(c_sh[k]), 1, 0.9));
+                hn_peaks.push(mk_peak("HNCACB", Some(ca_sh[k]), 1, 1.0));
+                if let Some(cb) = cb_sh[k] {
+                    hn_peaks.push(mk_peak("HNCACB", Some(cb), -1, 0.85));
+                }
+                hn_peaks.push(mk_peak("CBCACONH", Some(ca_sh[k - 1]), 1, 0.95));
+                if let Some(cb_prev) = cb_sh[k - 1] {
+                    hn_peaks.push(mk_peak("CBCACONH", Some(cb_prev), -1, 0.80));
+                }
+            }
+
+            if has_con {
+                con_roots.push(Con2DPeak {
+                    c_prev_ppm: c_sh[k - 1],
+                    n_curr_ppm: n_sh[k],
+                    height: 1.0,
+                    volume: 1.0,
+                    is_proline_imino_region: n_sh[k] >= PROLINE_N15_MIN_PPM,
+                    deconvolved_from_cluster: false,
+                });
+                strip_peaks.push(C13Strip3DPeak {
+                    exp: C13DetectedExp::Canco3D,
+                    c_prime_ppm: c_sh[k - 1],
+                    n_ppm: n_sh[k],
+                    c_indirect_ppm: ca_sh[k],
+                    sign: 1,
+                    height: 1.0,
+                    volume: 1.0,
+                    anchor_root_idx: None,
+                });
+                strip_peaks.push(C13Strip3DPeak {
+                    exp: C13DetectedExp::Canco3D,
+                    c_prime_ppm: c_sh[k - 1],
+                    n_ppm: n_sh[k],
+                    c_indirect_ppm: ca_sh[k - 1],
+                    sign: 1,
+                    height: 0.65,
+                    volume: 0.65,
+                    anchor_root_idx: None,
+                });
+                strip_peaks.push(C13Strip3DPeak {
+                    exp: C13DetectedExp::Cbcaco3D,
+                    c_prime_ppm: c_sh[k - 1],
+                    n_ppm: n_sh[k],
+                    c_indirect_ppm: ca_sh[k - 1],
+                    sign: 1,
+                    height: 0.95,
+                    volume: 0.95,
+                    anchor_root_idx: None,
+                });
+                if let Some(cb_prev) = cb_sh[k - 1] {
+                    strip_peaks.push(C13Strip3DPeak {
+                        exp: C13DetectedExp::Cbcaco3D,
+                        c_prime_ppm: c_sh[k - 1],
+                        n_ppm: n_sh[k],
+                        c_indirect_ppm: cb_prev,
+                        sign: -1,
+                        height: 0.85,
+                        volume: 0.85,
+                        anchor_root_idx: None,
+                    });
+                }
+                if seq[k - 1] == "SER" {
+                    ser_peaks.push(CasPeak {
+                        c_prime_ppm: c_sh[k - 1],
+                        n_ppm: n_sh[k],
+                        height: 1.0,
+                        volume: 1.0,
+                    });
+                }
+                if seq[k - 1] == "ALA" {
+                    ala_peaks.push(CasPeak {
+                        c_prime_ppm: c_sh[k - 1],
+                        n_ppm: n_sh[k],
+                        height: 1.0,
+                        volume: 1.0,
+                    });
+                }
+                if seq[k - 1] == "GLY" {
+                    gly_peaks.push(CasPeak {
+                        c_prime_ppm: c_sh[k - 1],
+                        n_ppm: n_sh[k],
+                        height: 1.0,
+                        volume: 1.0,
+                    });
+                }
+            }
+        }
+
+        // Populate CAS slots through live validation (`P2-7`).
         self.cas_slots.clear();
         self.next_slot_id = 1;
-
-        let s1 = self.add_cas_slot(
+        if let Ok(id_ser) = self.add_cas_slot(
             CasResidueType::Ser,
             "",
             CasDirection::Cacon,
             "demo/cacon_ser.tsv",
-        );
-        self.set_cas_slot_loaded(s1, true, 14, CasAxisConsistency::Consistent);
-
-        let s2 = self.add_cas_slot(
+        ) {
+            let _ = self.load_cas_slot_from_peaks(id_ser, ser_peaks, None);
+        }
+        if let Ok(id_ala) = self.add_cas_slot(
             CasResidueType::Ala,
             "",
             CasDirection::Cacon,
             "demo/cacon_ala.tsv",
-        );
-        self.set_cas_slot_loaded(s2, true, 11, CasAxisConsistency::Consistent);
-
-        let s3 = self.add_cas_slot(
+        ) {
+            let _ = self.load_cas_slot_from_peaks(id_ala, ala_peaks, None);
+        }
+        if let Ok(id_gly) = self.add_cas_slot(
             CasResidueType::Gly,
             "",
             CasDirection::Cacon,
             "demo/cacon_gly.tsv",
-        );
-        self.set_cas_slot_loaded(s3, true, 9, CasAxisConsistency::Consistent);
+        ) {
+            let _ = self.load_cas_slot_from_peaks(id_gly, gly_peaks, None);
+        }
 
-        let s4 = self.add_cas_slot(
-            CasResidueType::Tavi,
-            "",
-            CasDirection::Canco,
-            "demo/canco_tavi.tsv",
-        );
-        self.set_cas_slot_loaded(s4, true, 18, CasAxisConsistency::Consistent);
+        let ds = JointIdpDataset {
+            hn_peaks,
+            c13_dataset: C13PickedDataset {
+                con_roots,
+                caco_peaks: Vec::new(),
+                strip_peaks,
+            },
+            cas_spectra: self.build_ready_cas_spectra(),
+            hncacon_nn_edges: Vec::new(),
+            hncaconh_peaks: Vec::new(),
+            reciprocal_nn_pairs: Vec::new(),
+            proton_mhz: self.spectrometer_mhz,
+            user_locks: Vec::new(),
+        };
 
-        self.proline_bridges = vec![
-            ProlineBridgeEntry {
-                pro_seq_id: 14,
-                prev_label: "S13".to_string(),
-                pro_label: "P14".to_string(),
-                next_label: Some("G15".to_string()),
-                con_n_ppm: 136.42,
-                con_c_prime_ppm: 173.18,
-                confidence: 0.96,
-                locked: true,
-                supporting_channels: vec![
-                    "CON".to_string(),
-                    "H(CC)CON".to_string(),
-                    "CAS-SER(i-1)".to_string(),
-                ],
-            },
-            ProlineBridgeEntry {
-                pro_seq_id: 28,
-                prev_label: "A27".to_string(),
-                pro_label: "P28".to_string(),
-                next_label: Some("P29".to_string()),
-                con_n_ppm: 137.85,
-                con_c_prime_ppm: 175.44,
-                confidence: 0.92,
-                locked: true,
-                supporting_channels: vec![
-                    "CON".to_string(),
-                    "CANCO".to_string(),
-                    "CAS-ALA(i-1)".to_string(),
-                ],
-            },
-            ProlineBridgeEntry {
-                pro_seq_id: 29,
-                prev_label: "P28".to_string(),
-                pro_label: "P29".to_string(),
-                next_label: Some("T30".to_string()),
-                con_n_ppm: 135.91,
-                con_c_prime_ppm: 174.92,
-                confidence: 0.89,
-                locked: false,
-                supporting_channels: vec![
-                    "CON".to_string(),
-                    "(H)N(CA)CON".to_string(),
-                    "CAS-TAVI(i)".to_string(),
-                ],
-            },
-        ];
-
-        self.c_term_hints = vec![CTermAnchorHint {
-            seq_id: 64,
-            residue_label: "A64 (C-term)".to_string(),
-            observed_c_prime_ppm: 179.48,
-            expected_coo_ppm: C_TERM_COO_NOMINAL_PPM,
-            n_ppm: Some(128.64),
-            confidence: 0.97,
-            detected: true,
-            note: "Downfield COO- C' resonance confirmed in HN(CA)CO and CACO (pH 6.8)."
-                .to_string(),
-        }];
-
-        self.concordance_rows = vec![
-            ResidueRouteConcordance {
-                seq_id: 12,
-                res_name: "ALA".to_string(),
-                badge: JointRouteBadge::CrossValidatedHnAndCon,
-                hn_conf: Some(0.94),
-                con_conf: Some(0.93),
-                joint_conf: 0.98,
-                delta_n_ppm: Some(0.04),
-                delta_c_prime_ppm: Some(-0.01),
-                is_proline: false,
-                is_c_term: false,
-                cas_tags: vec!["CAS-ALA(i-1)".to_string()],
-                locked: true,
-            },
-            ResidueRouteConcordance {
-                seq_id: 13,
-                res_name: "SER".to_string(),
-                badge: JointRouteBadge::CrossValidatedHnAndCon,
-                hn_conf: Some(0.91),
-                con_conf: Some(0.95),
-                joint_conf: 0.97,
-                delta_n_ppm: Some(-0.03),
-                delta_c_prime_ppm: Some(0.02),
-                is_proline: false,
-                is_c_term: false,
-                cas_tags: vec!["CAS-SER(i-1)".to_string()],
-                locked: true,
-            },
-            ResidueRouteConcordance {
-                seq_id: 14,
-                res_name: "PRO".to_string(),
-                badge: JointRouteBadge::ConProBridge,
-                hn_conf: None,
-                con_conf: Some(0.96),
-                joint_conf: 0.96,
-                delta_n_ppm: None,
-                delta_c_prime_ppm: None,
-                is_proline: true,
-                is_c_term: false,
-                cas_tags: vec!["CAS-SER(i-1)".to_string()],
-                locked: true,
-            },
-            ResidueRouteConcordance {
-                seq_id: 15,
-                res_name: "GLY".to_string(),
-                badge: JointRouteBadge::CrossValidatedHnAndCon,
-                hn_conf: Some(0.92),
-                con_conf: Some(0.90),
-                joint_conf: 0.96,
-                delta_n_ppm: Some(0.05),
-                delta_c_prime_ppm: Some(0.01),
-                is_proline: false,
-                is_c_term: false,
-                cas_tags: vec!["CAS-GLY(i-1)".to_string()],
-                locked: false,
-            },
-            ResidueRouteConcordance {
-                seq_id: 16,
-                res_name: "SER".to_string(),
-                badge: JointRouteBadge::ConOnly,
-                hn_conf: None,
-                con_conf: Some(0.86),
-                joint_conf: 0.86,
-                delta_n_ppm: None,
-                delta_c_prime_ppm: None,
-                is_proline: false,
-                is_c_term: false,
-                cas_tags: vec!["CAS-GLY(i-1)".to_string()],
-                locked: false,
-            },
-            ResidueRouteConcordance {
-                seq_id: 27,
-                res_name: "ALA".to_string(),
-                badge: JointRouteBadge::CrossValidatedHnAndCon,
-                hn_conf: Some(0.90),
-                con_conf: Some(0.92),
-                joint_conf: 0.96,
-                delta_n_ppm: Some(0.02),
-                delta_c_prime_ppm: Some(-0.02),
-                is_proline: false,
-                is_c_term: false,
-                cas_tags: vec!["CAS-ALA(i-1)".to_string()],
-                locked: true,
-            },
-            ResidueRouteConcordance {
-                seq_id: 28,
-                res_name: "PRO".to_string(),
-                badge: JointRouteBadge::ConProBridge,
-                hn_conf: None,
-                con_conf: Some(0.92),
-                joint_conf: 0.92,
-                delta_n_ppm: None,
-                delta_c_prime_ppm: None,
-                is_proline: true,
-                is_c_term: false,
-                cas_tags: vec!["CAS-ALA(i-1)".to_string()],
-                locked: true,
-            },
-            ResidueRouteConcordance {
-                seq_id: 29,
-                res_name: "PRO".to_string(),
-                badge: JointRouteBadge::ConProBridge,
-                hn_conf: None,
-                con_conf: Some(0.89),
-                joint_conf: 0.89,
-                delta_n_ppm: None,
-                delta_c_prime_ppm: None,
-                is_proline: true,
-                is_c_term: false,
-                cas_tags: Vec::new(),
-                locked: false,
-            },
-            ResidueRouteConcordance {
-                seq_id: 30,
-                res_name: "THR".to_string(),
-                badge: JointRouteBadge::CrossValidatedHnAndCon,
-                hn_conf: Some(0.88),
-                con_conf: Some(0.91),
-                joint_conf: 0.95,
-                delta_n_ppm: Some(-0.06),
-                delta_c_prime_ppm: Some(0.03),
-                is_proline: false,
-                is_c_term: false,
-                cas_tags: vec!["CAS-TAVI(i)".to_string()],
-                locked: false,
-            },
-            ResidueRouteConcordance {
-                seq_id: 31,
-                res_name: "GLU".to_string(),
-                badge: JointRouteBadge::HnOnly,
-                hn_conf: Some(0.83),
-                con_conf: None,
-                joint_conf: 0.83,
-                delta_n_ppm: None,
-                delta_c_prime_ppm: None,
-                is_proline: false,
-                is_c_term: false,
-                cas_tags: Vec::new(),
-                locked: false,
-            },
-            ResidueRouteConcordance {
-                seq_id: 63,
-                res_name: "VAL".to_string(),
-                badge: JointRouteBadge::CrossValidatedHnAndCon,
-                hn_conf: Some(0.95),
-                con_conf: Some(0.94),
-                joint_conf: 0.98,
-                delta_n_ppm: Some(0.01),
-                delta_c_prime_ppm: Some(0.00),
-                is_proline: false,
-                is_c_term: false,
-                cas_tags: vec!["CAS-TAVI(i)".to_string()],
-                locked: true,
-            },
-            ResidueRouteConcordance {
-                seq_id: 64,
-                res_name: "ALA".to_string(),
-                badge: JointRouteBadge::CrossValidatedHnAndCon,
-                hn_conf: Some(0.96),
-                con_conf: Some(0.97),
-                joint_conf: 0.99,
-                delta_n_ppm: Some(-0.02),
-                delta_c_prime_ppm: Some(0.01),
-                is_proline: false,
-                is_c_term: true,
-                cas_tags: vec!["CAS-ALA(i-1)".to_string()],
-                locked: true,
-            },
-        ];
-
+        let res = assign_joint_idp_cpu(&ds, &seq, &cfg)?;
+        self.sync_from_joint_result(&res, &seq_ids);
         self.synthetic_demo_loaded = true;
-        self.status_message =
-            "Synthetic Demo loaded: 4 CAS slots, 3 X-Pro bridges, 1 C-term COO- anchor, 12 residues."
-                .to_string();
+        self.status_message = format!(
+            "Synthetic Demo solved (real assign_joint_idp_cpu): {} residues, {} X-Pro bridges, QC={:?}",
+            self.concordance_rows.len(),
+            self.proline_bridges.iter().filter(|b| b.bridged).count(),
+            res.qc_verdict
+        );
+        Ok((seq, seq_ids, ds, res))
     }
 
     /// Render the Unified Joint `HN + 13C` IDP workbench panel inside `ui` and return emitted actions.
@@ -1357,6 +1807,7 @@ impl IdpJointPanelState {
     ) {
         let stats = self.concordance_stats();
         let ready_cas = self.ready_cas_slot_count();
+        let bridged_pro = self.proline_bridges.iter().filter(|b| b.bridged).count();
 
         egui::Frame::new()
             .fill(theme.card_bg)
@@ -1393,17 +1844,28 @@ impl IdpJointPanelState {
                     );
                     draw_status_pill(
                         ui,
-                        &format!("X-Pro {}", self.proline_bridges.len()),
-                        JointRouteBadge::ConProBridge.color(paper_white),
+                        &format!("X-Pro {bridged_pro}/{}", self.proline_bridges.len()),
+                        joint_route_color(JointRouteSupport::ConProBridge, paper_white),
                         theme.pill_bg_alpha,
                     );
                     if stats.total > 0 {
                         draw_status_pill(
                             ui,
-                            &format!("HN+CON {}/{}", stats.cross_validated, stats.total),
-                            JointRouteBadge::CrossValidatedHnAndCon.color(paper_white),
+                            &format!("XVal {}/{}", stats.cross_validated, stats.total),
+                            joint_route_color(
+                                JointRouteSupport::CrossValidatedHnAndCon,
+                                paper_white,
+                            ),
                             theme.pill_bg_alpha,
                         );
+                    }
+                    if let Some(qc) = self.last_qc_verdict {
+                        let (qc_lbl, qc_col) = match qc {
+                            DatasetQcVerdict::Pass => ("QC PASS", theme.ok),
+                            DatasetQcVerdict::Warn => ("QC WARN", theme.warn),
+                            DatasetQcVerdict::Abstain => ("QC ABSTAIN", theme.err),
+                        };
+                        draw_status_pill(ui, qc_lbl, qc_col, theme.pill_bg_alpha);
                     }
                 });
 
@@ -1436,11 +1898,11 @@ impl IdpJointPanelState {
                             .min_size(egui::vec2(144.0, 26.0)),
                         )
                         .on_hover_text(
-                            "Populate a clean-room synthetic Pro/Ser-rich IDP dataset preview.",
+                            "Run real assign_joint_idp_cpu on a clean-room synthetic Pro/Ser IDP.",
                         )
                         .clicked()
                     {
-                        self.load_synthetic_idp_demo();
+                        let _ = self.load_synthetic_idp_demo();
                         actions.push(IdpJointAction::LoadSyntheticDemo);
                     }
 
@@ -1450,6 +1912,16 @@ impl IdpJointPanelState {
                             .color(theme.text_muted),
                     );
                 });
+
+                if !self.last_qc_reasons.is_empty() {
+                    ui.add_space(3.0);
+                    let summary = compact_text(&self.last_qc_reasons.join("; "), 130);
+                    ui.label(
+                        egui::RichText::new(format!("QC Notes: {summary}"))
+                            .size(TYPE_CAPTION_PX)
+                            .color(theme.warn),
+                    );
+                }
             });
     }
 
@@ -1579,12 +2051,12 @@ impl IdpJointPanelState {
                             hn_enabled,
                             egui::Checkbox::new(
                                 &mut self.trosy_half_j_calibration,
-                                egui::RichText::new("TROSY 1/2 1J_HN auto-calibration")
+                                egui::RichText::new("TROSY 1/2 1J_NH auto-calibration")
                                     .size(TYPE_BODY_PX),
                             ),
                         )
                         .on_hover_text(
-                            "Auto-calibrate +/-46 Hz / MHz (dH, dN) offset between TROSY 3Ds and decoupled HSQC/HNCO.",
+                            "Auto-calibrate 46 Hz (1/2 1J_NH), field-scaled to ppm, between TROSY 3Ds and decoupled HSQC/HNCO.",
                         )
                         .changed()
                     {
@@ -1595,7 +2067,7 @@ impl IdpJointPanelState {
                 });
 
                 ui.add_space(4.0);
-                // Field-scaled TROSY offset readout & spectrometer frequency selector
+                // Field-scaled TROSY offset readout via canonical `trosy_expected_shift_ppm`
                 ui.horizontal_wrapped(|ui| {
                     ui.spacing_mut().item_spacing = egui::vec2(10.0, 4.0);
                     ui.label(
@@ -1620,7 +2092,7 @@ impl IdpJointPanelState {
                     let (dh, dn) = self.trosy_half_j_offsets_ppm();
                     let trosy_text = if self.trosy_half_j_calibration {
                         format!(
-                            "1/2 1J_HN (+/-46 Hz): d1H = +/-{dh:.4} ppm, d15N = +/-{dn:.3} ppm"
+                            "46 Hz (1/2 1J_NH), field-scaled to ppm: d1H = {dh:+.4} ppm, d15N = {dn:+.3} ppm"
                         )
                     } else {
                         "TROSY offset calibration disabled (0.000 ppm shift)".to_string()
@@ -1662,8 +2134,10 @@ impl IdpJointPanelState {
                     if ui
                         .checkbox(
                             &mut self.c_term_coo_prior,
-                            egui::RichText::new("C-term COO- (~179 ppm) prior")
-                                .size(TYPE_CAPTION_PX),
+                            egui::RichText::new(format!(
+                                "C-term COO- (~{CTERM_COO_DSS_CENTER_PPM:.0} ppm) prior"
+                            ))
+                            .size(TYPE_CAPTION_PX),
                         )
                         .changed()
                     {
@@ -1691,7 +2165,8 @@ impl IdpJointPanelState {
                         .size(TYPE_CAPTION_PX)
                         .monospace()
                         .color(theme.text_muted),
-                );
+                )
+                .on_hover_text(self.cli_preview_command());
             });
     }
 
@@ -1717,9 +2192,10 @@ impl IdpJointPanelState {
                             .color(theme.text_primary),
                     );
                     ui.label(
-                        egui::RichText::new(
-                            "Map 2D amino-acid-selective (C'(i-1), N(i)) subspectra.",
-                        )
+                        egui::RichText::new(format!(
+                            "Map 2D AA-selective (C'(i-1), N(i)) subspectra ({}/{MAX_CAS_SLOTS}).",
+                            self.cas_slots.len()
+                        ))
                         .size(TYPE_CAPTION_PX)
                         .color(theme.text_muted),
                     );
@@ -1727,6 +2203,7 @@ impl IdpJointPanelState {
 
                 ui.add_space(6.0);
                 // Add-slot bar
+                let at_cap = self.cas_slots.len() >= MAX_CAS_SLOTS;
                 ui.horizontal_wrapped(|ui| {
                     ui.spacing_mut().item_spacing = egui::vec2(8.0, 4.0);
                     ui.label(
@@ -1786,10 +2263,11 @@ impl IdpJointPanelState {
                             .font(egui::FontId::proportional(TYPE_BODY_PX)),
                     );
 
-                    let draft_valid = self
-                        .draft_residue_type
-                        .resolve_residues(&self.draft_custom_residues)
-                        .is_ok();
+                    let draft_valid = !at_cap
+                        && self
+                            .draft_residue_type
+                            .resolve_residues(&self.draft_custom_residues)
+                            .is_ok();
                     if ui
                         .add_enabled(
                             draft_valid,
@@ -1802,28 +2280,41 @@ impl IdpJointPanelState {
                         )
                         .clicked()
                     {
+                        let token_part = self
+                            .draft_residue_type
+                            .cli_token(&self.draft_custom_residues)
+                            .unwrap_or_else(|| "cas".to_string());
                         let path = if self.draft_path.trim().is_empty() {
-                            format!(
-                                "{}_{}.tsv",
-                                self.draft_direction.cli_prefix(),
-                                self.draft_residue_type
-                                    .cli_token(&self.draft_custom_residues)
-                            )
+                            format!("{}_{}.tsv", self.draft_direction.cli_prefix(), token_part)
                         } else {
                             self.draft_path.trim().to_string()
                         };
-                        let id = self.add_cas_slot(
+                        if let Ok(id) = self.add_cas_slot(
                             self.draft_residue_type,
                             self.draft_custom_residues.trim().to_string(),
                             self.draft_direction,
                             path,
-                        );
-                        if let Some(created) = self.cas_slots.iter().find(|s| s.id == id).cloned() {
-                            actions.push(IdpJointAction::AddCasSlot(created));
+                        ) {
+                            if let Some(created) =
+                                self.cas_slots.iter().find(|s| s.id == id).cloned()
+                            {
+                                actions.push(IdpJointAction::AddCasSlot(created));
+                            }
+                            self.draft_path.clear();
                         }
-                        self.draft_path.clear();
                     }
                 });
+
+                if at_cap {
+                    ui.add_space(2.0);
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "Maximum of {MAX_CAS_SLOTS} CAS slots reached."
+                        ))
+                        .size(TYPE_CAPTION_PX)
+                        .color(theme.warn),
+                    );
+                }
 
                 if self.draft_residue_type == CasResidueType::Other {
                     if let Err(err) = self
@@ -2063,12 +2554,14 @@ impl IdpJointPanelState {
                 ui.horizontal_wrapped(|ui| {
                     ui.spacing_mut().item_spacing = egui::vec2(8.0, 4.0);
                     ui.label(
-                        egui::RichText::new("Resolved X-Pro Bridges (2D CON Imino 15N 132-143 ppm)")
-                            .size(TYPE_BODY_PX)
-                            .strong()
-                            .color(theme.text_primary),
+                        egui::RichText::new(format!(
+                            "Resolved X-Pro Bridges (2D CON Imino 15N {PROLINE_N15_MIN_PPM:.1}-{PROLINE_N15_MAX_PPM:.1} ppm DSS)"
+                        ))
+                        .size(TYPE_BODY_PX)
+                        .strong()
+                        .color(theme.text_primary),
                     );
-                    draw_route_badge_pill(ui, JointRouteBadge::ConProBridge, paper_white);
+                    draw_route_support_pill(ui, JointRouteSupport::ConProBridge, paper_white);
                 });
 
                 ui.add_space(6.0);
@@ -2112,16 +2605,16 @@ impl IdpJointPanelState {
                                     .strong()
                                     .color(theme.text_primary),
                             );
-                            ui.label(
-                                egui::RichText::new(format!("{:.2}", bridge.con_n_ppm))
-                                    .size(TYPE_BODY_PX)
-                                    .monospace(),
-                            );
-                            ui.label(
-                                egui::RichText::new(format!("{:.2}", bridge.con_c_prime_ppm))
-                                    .size(TYPE_BODY_PX)
-                                    .monospace(),
-                            );
+                            let n_str = bridge
+                                .con_n_ppm
+                                .map(|v| format!("{v:.2}"))
+                                .unwrap_or_else(|| "-".to_string());
+                            ui.label(egui::RichText::new(n_str).size(TYPE_BODY_PX).monospace());
+                            let c_str = bridge
+                                .con_c_prime_ppm
+                                .map(|v| format!("{v:.2}"))
+                                .unwrap_or_else(|| "-".to_string());
+                            ui.label(egui::RichText::new(c_str).size(TYPE_BODY_PX).monospace());
                             let conf_color = if bridge.confidence >= 0.80 {
                                 theme.ok
                             } else {
@@ -2168,7 +2661,7 @@ impl IdpJointPanelState {
                                     self.selected_residue = Some(bridge.pro_seq_id);
                                     actions.push(IdpJointAction::InspectResidue {
                                         seq_id: bridge.pro_seq_id,
-                                        badge: JointRouteBadge::ConProBridge,
+                                        route: JointRouteSupport::ConProBridge,
                                     });
                                 }
                             });
@@ -2191,9 +2684,9 @@ impl IdpJointPanelState {
             .inner_margin(egui::Margin::symmetric(10, 8))
             .show(ui, |ui| {
                 ui.label(
-                    egui::RichText::new(
-                        "C-Terminal COO- Anchor Hints (Platzer / ncIDP ~179 ppm DSS)",
-                    )
+                    egui::RichText::new(format!(
+                        "C-Terminal COO- Anchor Hints (Platzer / ncIDP ~{CTERM_COO_DSS_CENTER_PPM:.1} ppm DSS)"
+                    ))
                     .size(TYPE_BODY_PX)
                     .strong()
                     .color(theme.text_primary),
@@ -2214,8 +2707,16 @@ impl IdpJointPanelState {
                         ui.spacing_mut().item_spacing = egui::vec2(10.0, 4.0);
                         draw_status_pill(
                             ui,
-                            if hint.detected { "DETECTED" } else { "ABSENT" },
-                            if hint.detected { theme.ok } else { theme.warn },
+                            if hint.assigned_to_cterm {
+                                "ASSIGNED C-TERM"
+                            } else {
+                                "CANDIDATE"
+                            },
+                            if hint.assigned_to_cterm {
+                                theme.ok
+                            } else {
+                                theme.warn
+                            },
                             theme.pill_bg_alpha,
                         );
                         ui.label(
@@ -2226,9 +2727,9 @@ impl IdpJointPanelState {
                         );
                         ui.label(
                             egui::RichText::new(format!(
-                                "C' = {:.2} ppm (expected {:.2}, delta {:+.2} ppm)",
+                                "C' = {:.2} ppm (DSS {:.2}, delta {:+.2} ppm)",
                                 hint.observed_c_prime_ppm,
-                                hint.expected_coo_ppm,
+                                hint.observed_c_prime_dss_ppm,
                                 hint.delta_ppm()
                             ))
                             .size(TYPE_BODY_PX)
@@ -2314,26 +2815,26 @@ impl IdpJointPanelState {
                     {
                         self.route_filter = None;
                     }
-                    for badge in JointRouteBadge::ALL {
-                        let count = match badge {
-                            JointRouteBadge::CrossValidatedHnAndCon => stats.cross_validated,
-                            JointRouteBadge::HnOnly => stats.hn_only,
-                            JointRouteBadge::ConProBridge => stats.con_pro_bridge,
-                            JointRouteBadge::ConOnly => stats.con_only,
+                    for route in ALL_JOINT_ROUTE_SUPPORTS {
+                        let count = match route {
+                            JointRouteSupport::CrossValidatedHnAndCon => stats.cross_validated,
+                            JointRouteSupport::HnRoute => stats.hn_only,
+                            JointRouteSupport::ConProBridge => stats.con_pro_bridge,
+                            JointRouteSupport::ConRouteOnly => stats.con_only,
                         };
-                        let selected = self.route_filter == Some(badge);
-                        let label = format!("{} ({count})", badge.short_code());
+                        let selected = self.route_filter == Some(route);
+                        let label = format!("{} ({count})", joint_route_short_code(route));
                         if ui
                             .add(egui::Button::selectable(
                                 selected,
                                 egui::RichText::new(label)
                                     .size(TYPE_CAPTION_PX)
-                                    .color(badge.color(paper_white)),
+                                    .color(joint_route_color(route, paper_white)),
                             ))
-                            .on_hover_text(badge.description())
+                            .on_hover_text(joint_route_description(route))
                             .clicked()
                         {
-                            self.route_filter = if selected { None } else { Some(badge) };
+                            self.route_filter = if selected { None } else { Some(route) };
                         }
                     }
                 });
@@ -2366,14 +2867,15 @@ impl IdpJointPanelState {
                             .size(TYPE_CAPTION_PX)
                             .color(theme.text_muted),
                         );
-                        ui.label(
-                            egui::RichText::new(format!(
-                                "Max |d13C'|: {:.3} ppm",
-                                stats.max_abs_delta_c_prime_ppm
-                            ))
-                            .size(TYPE_CAPTION_PX)
-                            .color(theme.text_muted),
-                        );
+                        if let Some((rms_c, rms_n)) = self.last_fusion_rms_ppm {
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "Fusion RMS: C' {rms_c:.3} / N {rms_n:.3} ppm"
+                                ))
+                                .size(TYPE_CAPTION_PX)
+                                .color(theme.text_muted),
+                            );
+                        }
                     });
                 }
 
@@ -2389,21 +2891,20 @@ impl IdpJointPanelState {
                     return;
                 }
 
-                let mut inspect_req: Option<(i32, JointRouteBadge)> = None;
+                let mut inspect_req: Option<(i32, JointRouteSupport)> = None;
 
                 egui::Grid::new("idp_concordance_grid")
-                    .num_columns(8)
+                    .num_columns(7)
                     .spacing([12.0, 5.0])
                     .striped(true)
                     .show(ui, |ui| {
                         for header in [
                             "Residue",
                             "Route",
-                            "HN Conf",
-                            "CON Conf",
-                            "Joint",
-                            "dN / dC' (ppm)",
-                            "CAS / Anchor",
+                            "Raw Post.",
+                            "Calib. Conf",
+                            "dN (ppm)",
+                            "Flags",
                             "View",
                         ] {
                             ui.label(
@@ -2417,7 +2918,7 @@ impl IdpJointPanelState {
 
                         for row in &self.concordance_rows {
                             if let Some(filter) = self.route_filter {
-                                if row.badge != filter {
+                                if row.route != filter {
                                     continue;
                                 }
                             }
@@ -2431,20 +2932,10 @@ impl IdpJointPanelState {
                             }
                             ui.label(res_txt);
 
-                            draw_route_badge_pill(ui, row.badge, paper_white);
+                            draw_route_support_pill(ui, row.route, paper_white);
 
-                            let hn_str = row
-                                .hn_conf
-                                .map(|c| format!("{:.0}%", c * 100.0))
-                                .unwrap_or_else(|| "-".to_string());
-                            ui.label(egui::RichText::new(hn_str).size(TYPE_CAPTION_PX).monospace());
-
-                            let con_str = row
-                                .con_conf
-                                .map(|c| format!("{:.0}%", c * 100.0))
-                                .unwrap_or_else(|| "-".to_string());
                             ui.label(
-                                egui::RichText::new(con_str)
+                                egui::RichText::new(format!("{:.0}%", row.raw_posterior * 100.0))
                                     .size(TYPE_CAPTION_PX)
                                     .monospace(),
                             );
@@ -2461,12 +2952,10 @@ impl IdpJointPanelState {
                                     .color(joint_color),
                             );
 
-                            let delta_str = match (row.delta_n_ppm, row.delta_c_prime_ppm) {
-                                (Some(dn), Some(dc)) => format!("{dn:+.2} / {dc:+.2}"),
-                                (Some(dn), None) => format!("{dn:+.2} / -"),
-                                (None, Some(dc)) => format!("- / {dc:+.2}"),
-                                (None, None) => "-".to_string(),
-                            };
+                            let delta_str = row
+                                .delta_n_ppm
+                                .map(|dn| format!("{dn:+.2}"))
+                                .unwrap_or_else(|| "-".to_string());
                             ui.label(
                                 egui::RichText::new(delta_str)
                                     .size(TYPE_CAPTION_PX)
@@ -2474,8 +2963,10 @@ impl IdpJointPanelState {
                                     .color(theme.text_muted),
                             );
 
-                            let mut tags: Vec<&str> =
-                                row.cas_tags.iter().map(String::as_str).collect();
+                            let mut tags: Vec<&str> = Vec::new();
+                            if row.is_proline {
+                                tags.push("PRO");
+                            }
                             if row.is_c_term {
                                 tags.push("COO-");
                             }
@@ -2499,30 +2990,31 @@ impl IdpJointPanelState {
                                 ))
                                 .clicked()
                             {
-                                inspect_req = Some((row.seq_id, row.badge));
+                                inspect_req = Some((row.seq_id, row.route));
                             }
                             ui.end_row();
                         }
                     });
 
-                if let Some((seq_id, badge)) = inspect_req {
+                if let Some((seq_id, route)) = inspect_req {
                     self.selected_residue = Some(seq_id);
-                    actions.push(IdpJointAction::InspectResidue { seq_id, badge });
+                    actions.push(IdpJointAction::InspectResidue { seq_id, route });
                 }
             });
     }
 }
 
-/// Reusable zero-emoji pill widget for [`JointRouteBadge`] (for sequence ribbon, strip headers,
-/// and concordance tables).
-pub fn draw_route_badge_pill(
+/// Reusable zero-emoji pill widget for [`JointRouteSupport`] (used in concordance tables,
+/// sequence ribbons, and strip headers).
+pub fn draw_route_support_pill(
     ui: &mut egui::Ui,
-    badge: JointRouteBadge,
+    route: JointRouteSupport,
     paper_white: bool,
 ) -> egui::Response {
-    let color = badge.color(paper_white);
+    let color = joint_route_color(route, paper_white);
     let alpha = if paper_white { 28 } else { 36 };
-    draw_status_pill(ui, badge.short_code(), color, alpha).on_hover_text(badge.description())
+    draw_status_pill(ui, joint_route_short_code(route), color, alpha)
+        .on_hover_text(joint_route_description(route))
 }
 
 fn draw_status_pill(

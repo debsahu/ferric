@@ -24,10 +24,12 @@ use nmr_core::aromatic::{
 use nmr_core::bayes_sa::{
     solve_bayes_sa, solve_bayes_sa_from_peaks, BayesSaConfig, BayesSaReport, LockedAssignment,
 };
+#[cfg(not(target_arch = "wasm32"))]
+use nmr_core::c13_detected::parse_cas_peaks_str;
 use nmr_core::c13_detected::{
     pick_caco_2d, pick_con_2d, pick_con_anchored_3d, simulate_idp_13c_cubes, C13DetectedExp,
-    C13PickedDataset, C13PickerConfig, C13Strip3DPeak, Caco2DPeak, CacoPeakKind, Con2DPeak,
-    IdpCubeSimConfig,
+    C13PickedDataset, C13PickerConfig, C13Strip3DPeak, Caco2DPeak, CacoPeakKind, CasPeak,
+    Con2DPeak, IdpCubeSimConfig,
 };
 use nmr_core::classify::{
     DataState, ExperimentDimensionality, ExperimentVendor, ProblemRegime, PulseSequenceClass,
@@ -39,6 +41,10 @@ use nmr_core::fid::read_bruker_fid_3d_from_bytes;
 use nmr_core::idp_propensity::{PropensityConfig, PropensityReport};
 use nmr_core::idp_solver::{
     assign_idp_13c_cpu, idp_to_reference, register_and_build_con_dipeptide_systems, IdpSolverConfig,
+};
+use nmr_core::joint_idp_solver::{
+    assign_joint_idp_cpu, joint_idp_to_reference, JointIdpAssignResult, JointIdpDataset,
+    JointRouteSupport,
 };
 use nmr_core::nef::read_nef_str;
 use nmr_core::neural_picker::{pick_hsqc_2d_neural, NeuralPickerConfig};
@@ -119,6 +125,8 @@ use nmr_gpu::bayes_sa_gpu::BayesSaGpuSolver;
 #[cfg(not(target_arch = "wasm32"))]
 use nmr_gpu::GpuEngine;
 #[cfg(not(target_arch = "wasm32"))]
+use nmr_gui::idp_joint_panel::CasAxisConsistency;
+#[cfg(not(target_arch = "wasm32"))]
 use nmr_gui::ingest_panel::{
     ingest_dropped_files_native, load_native_path_1d_or_workspace, sanitize_user_path_input,
 };
@@ -143,6 +151,10 @@ use nmr_gui::{
     demo_preset::{build_builtin_demo_suite, BUILTIN_DEMO_SUITE_SEED},
     dosy_panel::{render_dosy_panel, DosyPanelAction, DosyPanelState},
     dynamics_panel::{DynamicsStudioOutput, DynamicsStudioPanel, DynamicsStudioTab},
+    idp_joint_panel::{
+        joint_route_color, joint_route_short_code, IdpJointAction, IdpJointPanelState,
+        IdpRegimeSelection,
+    },
     ingest_panel::{
         ingest_dropped_payloads, install_browser_folder_drop_hook, is_bare_bruker_file_error,
         poll_browser_drop_error, poll_browser_dropped_payloads, try_load_1d_ucsf_or_pipe_bytes,
@@ -374,6 +386,7 @@ impl GuiSolverKind {
 enum GuiRegimeKind {
     #[default]
     Globular,
+    IdpJoint,
     Idp13C,
     Paramagnetic,
 }
@@ -382,6 +395,7 @@ impl GuiRegimeKind {
     fn label(self) -> &'static str {
         match self {
             Self::Globular => "Globular",
+            Self::IdpJoint => "IDP Joint",
             Self::Idp13C => "13C-IDP",
             Self::Paramagnetic => "Paramagnetic",
         }
@@ -1825,6 +1839,11 @@ struct NmrWorkbenchApp {
     workflow_dag_panel: WorkflowDagPanel,
     show_workflow_dag_window: bool,
     assign_setup_drawer: AssignSetupDrawerState,
+    idp_joint_panel: IdpJointPanelState,
+    joint_idp_result: Option<JointIdpAssignResult>,
+    joint_route_by_res: BTreeMap<usize, JointRouteSupport>,
+    #[cfg(not(target_arch = "wasm32"))]
+    background_joint_idp: Option<mpsc::Receiver<(Result<JointIdpAssignResult, String>, f64)>>,
     about_references_modal: AboutReferencesModal,
     p22_tools_panel: P22ToolsPanel,
     octet_exp_sync_key: (usize, usize),
@@ -3167,6 +3186,11 @@ impl Default for NmrWorkbenchApp {
             workflow_dag_panel: WorkflowDagPanel::new(),
             show_workflow_dag_window: false,
             assign_setup_drawer: AssignSetupDrawerState::new(),
+            idp_joint_panel: IdpJointPanelState::new(),
+            joint_idp_result: None,
+            joint_route_by_res: BTreeMap::new(),
+            #[cfg(not(target_arch = "wasm32"))]
+            background_joint_idp: None,
             about_references_modal: AboutReferencesModal::new(),
             p22_tools_panel: P22ToolsPanel::new(),
             octet_exp_sync_key: (0, usize::MAX),
@@ -6067,6 +6091,516 @@ impl NmrWorkbenchApp {
         );
     }
 
+    fn apply_joint_idp_result(&mut self, result: JointIdpAssignResult, dt_ms: f64) {
+        self.last_solve_ms = Some(dt_ms);
+        self.idp_joint_panel.solver_running = false;
+        self.idp_joint_panel
+            .sync_from_joint_result(&result, &self.seq_ids);
+        self.joint_route_by_res = self.idp_joint_panel.route_map_by_res_idx();
+        self.sidechain_ribbon_state.joint_route_by_res = self.joint_route_by_res.clone();
+        self.strip_tiler
+            .set_joint_route_support(self.joint_route_by_res.clone());
+
+        let (pred, conf) = joint_idp_to_reference(&result, &self.sequence, &self.seq_ids);
+        let n_hc = conf.values().filter(|&&c| c >= 0.80).count();
+        let (n_pro, n_pro_tot) = result.proline_bridge_recovery;
+        let n_xval = result.n_cross_validated_hn_con;
+        let qc = result.qc_verdict;
+
+        self.sidechain_ribbon_state
+            .sync_inferred_variants_from_reference(&pred);
+        self.pred_ref = Some(pred);
+        self.pred_conf = conf;
+        self.assign_res = Some(result.as_assign_result());
+        self.joint_idp_result = Some(result);
+        self.metrics = None;
+        self.refresh_propensity_report();
+        self.show_propensity_panel = true;
+        self.sync_session_assignments_from_solver();
+        let tag = if cfg!(target_arch = "wasm32") {
+            "IDP-Joint WASM"
+        } else {
+            "IDP-Joint CPU"
+        };
+        self.status_msg = format!(
+            "[{tag}] Assigned {}/{} residues ({n_hc} >=0.8, {n_xval} XVal, {n_pro}/{n_pro_tot} Pro, QC={qc:?}) in {dt_ms:.0} ms",
+            self.pred_conf.len(),
+            self.sequence.len()
+        );
+    }
+
+    fn run_idp_joint_assignment(&mut self, ctx_opt: Option<&egui::Context>) {
+        if self.sequence.is_empty() {
+            let msg = "Load an IDP sequence or NMR-STAR entry before idp-joint assignment";
+            self.status_msg = msg.to_string();
+            self.idp_joint_panel.status_message = msg.to_string();
+            return;
+        }
+        let c13_ds = self.c13_picked_dataset.clone().unwrap_or_default();
+        if self.peaks.is_empty() && c13_ds.con_roots.is_empty() {
+            let msg = "Load HN peaks and/or 2D CON peaks (or click Load Synthetic Demo) before running idp-joint";
+            self.status_msg = msg.to_string();
+            self.idp_joint_panel.status_message = msg.to_string();
+            return;
+        }
+
+        let cas_spectra = self.idp_joint_panel.build_ready_cas_spectra();
+        let user_locks: Vec<(usize, usize)> = self
+            .session
+            .state
+            .locked_residues
+            .iter()
+            .map(|(&node_idx, &res_idx)| (node_idx, res_idx))
+            .collect();
+        let ds = JointIdpDataset {
+            hn_peaks: self.peaks.clone(),
+            c13_dataset: c13_ds,
+            cas_spectra,
+            hncacon_nn_edges: Vec::new(),
+            hncaconh_peaks: Vec::new(),
+            reciprocal_nn_pairs: Vec::new(),
+            proton_mhz: self.idp_joint_panel.spectrometer_mhz,
+            user_locks,
+        };
+        let cfg = self.idp_joint_panel.build_joint_config(self.sim_seed);
+        let seq = self.sequence.clone();
+
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(ctx) = ctx_opt {
+            let (tx, rx) = mpsc::channel();
+            let repaint_ctx = ctx.clone();
+            let ds_bg = ds.clone();
+            let seq_bg = seq.clone();
+            let cfg_bg = cfg.clone();
+            match std::thread::Builder::new()
+                .name("ferric-idp-joint".to_string())
+                .spawn(move || {
+                    let timer = PerfTimer::start();
+                    let res = assign_joint_idp_cpu(&ds_bg, &seq_bg, &cfg_bg);
+                    let dt_ms = timer.elapsed_ms();
+                    let _ = tx.send((res, dt_ms));
+                    repaint_ctx.request_repaint();
+                }) {
+                Ok(_handle) => {
+                    self.background_joint_idp = Some(rx);
+                    self.idp_joint_panel.solver_running = true;
+                    self.idp_joint_panel.status_message =
+                        "Running unified HN + 13C idp-joint solver in background...".to_string();
+                    self.status_msg = self.idp_joint_panel.status_message.clone();
+                    return;
+                }
+                Err(_) => {
+                    // Fall through to synchronous CPU execution if thread spawn fails.
+                }
+            }
+        }
+        #[cfg(target_arch = "wasm32")]
+        let _ = ctx_opt;
+
+        let timer = PerfTimer::start();
+        let res = assign_joint_idp_cpu(&ds, &seq, &cfg);
+        let dt_ms = timer.elapsed_ms();
+        match res {
+            Ok(solved) => self.apply_joint_idp_result(solved, dt_ms),
+            Err(err) => {
+                self.idp_joint_panel.solver_running = false;
+                let msg = format!("idp-joint solver error: {err}");
+                self.idp_joint_panel.status_message = msg.clone();
+                self.status_msg = msg;
+            }
+        }
+    }
+
+    fn poll_background_joint_idp(&mut self) {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let outcome = match self.background_joint_idp.as_ref() {
+                Some(rx) => match rx.try_recv() {
+                    Ok(pair) => Some(Ok(pair)),
+                    Err(mpsc::TryRecvError::Empty) => None,
+                    Err(mpsc::TryRecvError::Disconnected) => Some(Err(())),
+                },
+                None => None,
+            };
+            if let Some(done) = outcome {
+                self.background_joint_idp = None;
+                match done {
+                    Ok((Ok(res), dt_ms)) => self.apply_joint_idp_result(res, dt_ms),
+                    Ok((Err(err), _)) => {
+                        self.idp_joint_panel.solver_running = false;
+                        let msg = format!("Background idp-joint solver error: {err}");
+                        self.idp_joint_panel.status_message = msg.clone();
+                        self.status_msg = msg;
+                    }
+                    Err(()) => {
+                        self.idp_joint_panel.solver_running = false;
+                        self.idp_joint_panel.status_message =
+                            "Background idp-joint worker disconnected unexpectedly.".to_string();
+                        self.status_msg = self.idp_joint_panel.status_message.clone();
+                    }
+                }
+            }
+        }
+    }
+
+    fn load_cas_slot_for_id(&mut self, slot_id: usize) {
+        let Some((path_raw, dir)) = self
+            .idp_joint_panel
+            .cas_slots
+            .iter()
+            .find(|s| s.id == slot_id)
+            .map(|s| (s.path.trim().to_string(), s.direction))
+        else {
+            return;
+        };
+
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            if !path_raw.is_empty() {
+                let p = std::path::PathBuf::from(&path_raw);
+                if p.is_file() {
+                    let ext = p
+                        .extension()
+                        .and_then(|s| s.to_str())
+                        .map(|s| s.to_ascii_lowercase())
+                        .unwrap_or_default();
+                    if matches!(ext.as_str(), "tsv" | "txt" | "csv" | "peaks" | "list") {
+                        match std::fs::read_to_string(&p) {
+                            Ok(txt) => {
+                                match parse_cas_peaks_str(&txt, Some(&p), Some(dir.to_core_mode()))
+                                {
+                                    Ok((_, peaks)) => {
+                                        let ax = self
+                                            .idp_joint_panel
+                                            .load_cas_slot_from_peaks(slot_id, peaks, None)
+                                            .unwrap_or(CasAxisConsistency::Unchecked);
+                                        let msg = format!(
+                                            "Loaded CAS slot #{slot_id} from '{}' (axes: {})",
+                                            path_raw,
+                                            ax.badge_label()
+                                        );
+                                        self.idp_joint_panel.status_message = msg.clone();
+                                        self.status_msg = msg;
+                                        return;
+                                    }
+                                    Err(err) => {
+                                        let msg = format!(
+                                            "Failed parsing CAS peaks in '{path_raw}': {err}"
+                                        );
+                                        self.idp_joint_panel.status_message = msg.clone();
+                                        self.status_msg = msg;
+                                        return;
+                                    }
+                                }
+                            }
+                            Err(err) => {
+                                let msg = format!("Failed reading CAS file '{path_raw}': {err}");
+                                self.idp_joint_panel.status_message = msg.clone();
+                                self.status_msg = msg;
+                                return;
+                            }
+                        }
+                    } else {
+                        let loaded_2d = match ext.as_str() {
+                            "ucsf" | "usf" => read_ucsf_2d(&p),
+                            "ft2" | "ft" | "pipe" => read_nmrpipe_2d(&p),
+                            _ => {
+                                let pd = resolve_bruker_pdata_dir(&p, "2rr");
+                                read_bruker_pdata_2d(&pd)
+                            }
+                        };
+                        match loaded_2d {
+                            Ok(spec2) => {
+                                let pcfg = C13PickerConfig {
+                                    snr_2d: self.picker_snr.max(3.0),
+                                    ..C13PickerConfig::default()
+                                };
+                                let picked = pick_con_2d(&spec2, &pcfg);
+                                let peaks: Vec<CasPeak> = picked
+                                    .into_iter()
+                                    .map(|pk| CasPeak {
+                                        c_prime_ppm: pk.c_prev_ppm,
+                                        n_ppm: pk.n_curr_ppm,
+                                        height: pk.height,
+                                        volume: pk.volume,
+                                    })
+                                    .collect();
+                                let ax = self
+                                    .idp_joint_panel
+                                    .load_cas_slot_from_peaks(
+                                        slot_id,
+                                        peaks,
+                                        Some((
+                                            &spec2.axis_x.label,
+                                            spec2.axis_x.max_ppm(),
+                                            spec2.axis_x.min_ppm(),
+                                            &spec2.axis_y.label,
+                                            spec2.axis_y.max_ppm(),
+                                            spec2.axis_y.min_ppm(),
+                                        )),
+                                    )
+                                    .unwrap_or(CasAxisConsistency::Unchecked);
+                                let msg = format!(
+                                    "Picked CAS slot #{slot_id} from 2D spectrum '{}' (axes: {})",
+                                    path_raw,
+                                    ax.badge_label()
+                                );
+                                self.idp_joint_panel.status_message = msg.clone();
+                                self.status_msg = msg;
+                                return;
+                            }
+                            Err(err) => {
+                                let msg =
+                                    format!("Failed loading 2D CAS spectrum '{path_raw}': {err}");
+                                self.idp_joint_panel.status_message = msg.clone();
+                                self.status_msg = msg;
+                                return;
+                            }
+                        }
+                    }
+                } else if p.is_dir() {
+                    let pd = resolve_bruker_pdata_dir(&p, "2rr");
+                    if let Ok(spec2) = read_bruker_pdata_2d(&pd) {
+                        let pcfg = C13PickerConfig {
+                            snr_2d: self.picker_snr.max(3.0),
+                            ..C13PickerConfig::default()
+                        };
+                        let peaks: Vec<CasPeak> = pick_con_2d(&spec2, &pcfg)
+                            .into_iter()
+                            .map(|pk| CasPeak {
+                                c_prime_ppm: pk.c_prev_ppm,
+                                n_ppm: pk.n_curr_ppm,
+                                height: pk.height,
+                                volume: pk.volume,
+                            })
+                            .collect();
+                        let ax = self
+                            .idp_joint_panel
+                            .load_cas_slot_from_peaks(
+                                slot_id,
+                                peaks,
+                                Some((
+                                    &spec2.axis_x.label,
+                                    spec2.axis_x.max_ppm(),
+                                    spec2.axis_x.min_ppm(),
+                                    &spec2.axis_y.label,
+                                    spec2.axis_y.max_ppm(),
+                                    spec2.axis_y.min_ppm(),
+                                )),
+                            )
+                            .unwrap_or(CasAxisConsistency::Unchecked);
+                        let msg = format!(
+                            "Picked Bruker 2D CAS slot #{slot_id} from '{}' (axes: {})",
+                            path_raw,
+                            ax.badge_label()
+                        );
+                        self.idp_joint_panel.status_message = msg.clone();
+                        self.status_msg = msg;
+                        return;
+                    }
+                }
+            }
+            self.ingest_panel.open = true;
+            let msg = format!(
+                "CAS slot #{slot_id}: path '{path_raw}' not found on disk; drop or select a CAS study folder in Ingest Matrix."
+            );
+            self.idp_joint_panel.status_message = msg.clone();
+            self.status_msg = msg;
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = (path_raw, dir);
+            trigger_browser_files_picker();
+            let msg = format!(
+                "CAS slot #{slot_id}: choose a 2D CAS spectrum or peak TSV in the browser file picker."
+            );
+            self.idp_joint_panel.status_message = msg.clone();
+            self.status_msg = msg;
+        }
+    }
+
+    fn handle_idp_joint_action(&mut self, action: IdpJointAction, ctx_opt: Option<&egui::Context>) {
+        match action {
+            IdpJointAction::RegimeChanged(regime) => {
+                self.regime_kind = match regime {
+                    IdpRegimeSelection::AutoJoint | IdpRegimeSelection::IdpJoint => {
+                        GuiRegimeKind::IdpJoint
+                    }
+                    IdpRegimeSelection::Idp13cOnly => GuiRegimeKind::Idp13C,
+                    IdpRegimeSelection::Globular => GuiRegimeKind::Globular,
+                };
+                self.assign_setup_drawer.regime = match self.regime_kind {
+                    GuiRegimeKind::Globular => AssignProteinRegime::Globular,
+                    GuiRegimeKind::IdpJoint => AssignProteinRegime::IdpJoint,
+                    GuiRegimeKind::Idp13C => AssignProteinRegime::Idp13C,
+                    GuiRegimeKind::Paramagnetic => AssignProteinRegime::Paramagnetic,
+                };
+                let msg = format!("Switched IDP workbench regime to {}", regime.label());
+                self.idp_joint_panel.status_message = msg.clone();
+                self.status_msg = msg;
+            }
+            IdpJointAction::ToggleRootsHnco(enabled) => {
+                self.idp_joint_panel.roots_hnco = enabled;
+                self.status_msg = format!(
+                    "HNCO-supported amide roots (--roots hnco): {}",
+                    if enabled { "enabled" } else { "disabled" }
+                );
+            }
+            IdpJointAction::ToggleNh2Filtering(enabled) => {
+                self.idp_joint_panel.filter_nh2_pairs = enabled;
+                self.status_msg = format!(
+                    "Asn/Gln NH2 doublet filtering: {}",
+                    if enabled { "enabled" } else { "disabled" }
+                );
+            }
+            IdpJointAction::ToggleTrosyCalibration(enabled) => {
+                self.idp_joint_panel.trosy_half_j_calibration = enabled;
+                self.status_msg = format!(
+                    "TROSY 46 Hz (1/2 1J_NH) auto-calibration: {}",
+                    if enabled { "enabled" } else { "disabled" }
+                );
+            }
+            IdpJointAction::ToggleNusSidelobePruning(enabled) => {
+                self.idp_joint_panel.f1_nus_sidelobe_pruning = enabled;
+                self.status_msg = format!(
+                    "F1(C') NUS sidelobe pruning: {}",
+                    if enabled { "enabled" } else { "disabled" }
+                );
+            }
+            IdpJointAction::ToggleGlyCbGuard(enabled) => {
+                self.idp_joint_panel.gly_cb_bleed_guard = enabled;
+                self.status_msg = format!(
+                    "Gly CB bleed-through guard: {}",
+                    if enabled { "enabled" } else { "disabled" }
+                );
+            }
+            IdpJointAction::ToggleCTermCooPrior(enabled) => {
+                self.idp_joint_panel.c_term_coo_prior = enabled;
+                self.status_msg = format!(
+                    "C-terminal COO- prior: {}",
+                    if enabled { "enabled" } else { "disabled" }
+                );
+            }
+            IdpJointAction::ToggleTwoPassAnchorLock(enabled) => {
+                self.idp_joint_panel.two_pass_anchor_lock = enabled;
+                self.status_msg = format!(
+                    "2-pass anchor-lock propagation: {}",
+                    if enabled { "enabled" } else { "disabled" }
+                );
+            }
+            IdpJointAction::SpectrometerMhzChanged(mhz) => {
+                self.idp_joint_panel.spectrometer_mhz = mhz;
+                let (dh, dn) = self.idp_joint_panel.trosy_half_j_offsets_ppm();
+                self.status_msg = format!(
+                    "Updated spectrometer field to {mhz:.1} MHz (TROSY d1H={dh:+.4}, d15N={dn:+.3} ppm)"
+                );
+            }
+            IdpJointAction::AddCasSlot(slot) => {
+                self.status_msg = format!(
+                    "Added CAS slot #{} ({})",
+                    slot.id,
+                    slot.display_filter_summary()
+                );
+            }
+            IdpJointAction::RemoveCasSlot(slot_id) => {
+                self.status_msg = format!("Removed CAS slot #{slot_id}");
+            }
+            IdpJointAction::UpdateCasSlot(slot) => {
+                self.status_msg = format!(
+                    "Updated CAS slot #{} -> {}",
+                    slot.id,
+                    slot.display_filter_summary()
+                );
+            }
+            IdpJointAction::RequestLoadCasSlot(slot_id) => {
+                self.load_cas_slot_for_id(slot_id);
+            }
+            IdpJointAction::RunJointAssignment => match self.idp_joint_panel.regime {
+                IdpRegimeSelection::AutoJoint | IdpRegimeSelection::IdpJoint => {
+                    self.regime_kind = GuiRegimeKind::IdpJoint;
+                    self.run_idp_joint_assignment(ctx_opt);
+                }
+                IdpRegimeSelection::Idp13cOnly => {
+                    self.regime_kind = GuiRegimeKind::Idp13C;
+                    self.run_idp_13c_assignment();
+                }
+                IdpRegimeSelection::Globular => {
+                    self.regime_kind = GuiRegimeKind::Globular;
+                    self.run_assignment();
+                }
+            },
+            IdpJointAction::InspectResidue { seq_id, route } => {
+                if let Some(k) = self.seq_ids.iter().position(|&id| id == seq_id) {
+                    self.show_strips_dock = true;
+                    self.select_residue_and_sync_strip(k);
+                    self.status_msg = format!(
+                        "Inspecting residue {} ({seq_id}) [{}]",
+                        self.sequence.get(k).map(String::as_str).unwrap_or("RES"),
+                        joint_route_short_code(route)
+                    );
+                } else {
+                    self.status_msg = format!(
+                        "Residue {seq_id} [{}] not in current sequence table",
+                        joint_route_short_code(route)
+                    );
+                }
+            }
+            IdpJointAction::ToggleProBridgeLock { pro_seq_id, locked } => {
+                if let Some(k) = self.seq_ids.iter().position(|&id| id == pro_seq_id) {
+                    if let Some(node_idx) = self.assign_res.as_ref().and_then(|res| {
+                        res.position
+                            .iter()
+                            .enumerate()
+                            .find_map(|(s, &pos)| (pos >= 0 && pos as usize == k).then_some(s))
+                    }) {
+                        if locked {
+                            self.session.state.locked_residues.insert(node_idx, k);
+                        } else {
+                            self.session.state.locked_residues.remove(&node_idx);
+                        }
+                    }
+                    self.status_msg = format!(
+                        "{} Proline bridge P{pro_seq_id}",
+                        if locked { "Locked" } else { "Unlocked" }
+                    );
+                }
+            }
+            IdpJointAction::FocusCTermAnchor {
+                seq_id,
+                c_prime_ppm,
+            } => {
+                if let Some(k) = self.seq_ids.iter().position(|&id| id == seq_id) {
+                    self.show_strips_dock = true;
+                    self.strip_tiler.band_view = nmr_gui::strip_tiler::StripBandView::Co;
+                    self.select_residue_and_sync_strip(k);
+                    self.crosshair.c_ppm = Some(c_prime_ppm);
+                }
+                self.status_msg =
+                    format!("Focused C-terminal COO- anchor at residue {seq_id} (C' = {c_prime_ppm:.2} ppm)");
+            }
+            IdpJointAction::LoadSyntheticDemo => {
+                match self.idp_joint_panel.load_synthetic_idp_demo() {
+                    Ok((seq, seq_ids, ds, res)) => {
+                        self.sequence = seq;
+                        self.seq_ids = seq_ids;
+                        self.peaks = ds.hn_peaks;
+                        self.c13_picked_dataset = Some(ds.c13_dataset);
+                        self.regime_kind = GuiRegimeKind::IdpJoint;
+                        self.assign_setup_drawer.regime = AssignProteinRegime::IdpJoint;
+                        self.rebuild_systems_and_matrices();
+                        self.apply_joint_idp_result(res, 0.0);
+                        self.idp_joint_panel.synthetic_demo_loaded = true;
+                    }
+                    Err(err) => {
+                        let msg = format!("Synthetic IDP demo solver error: {err}");
+                        self.idp_joint_panel.status_message = msg.clone();
+                        self.status_msg = msg;
+                    }
+                }
+            }
+        }
+    }
+
     fn run_paramagnetic_assignment(&mut self) {
         if self.sequence.is_empty()
             || (self.solver_kind == GuiSolverKind::EvoGraph && self.peaks.is_empty())
@@ -6209,6 +6743,10 @@ impl NmrWorkbenchApp {
 
     fn run_assignment(&mut self) {
         match self.regime_kind {
+            GuiRegimeKind::IdpJoint => {
+                self.run_idp_joint_assignment(None);
+                return;
+            }
             GuiRegimeKind::Idp13C => {
                 self.run_idp_13c_assignment();
                 return;
@@ -9165,6 +9703,11 @@ impl NmrWorkbenchApp {
                                 );
                                 ui.selectable_value(
                                     &mut self.regime_kind,
+                                    GuiRegimeKind::IdpJoint,
+                                    "IDP Joint (HN + 2D CON + Pro + CAS)",
+                                );
+                                ui.selectable_value(
+                                    &mut self.regime_kind,
                                     GuiRegimeKind::Idp13C,
                                     "13C-IDP (CON / CACO / CANCO + Pro)",
                                 );
@@ -9174,7 +9717,10 @@ impl NmrWorkbenchApp {
                                     "Paramagnetic (PRE Blind-Zone + Metal)",
                                 );
                             });
-                        if self.regime_kind != GuiRegimeKind::Idp13C {
+                        if !matches!(
+                            self.regime_kind,
+                            GuiRegimeKind::Idp13C | GuiRegimeKind::IdpJoint
+                        ) {
                             egui::ComboBox::from_id_salt("gui_solver_kind")
                                 .selected_text(format!("Solver: {}", self.solver_kind.label()))
                                 .show_ui(ui, |ui| {
@@ -9241,6 +9787,10 @@ impl NmrWorkbenchApp {
                         if ui.button("Assignment Setup Drawer...").clicked() {
                             ui.close();
                             self.assign_setup_drawer.open = true;
+                        }
+                        if ui.button("IDP Joint HN + 13C & CAS Mapper...").clicked() {
+                            ui.close();
+                            self.idp_joint_panel.open = true;
                         }
                         if ui.button("Workflow DAG Composer...").clicked() {
                             ui.close();
@@ -9493,7 +10043,8 @@ impl NmrWorkbenchApp {
                 }
             }
 
-            let cell_w = 38.0_f32;
+            let has_joint_routes = !self.joint_route_by_res.is_empty();
+            let cell_w = if has_joint_routes { 66.0_f32 } else { 38.0_f32 };
             let cell_h = 24.0_f32;
             let gap_x = 2.0_f32;
             let left_pad = 2.0_f32;
@@ -9542,7 +10093,10 @@ impl NmrWorkbenchApp {
                             c1.contains(&query) || c3.contains(&query)
                         };
 
-                        let fill = if let Some(conf) = direct_conf {
+                        let route_opt = self.joint_route_by_res.get(&k).copied();
+                        let fill = if route_opt == Some(JointRouteSupport::ConProBridge) {
+                            egui::Color32::from_rgb(84, 48, 122)
+                        } else if let Some(conf) = direct_conf {
                             if conf >= 0.80 {
                                 egui::Color32::from_rgb(28, 125, 82)
                             } else if conf >= 0.50 {
@@ -9562,6 +10116,8 @@ impl NmrWorkbenchApp {
                             egui::Stroke::new(2.0, egui::Color32::from_rgb(250, 204, 21))
                         } else if is_locked {
                             egui::Stroke::new(1.8, egui::Color32::from_rgb(255, 215, 90))
+                        } else if let Some(route) = route_opt {
+                            egui::Stroke::new(1.5, joint_route_color(route, false))
                         } else {
                             egui::Stroke::new(1.0, egui::Color32::from_rgb(65, 76, 98))
                         };
@@ -9569,10 +10125,15 @@ impl NmrWorkbenchApp {
                         painter.rect_filled(cell_rect, 3.0, fill);
                         painter.rect_stroke(cell_rect, 3.0, stroke, egui::StrokeKind::Inside);
 
-                        let label = if is_locked {
+                        let base_label = if is_locked {
                             format!("*{one}{seq_id}")
                         } else {
                             format!("{one}{seq_id}")
+                        };
+                        let label = if let Some(route) = route_opt {
+                            format!("{base_label} {}", joint_route_short_code(route))
+                        } else {
+                            base_label
                         };
                         painter.text(
                             cell_rect.center(),
@@ -13997,9 +14558,18 @@ impl NmrWorkbenchApp {
             }
 
             let mut any_extra_2d = false;
+            let mut con_2d_extra_specs: Vec<Spectrum2D> = Vec::new();
+            let mut cas_2d_loaded: Vec<(String, PulseSequenceClass, Spectrum2D)> = Vec::new();
             for (lbl, cls_ov, _, s2) in loaded_2d_list {
                 if cls_ov == PulseSequenceClass::Caco2D {
                     caco_2d_specs.push(s2.clone());
+                } else if cls_ov == PulseSequenceClass::Con2D {
+                    con_2d_extra_specs.push(s2.clone());
+                } else if matches!(
+                    cls_ov,
+                    PulseSequenceClass::CasCacon2D | PulseSequenceClass::CasCanco2D
+                ) {
+                    cas_2d_loaded.push((lbl.clone(), cls_ov, s2.clone()));
                 }
                 let _ = self.workbook.add_2d_page(lbl, s2, true, false);
                 any_extra_2d = true;
@@ -14013,11 +14583,105 @@ impl NmrWorkbenchApp {
                 self.save_live_2d_into_workbook();
             }
 
-            // Regime auto-selection & 13C-IDP CON/CACO/3D root picking
-            let is_idp_13c = plan.problem_regime == ProblemRegime::Idp13cDetected
-                || primary_cls == Some(PulseSequenceClass::Con2D)
-                || self.active_2d_nuclei() == ("13C", "15N");
-            if is_idp_13c {
+            // Sync classified CAS slots (`CasCacon2D`/`CasCanco2D`) into `idp_joint_panel` and
+            // run live axis validation + 2D CAS peak picking whenever loaded spectra exist (`180.gui:P1-5`, `P2-7`).
+            let extracted_cas = plan.extract_cas_slot_entries();
+            if !extracted_cas.is_empty() {
+                self.idp_joint_panel
+                    .sync_cas_slots_from_ingest(extracted_cas);
+                let c13_cfg = C13PickerConfig {
+                    snr_2d: self.picker_snr.max(3.0),
+                    ..C13PickerConfig::default()
+                };
+                for (cas_lbl, _, cas_sp) in &cas_2d_loaded {
+                    let picked = pick_con_2d(cas_sp, &c13_cfg);
+                    let cas_peaks: Vec<CasPeak> = picked
+                        .into_iter()
+                        .map(|pk| CasPeak {
+                            c_prime_ppm: pk.c_prev_ppm,
+                            n_ppm: pk.n_curr_ppm,
+                            height: pk.height,
+                            volume: pk.volume,
+                        })
+                        .collect();
+                    let matching_id = self
+                        .idp_joint_panel
+                        .cas_slots
+                        .iter()
+                        .find(|slot| {
+                            slot.path.contains(cas_lbl.as_str())
+                                || cas_lbl.contains(slot.path.as_str())
+                                || !slot.loaded
+                        })
+                        .map(|slot| slot.id);
+                    if let Some(slot_id) = matching_id {
+                        let _ = self.idp_joint_panel.load_cas_slot_from_peaks(
+                            slot_id,
+                            cas_peaks,
+                            Some((
+                                &cas_sp.axis_x.label,
+                                cas_sp.axis_x.max_ppm(),
+                                cas_sp.axis_x.min_ppm(),
+                                &cas_sp.axis_y.label,
+                                cas_sp.axis_y.max_ppm(),
+                                cas_sp.axis_y.min_ppm(),
+                            )),
+                        );
+                    }
+                }
+            }
+
+            // Regime auto-selection & Joint HN+13C / 13C-IDP CON/CACO/3D root picking
+            let is_joint_hn_con = plan.has_joint_hn_con_suite();
+            let is_idp_13c = !is_joint_hn_con
+                && (plan.problem_regime == ProblemRegime::Idp13cDetected
+                    || primary_cls == Some(PulseSequenceClass::Con2D)
+                    || self.active_2d_nuclei() == ("13C", "15N"));
+            if is_joint_hn_con {
+                self.regime_kind = GuiRegimeKind::IdpJoint;
+                self.idp_joint_panel.regime = IdpRegimeSelection::IdpJoint;
+                self.assign_setup_drawer.regime = AssignProteinRegime::IdpJoint;
+                if !keep_existing_peaks {
+                    let c13_cfg = C13PickerConfig {
+                        snr_2d: self.picker_snr,
+                        ..C13PickerConfig::default()
+                    };
+                    let mut con_roots = Vec::new();
+                    if self.active_2d_nuclei() == ("13C", "15N") {
+                        if let Some(ref sp) = self.hsqc_spec {
+                            con_roots.extend(pick_con_2d(sp, &c13_cfg));
+                        }
+                    }
+                    for con_sp in &con_2d_extra_specs {
+                        con_roots.extend(pick_con_2d(con_sp, &c13_cfg));
+                    }
+                    let mut caco_peaks = Vec::new();
+                    for caco_sp in &caco_2d_specs {
+                        caco_peaks.extend(pick_caco_2d(caco_sp, &c13_cfg));
+                    }
+                    let mut strip_peaks = Vec::new();
+                    if !con_roots.is_empty() {
+                        for (_, cls3, ref sp3) in &cubes_3d {
+                            let exp_opt = match cls3 {
+                                PulseSequenceClass::Canco3D => Some(C13DetectedExp::Canco3D),
+                                PulseSequenceClass::Cbcaco3D => Some(C13DetectedExp::Cbcaco3D),
+                                PulseSequenceClass::Cccon3D => Some(C13DetectedExp::Cccon3D),
+                                _ => C13DetectedExp::from_name(&sp3.exp),
+                            };
+                            if let Some(c13_exp) = exp_opt {
+                                strip_peaks.extend(pick_con_anchored_3d(
+                                    sp3, c13_exp, &con_roots, &c13_cfg,
+                                ));
+                            }
+                        }
+                    }
+                    self.c13_picked_dataset = Some(C13PickedDataset {
+                        con_roots,
+                        caco_peaks,
+                        strip_peaks,
+                    });
+                }
+            } else if is_idp_13c {
                 self.regime_kind = GuiRegimeKind::Idp13C;
                 if !keep_existing_peaks {
                     let c13_cfg = C13PickerConfig {
@@ -16664,6 +17328,7 @@ impl eframe::App for NmrWorkbenchApp {
         // 4. Drag-and-drop + Modals + MCP Live Workbench Bridge + Unified 1D Undo Drain
         self.drain_1d_undo_into_journal();
         self.poll_background_ingest(&ctx);
+        self.poll_background_joint_idp();
         self.draw_background_ingest_banner(ui);
         self.mcp_bridge.set_repaint_context(ctx.clone());
         self.apply_pending_mcp_bridge_commands_with_ctx(Some(&ctx));
@@ -18970,6 +19635,18 @@ impl NmrWorkbenchApp {
         self.p22_tools_panel
             .show_window(ctx, self.hsqc_spec.as_ref(), self.paper_white_canvas);
 
+        // 1b. Unified Joint HN + 13C IDP Workbench & Interactive --cas Slot Mapper (`T23.3`)
+        if self.idp_joint_panel.open {
+            let mut open = self.idp_joint_panel.open;
+            let joint_actions =
+                self.idp_joint_panel
+                    .show_window(ctx, &mut open, self.paper_white_canvas);
+            self.idp_joint_panel.open = open;
+            for act in joint_actions {
+                self.handle_idp_joint_action(act, Some(ctx));
+            }
+        }
+
         // 2. 3-Step Assignment Setup Drawer
         if self.assign_setup_drawer.open {
             let mut exp_counts = [(false, 0usize); 7];
@@ -19132,14 +19809,24 @@ impl NmrWorkbenchApp {
                         };
                         self.regime_kind = match regime {
                             AssignProteinRegime::Globular => GuiRegimeKind::Globular,
+                            AssignProteinRegime::IdpJoint => GuiRegimeKind::IdpJoint,
                             AssignProteinRegime::Idp13C => GuiRegimeKind::Idp13C,
                             AssignProteinRegime::Paramagnetic => GuiRegimeKind::Paramagnetic,
                         };
-                        self.run_assignment();
+                        if self.regime_kind == GuiRegimeKind::IdpJoint {
+                            self.run_idp_joint_assignment(Some(ctx));
+                        } else {
+                            self.run_assignment();
+                        }
                     }
                     AssignSetupAction::JumpToResidue(res_idx) => {
                         self.show_strips_dock = true;
                         self.select_residue_and_sync_strip(res_idx);
+                    }
+                    AssignSetupAction::OpenIdpJointPanel => {
+                        self.idp_joint_panel.open = true;
+                        self.status_msg =
+                            "Opened Unified Joint HN + 13C IDP & --cas Slot Mapper".to_string();
                     }
                 }
             }
@@ -25225,5 +25912,144 @@ CBCACON\t175.41\t122.09\t30.40\t1\t520.0
             app.session.state.locked_residues.is_empty(),
             "equidistant exact-tie peak must clear ambiguous locks"
         );
+    }
+
+    #[test]
+    fn test_v180_idp_joint_workbench_e2e_wiring_and_all_actions() {
+        use eframe::egui;
+        use nmr_core::joint_idp_solver::JointRouteSupport;
+        use nmr_gui::idp_joint_panel::{
+            CasAxisConsistency, CasDirection, CasResidueType, IdpJointAction, IdpRegimeSelection,
+        };
+        use nmr_gui::workbench_mode::{apply_type_scale, audit_text_layout, MIN_FONT_PX};
+
+        let mut app = make_headless_test_app();
+        app.idp_joint_panel.open = true;
+
+        // 1. Load real-solver synthetic IDP demo via IdpJointAction::LoadSyntheticDemo
+        app.handle_idp_joint_action(IdpJointAction::LoadSyntheticDemo, None);
+        assert_eq!(app.regime_kind, GuiRegimeKind::IdpJoint);
+        assert!(app.joint_idp_result.is_some());
+        assert!(!app.joint_route_by_res.is_empty());
+        assert_eq!(
+            app.sidechain_ribbon_state.joint_route_by_res,
+            app.joint_route_by_res
+        );
+        assert_eq!(app.strip_tiler.joint_route_by_res, app.joint_route_by_res);
+
+        // 2. Render the live top sequence ribbon & idp_joint_panel window in headless egui
+        let ctx = egui::Context::default();
+        let viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1440.0, 900.0));
+        let mut out = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(viewport),
+                ..Default::default()
+            },
+            |ui| {
+                apply_type_scale(ui.ctx());
+                egui::CentralPanel::default().show(ui, |ui| {
+                    app.draw_sequence_ribbon(ui);
+                });
+                app.draw_v0171_windows_and_bridges(ui.ctx());
+            },
+        );
+        out.textures_delta.clear();
+        let audit = audit_text_layout(&out.shapes, viewport);
+        assert!(audit.min_font_px >= MIN_FONT_PX - 1e-3);
+        assert!(
+            audit.texts.iter().any(|t| t.text.contains("XVal")),
+            "workbench sequence ribbon must display XVal route indicator"
+        );
+        assert!(
+            audit.texts.iter().any(|t| t.text.contains("[Pro]")),
+            "workbench sequence ribbon must display [Pro] Proline-bridge indicator"
+        );
+
+        // 3. Exercise every remaining IdpJointAction variant cleanly
+        app.handle_idp_joint_action(
+            IdpJointAction::RegimeChanged(IdpRegimeSelection::IdpJoint),
+            None,
+        );
+        app.handle_idp_joint_action(IdpJointAction::ToggleRootsHnco(true), None);
+        app.handle_idp_joint_action(IdpJointAction::ToggleNh2Filtering(true), None);
+        app.handle_idp_joint_action(IdpJointAction::ToggleTrosyCalibration(true), None);
+        app.handle_idp_joint_action(IdpJointAction::ToggleNusSidelobePruning(true), None);
+        app.handle_idp_joint_action(IdpJointAction::ToggleGlyCbGuard(true), None);
+        app.handle_idp_joint_action(IdpJointAction::ToggleCTermCooPrior(true), None);
+        app.handle_idp_joint_action(IdpJointAction::ToggleTwoPassAnchorLock(true), None);
+        app.handle_idp_joint_action(IdpJointAction::SpectrometerMhzChanged(900.0), None);
+        assert!((app.idp_joint_panel.spectrometer_mhz - 900.0).abs() < 1e-9);
+
+        // 4. RequestLoadCasSlot with a real temporary CAS peak TSV runs live axis validation
+        let tmp_cas = std::env::temp_dir().join("ferric_test_v180_cacon_ser.tsv");
+        std::fs::write(
+            &tmp_cas,
+            "# cacon_ser\nc_prime_ppm\tn_ppm\theight\n173.8\t136.4\t1.0\n174.6\t119.2\t0.9\n",
+        )
+        .expect("write tmp cas tsv");
+        let slot_id = app
+            .idp_joint_panel
+            .add_cas_slot(
+                CasResidueType::Ser,
+                "",
+                CasDirection::Cacon,
+                tmp_cas.display().to_string(),
+            )
+            .expect("add cas slot");
+        let created = app
+            .idp_joint_panel
+            .cas_slots
+            .iter()
+            .find(|s| s.id == slot_id)
+            .cloned()
+            .expect("created slot");
+        app.handle_idp_joint_action(IdpJointAction::AddCasSlot(created.clone()), None);
+        app.handle_idp_joint_action(IdpJointAction::UpdateCasSlot(created), None);
+        app.handle_idp_joint_action(IdpJointAction::RequestLoadCasSlot(slot_id), None);
+        let _ = std::fs::remove_file(&tmp_cas);
+        let loaded_slot = app
+            .idp_joint_panel
+            .cas_slots
+            .iter()
+            .find(|s| s.id == slot_id)
+            .expect("slot present");
+        assert!(loaded_slot.loaded);
+        assert_eq!(loaded_slot.peak_count, 2);
+        assert_eq!(loaded_slot.axis_consistency, CasAxisConsistency::Consistent);
+        assert!(loaded_slot.is_ready_for_solve());
+
+        // 5. RunJointAssignment synchronously runs real assign_joint_idp_cpu
+        app.handle_idp_joint_action(IdpJointAction::RunJointAssignment, None);
+        assert!(app.joint_idp_result.is_some());
+
+        // 6. InspectResidue, ToggleProBridgeLock, FocusCTermAnchor, RemoveCasSlot
+        app.handle_idp_joint_action(
+            IdpJointAction::InspectResidue {
+                seq_id: 4,
+                route: JointRouteSupport::ConProBridge,
+            },
+            None,
+        );
+        assert_eq!(app.selected_res, Some(3));
+        assert!(app.show_strips_dock);
+
+        app.handle_idp_joint_action(
+            IdpJointAction::ToggleProBridgeLock {
+                pro_seq_id: 4,
+                locked: true,
+            },
+            None,
+        );
+        app.handle_idp_joint_action(
+            IdpJointAction::FocusCTermAnchor {
+                seq_id: 22,
+                c_prime_ppm: 179.35,
+            },
+            None,
+        );
+        assert_eq!(app.selected_res, Some(21));
+        assert_eq!(app.crosshair.c_ppm, Some(179.35));
+
+        app.handle_idp_joint_action(IdpJointAction::RemoveCasSlot(slot_id), None);
     }
 }
