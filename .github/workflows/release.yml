@@ -151,6 +151,7 @@ jobs:
           set -euo pipefail
           HOST_UID="$(id -u)"
           HOST_GID="$(id -g)"
+          FERRIC_GIT_HASH="$(git rev-parse --short=7 HEAD)"
           mkdir -p "$HOME/.cargo/registry" "$HOME/.cargo/git" target
           docker run --rm \
             -v "$PWD:/work" \
@@ -160,6 +161,7 @@ jobs:
             -e CARGO_TERM_COLOR=always \
             -e HOST_UID="$HOST_UID" \
             -e HOST_GID="$HOST_GID" \
+            -e FERRIC_GIT_HASH="$FERRIC_GIT_HASH" \
             almalinux:9 \
             bash -euo pipefail -c '
               cleanup() {
@@ -268,9 +270,11 @@ jobs:
           dpkg-deb --contents dist/ferric-v*-linux-x86_64.deb
           rpm -qp --info --list dist/ferric-v*-linux-x86_64.rpm
           docker run --rm -v "$PWD/dist:/dist:ro" almalinux:9 bash -euo pipefail -c '
-            rpm -Uvh /dist/ferric-v*-linux-x86_64.rpm
+            dnf install -y --setopt=install_weak_deps=False /dist/ferric-v*-linux-x86_64.rpm
             /usr/bin/ferric --version
+            /usr/bin/ferric --version | grep -qv "(unknown)"
             test -x /usr/bin/ferric-gui
+            test -f /usr/share/doc/ferric/LICENSE
             test -f /usr/share/applications/ferric.desktop
             test -f /usr/share/icons/hicolor/256x256/apps/ferric.png
           '
