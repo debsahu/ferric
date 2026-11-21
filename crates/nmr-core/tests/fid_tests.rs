@@ -2848,14 +2848,14 @@ fn v0150_p2_strip_transformed_procs_53280_625_and_ipap_strip_procs_and_overrides
 }
 
 #[test]
-fn test_b7_raw_3d_ipap_c_cbcanco_and_c_canco_fail_closed_while_splitcomb_loads() {
-    // B7 regression: raw unsplit 3D 13C-detected IPAP datasets (`c_cbcanco_ia3d`, `c_canco_ia3d`)
-    // previously bypassed IPAP handling in `read_bruker_fid_3d` and silently loaded with
-    // `n2 = 64` instead of `32` (v0150:P0-1 in 3D). They must fail closed with an explicit error
-    // recommending TopSpin `splitcomb`, while already-`splitcomb` 3D datasets load cleanly.
+fn test_b7_raw_3d_ipap_c_cbcanco_and_c_canco_decode_cleanly_matching_splitcomb() {
+    // B7 + RD-11: raw unsplit 3D 13C-detected IPAP datasets (`c_cbcanco_ia3d`, `c_canco_ia3d`)
+    // previously failed closed with an unsupported error; RD-11 now detects, de-interleaves, and
+    // recombines raw IPAP traces cleanly with `n2 = 32` matching already-`splitcomb` 3D datasets
+    // (never silently loading `n2 = 64`).
     let td0 = 256usize; // 128 complex direct points -> 1024-byte aligned stride
     let td1 = 8usize; // 4 complex F2 points (15N)
-    let td2_raw = 128usize; // unsplit IP+AP F1 traces (64 complex if mis-loaded without recombination!)
+    let td2_raw = 128usize; // unsplit IP+AP F1 traces -> post-IPAP `64` -> `32` complex F1 points
     let td2_split = 64usize; // post-splitcomb F1 traces -> 32 complex F1 points (13C)
 
     let acqu2s_txt = format!(
@@ -2882,8 +2882,8 @@ fn test_b7_raw_3d_ipap_c_cbcanco_and_c_canco_fail_closed_while_splitcomb_loads()
              ##$TD= {td0}\n##$BYTORDA= 0\n##$DTYPA= 0\n##$AQSEQ= 0\n##$GRPDLY= 0\n"
         );
 
-        // 1. In-memory bytes path must fail closed (never silently load n2 = 64).
-        let err_bytes = nmr_core::fid::read_bruker_fid_3d_from_bytes(
+        // 1. Raw in-memory bytes path decodes cleanly with `n1 = 4`, `n2 = 32` (never `n2 = 64`).
+        let fid_bytes = nmr_core::fid::read_bruker_fid_3d_from_bytes(
             pulprog,
             &acqus_txt,
             None,
@@ -2899,31 +2899,24 @@ fn test_b7_raw_3d_ipap_c_cbcanco_and_c_canco_fail_closed_while_splitcomb_loads()
             &ser_raw,
             false,
         )
-        .expect_err(&format!(
-            "unsplit 3D IPAP {pulprog} must fail closed instead of silently loading n2=64"
-        ));
-        assert!(
-            err_bytes.contains("IPAP") && err_bytes.contains("splitcomb"),
-            "error for {pulprog} must explain IPAP and recommend splitcomb, got: {err_bytes}"
-        );
+        .unwrap_or_else(|e| panic!("raw 3D IPAP {pulprog} bytes must decode cleanly: {e}"));
+        assert_eq!(fid_bytes.axis_y.complex_points, 4);
+        assert_eq!(fid_bytes.axis_z.complex_points, 32);
 
-        // 2. Filesystem `read_bruker_fid_3d` path must also fail closed.
+        // 2. Filesystem `read_bruker_fid_3d` path also decodes cleanly with `n2 = 32`.
         let dir_raw = temp_test_dir(&format!("b7_raw_{pulprog}"));
         fs::write(dir_raw.join("acqus"), &acqus_txt).unwrap();
         fs::write(dir_raw.join("acqu2s"), &acqu2s_txt).unwrap();
         fs::write(dir_raw.join("acqu3s"), &acqu3s_raw_txt).unwrap();
         fs::write(dir_raw.join("ser"), &ser_raw).unwrap();
 
-        let err_dir = read_bruker_fid_3d(&dir_raw).expect_err(&format!(
-            "read_bruker_fid_3d on unsplit 3D IPAP {pulprog} must fail closed"
-        ));
-        assert!(
-            err_dir.contains("IPAP") && err_dir.contains("splitcomb"),
-            "filesystem error for {pulprog} must explain IPAP and recommend splitcomb, got: {err_dir}"
-        );
+        let fid_dir = read_bruker_fid_3d(&dir_raw)
+            .unwrap_or_else(|e| panic!("read_bruker_fid_3d on raw 3D IPAP {pulprog} failed: {e}"));
         let _ = fs::remove_dir_all(&dir_raw);
+        assert_eq!(fid_dir.axis_y.complex_points, 4);
+        assert_eq!(fid_dir.axis_z.complex_points, 32);
 
-        // 3. Already-`splitcomb` 3D dataset with the same PULPROG must load cleanly with n2 = 32.
+        // 3. Already-`splitcomb` 3D dataset with the same PULPROG matches `(n1=4, n2=32)`.
         let fid_split = nmr_core::fid::read_bruker_fid_3d_from_bytes(
             &format!("{pulprog}_splitcomb"),
             &acqus_txt,
@@ -2941,6 +2934,8 @@ fn test_b7_raw_3d_ipap_c_cbcanco_and_c_canco_fail_closed_while_splitcomb_loads()
             false,
         )
         .unwrap_or_else(|e| panic!("already-splitcomb 3D {pulprog} must load cleanly: {e}"));
+        assert_eq!(fid_split.axis_y.complex_points, 4);
         assert_eq!(fid_split.axis_z.complex_points, 32);
+        assert_eq!(fid_bytes.data.len(), fid_split.data.len());
     }
 }

@@ -137,6 +137,9 @@ pub enum PhaseSource {
     Auto,
     /// Solved automatically via Chen et al. (2002) entropy minimization when no phases were stored.
     AutoChen2002,
+    /// Derived deterministically from Bruker `FnMODE` quadrature and initial evolution delay
+    /// (`t0 = 0` vs half-dwell / multi-half-dwell) rather than blind sparse auto-phasing.
+    FnMode,
     /// Default `(0.0, 0.0)` on indirect axes when no phases were stored.
     DefaultZero,
 }
@@ -183,10 +186,14 @@ pub struct DimRecipe {
     pub roi_ppm: Option<[f64; 2]>,
 }
 
-/// Clean-room FISTA / IST configuration for 1D and 2D hypercomplex NUS reconstruction.
+/// Default IST/FISTA iteration budget for 3D NUS reconstruction (raised from 40 to 200
+/// for improved dynamic-range convergence across weak sequential cross-peaks).
+pub const DEFAULT_3D_NUS_IST_ITERATIONS: usize = 200;
+
+/// Clean-room FISTA / IST configuration for 1D, 2D, and 3D hypercomplex NUS reconstruction.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct NusIstConfig {
-    /// Number of FISTA / IST soft-thresholding iterations (default `40`).
+    /// Number of FISTA / IST soft-thresholding iterations (default `40` for 1D/2D, `200` for 3D via [`Self::default_3d`]).
     pub iterations: usize,
     /// Starting threshold as a fraction of maximum dirty-spectrum magnitude (default `0.85`).
     pub initial_thresh_frac: f64,
@@ -205,6 +212,239 @@ impl Default for NusIstConfig {
             fista_momentum: true,
         }
     }
+}
+
+impl NusIstConfig {
+    /// Default 3D NUS IST/FISTA configuration with [`DEFAULT_3D_NUS_IST_ITERATIONS`] (`200`) iterations.
+    pub fn default_3d() -> Self {
+        Self {
+            iterations: DEFAULT_3D_NUS_IST_ITERATIONS,
+            ..Self::default()
+        }
+    }
+}
+
+/// Derive deterministic `(p0_deg, p1_deg, fcor)` for a Bruker indirect dimension from its
+/// `FnMODE` quadrature mode (`QuadMode`) and initial evolution delay (`t0 = 0` vs half-dwell /
+/// multi-half-dwell captured in `pulprog_p1_deg`), instead of blind sparse auto-phasing.
+pub fn derive_bruker_indirect_fnmode_phase(
+    quad_mode: QuadMode,
+    pulprog_p1_deg: Option<f64>,
+    axis_reverse: bool,
+    dim_reverse: bool,
+    stored_fcor: Option<f64>,
+) -> (f64, f64, f64) {
+    if quad_mode == QuadMode::Qf {
+        return (0.0, 0.0, stored_fcor.unwrap_or(0.5));
+    }
+    if let Some(p1_raw) = pulprog_p1_deg {
+        let p1 = if dim_reverse != axis_reverse {
+            -p1_raw
+        } else {
+            p1_raw
+        };
+        // Pivot at the carrier bin `j / N = 0.5` has zero delay phase: `p0 + 0.5 * p1 ≡ 0 (mod 360°)`.
+        let p0 = wrap_deg_180(-0.5 * p1);
+        (p0, p1, stored_fcor.unwrap_or(1.0))
+    } else {
+        (0.0, 0.0, stored_fcor.unwrap_or(0.5))
+    }
+}
+
+fn finalize_recipe_dim_phases(
+    dims: &mut [DimRecipe],
+    axes: &[&FidAxisMeta],
+    vendor: FidVendor,
+    is_nus: bool,
+) {
+    if vendor == FidVendor::Varian {
+        // Varian `.fid/procpar` stores VnmrJ 1D interactive scout cursor `rp*`/`lp*` rather
+        // than calibrated 2D spectral phases; solve both dimensions via blind autophasing,
+        // preserving explicit `fcor = Some(1.0)` when `f1180 = 'y'` (Marion et al. 1989).
+        for (d, ax) in dims.iter_mut().zip(axes) {
+            d.set_auto_phase_with_stored_fcor(ax.stored_proc.fcor);
+        }
+        return;
+    }
+    for (idx, (d, ax)) in dims.iter_mut().zip(axes).enumerate() {
+        if idx > 0 && is_nus && d.phase_source == PhaseSource::DefaultZero {
+            // Sparse NUS indirect dimensions without stored proc phases are phased directly from
+            // FnMODE + half-dwell physics (`PhaseSource::FnMode`) rather than blind sparse auto-phase.
+            let (p0, p1, fcor) = derive_bruker_indirect_fnmode_phase(
+                ax.quad_mode,
+                ax.stored_proc.pulprog_p1_deg,
+                ax.stored_proc.reverse,
+                d.reverse,
+                ax.stored_proc.fcor,
+            );
+            d.p0_deg = Some(p0);
+            d.p1_deg = Some(p1);
+            d.fcor = fcor;
+            d.phase_source = PhaseSource::FnMode;
+        } else if matches!(
+            d.phase_source,
+            PhaseSource::AutoChen2002 | PhaseSource::DefaultZero
+        ) {
+            d.set_auto_phase_with_stored_fcor(ax.stored_proc.fcor);
+        }
+    }
+}
+
+fn norm_nuc_label(raw: &str) -> &'static str {
+    let up = raw.trim().to_ascii_uppercase();
+    if up.contains("15N") || up == "N" || up == "N15" {
+        "15N"
+    } else if up.contains("13C") || up == "C" || up == "C13" {
+        "13C"
+    } else if up.contains("1H") || up == "H" || up == "H1" {
+        "1H"
+    } else {
+        "OTHER"
+    }
+}
+
+/// Infer a canonical 3D backbone experiment label consistent with the physical axis nuclei
+/// `(axis_x, axis_y, axis_z)` and pulse program metadata (`BT_HNCACONH` on `1H/15N/15N`,
+/// `13C`-detected `HNCACON`/`CBCANCO`/`CANCO`, or `1H/15N/13C` triple resonance).
+pub fn infer_3d_experiment_label(fid: &Fid3D) -> String {
+    let nx = norm_nuc_label(&fid.axis_x.label);
+    let ny = norm_nuc_label(&fid.axis_y.label);
+    let nz = norm_nuc_label(&fid.axis_z.label);
+    let pp = fid.pulse_program.to_ascii_lowercase();
+    let nm = fid.name.to_ascii_lowercase();
+
+    if nx == "1H" && ny == "15N" && nz == "15N" {
+        if pp.contains("hncaconh") || pp.contains("hncocanh") || pp.contains("hacoconh") {
+            return "HNCACONH".to_string();
+        }
+        if pp.contains("hnn") {
+            return "HNN".to_string();
+        }
+        if nm.contains("hnn") && !nm.contains("hncaconh") && !nm.contains("hncocanh") {
+            return "HNN".to_string();
+        }
+        return "HNCACONH".to_string();
+    }
+
+    if nx == "13C" {
+        if ny == "15N" && nz == "15N" {
+            return "HNCACON".to_string();
+        }
+        if (ny == "15N" && nz == "13C") || (ny == "13C" && nz == "15N") {
+            if pp.contains("cbcanco") || nm.contains("cbcanco") {
+                return "CBCANCO".to_string();
+            }
+            if pp.contains("canco") || nm.contains("canco") {
+                return "CANCO".to_string();
+            }
+            if pp.contains("hcccon") || nm.contains("hcccon") {
+                return "HCCCON".to_string();
+            }
+            if pp.contains("cbcaco") || nm.contains("cbcaco") {
+                return "CBCACO".to_string();
+            }
+            return "CACOCON".to_string();
+        }
+        if ny == "13C" && nz == "13C" {
+            return "CCC".to_string();
+        }
+        return format!(
+            "3D({}/{}/{})",
+            fid.axis_x.label, fid.axis_y.label, fid.axis_z.label
+        );
+    }
+
+    if nx == "1H" && ((ny == "15N" && nz == "13C") || (ny == "13C" && nz == "15N")) {
+        if pp.contains("hncoca") || pp.contains("hn_co_ca") || pp.contains("hnco_ca") {
+            return "HN(CO)CA".to_string();
+        }
+        if pp.contains("hncaco") || pp.contains("hn_ca_co") {
+            return "HN(CA)CO".to_string();
+        }
+        if pp.contains("cbcaconh") || pp.contains("cbca_co_nh") || pp.contains("cbcaco") {
+            return "CBCA(CO)NH".to_string();
+        }
+        if pp.contains("hncacb") {
+            return "HNCACB".to_string();
+        }
+        if pp.contains("hnco") {
+            return "HNCO".to_string();
+        }
+        if pp.contains("hnca") {
+            return "HNCA".to_string();
+        }
+        let c_axis = if nz == "13C" {
+            &fid.axis_z
+        } else {
+            &fid.axis_y
+        };
+        let c_span = (c_axis.sw_hz / c_axis.obs_mhz.max(1e-6)).abs();
+        let c_mid = c_axis.first_ppm - 0.5 * c_span;
+        if c_mid > 140.0 {
+            return "HNCO".to_string();
+        }
+        if c_span > 52.0 || c_mid < 47.0 {
+            return "HNCACB".to_string();
+        }
+        return "HNCA".to_string();
+    }
+
+    format!(
+        "3D({}/{}/{})",
+        fid.axis_x.label, fid.axis_y.label, fid.axis_z.label
+    )
+}
+
+/// Resolve an experiment label for a 3D FID: preserves `exp_hint` when compatible with
+/// `(axis_x, axis_y, axis_z)`, and overrides missing/placeholder or axis-contradictory labels
+/// (such as `"HNCA"` on `1H/15N/15N` `BT_HNCACONH`) with [`infer_3d_experiment_label`].
+pub fn resolve_3d_experiment_label(fid: &Fid3D, exp_hint: Option<&str>) -> String {
+    let raw = exp_hint.unwrap_or("").trim();
+    if raw.is_empty() || raw.eq_ignore_ascii_case("AUTO") || raw.eq_ignore_ascii_case("3D") {
+        return infer_3d_experiment_label(fid);
+    }
+    let nx = norm_nuc_label(&fid.axis_x.label);
+    let ny = norm_nuc_label(&fid.axis_y.label);
+    let nz = norm_nuc_label(&fid.axis_z.label);
+    let up = raw
+        .to_ascii_uppercase()
+        .replace(['(', ')', '-', '_', ' '], "");
+
+    if nx == "1H" && ny == "15N" && nz == "15N" {
+        if up.contains("HNN") && !up.contains("HNCACONH") {
+            return "HNN".to_string();
+        }
+        if up.contains("HNCACONH") || up.contains("HNCOCANH") || up.contains("HACOCONH") {
+            return "HNCACONH".to_string();
+        }
+        return infer_3d_experiment_label(fid);
+    }
+
+    if nx == "13C"
+        && matches!(
+            up.as_str(),
+            "HNCA"
+                | "3DHNCA"
+                | "HNCOCA"
+                | "HNCACB"
+                | "CBCACONH"
+                | "HNCO"
+                | "HNCACO"
+                | "HNCACONH"
+                | "HNN"
+        )
+    {
+        return infer_3d_experiment_label(fid);
+    }
+
+    if nx == "1H"
+        && ((ny == "15N" && nz == "13C") || (ny == "13C" && nz == "15N"))
+        && (up.contains("HNCACONH") || up.contains("HNCOCANH") || up == "HNN" || up == "BTHNCACONH")
+    {
+        return infer_3d_experiment_label(fid);
+    }
+
+    raw.to_string()
 }
 
 /// Compact serializable audit record for empirical 3D indirect-axis `{sign, fold}` verification
@@ -314,10 +554,17 @@ impl DimRecipe {
         } else {
             (2 * n_eff).next_power_of_two()
         };
+        // Default indirect axes to at least 2x zero-fill (4 * complex_points -> e.g. 32->128, 64->256)
+        // when no processed SI is stored, while preserving valid explicit stored SI >= min_zf.
+        let default_zf = if !is_direct {
+            (4 * n_eff).next_power_of_two()
+        } else {
+            min_zf
+        };
         let si = sp
             .si
             .map(|s| s.max(min_zf).next_power_of_two())
-            .unwrap_or(min_zf);
+            .unwrap_or(default_zf);
 
         let window =
             sp.window
@@ -502,23 +749,7 @@ impl ProcessingRecipe {
             truncated_fid_warning,
         };
         let axes = [&fid.axis_x, &fid.axis_y];
-        if fid.vendor == FidVendor::Varian {
-            // Varian `.fid/procpar` stores VnmrJ 1D interactive scout cursor `rp*`/`lp*` rather
-            // than calibrated 2D spectral phases; solve both dimensions via blind autophasing,
-            // preserving explicit `fcor = Some(1.0)` when `f1180 = 'y'` (Marion et al. 1989).
-            for (d, ax) in rec.dims.iter_mut().zip(axes) {
-                d.set_auto_phase_with_stored_fcor(ax.stored_proc.fcor);
-            }
-        } else {
-            for (d, ax) in rec.dims.iter_mut().zip(axes) {
-                if matches!(
-                    d.phase_source,
-                    PhaseSource::AutoChen2002 | PhaseSource::DefaultZero
-                ) {
-                    d.set_auto_phase_with_stored_fcor(ax.stored_proc.fcor);
-                }
-            }
-        }
+        finalize_recipe_dim_phases(&mut rec.dims, &axes, fid.vendor, fid.nus_mask.is_some());
         rec
     }
 
@@ -539,7 +770,7 @@ impl ProcessingRecipe {
                 DimRecipe::from_axis_meta(&fid.axis_y, 1),
                 DimRecipe::from_axis_meta(&fid.axis_z, 2),
             ],
-            nus: fid.nus_mask.as_ref().map(|_| NusIstConfig::default()),
+            nus: fid.nus_mask.as_ref().map(|_| NusIstConfig::default_3d()),
             enable_axis_rescue: true,
             axis_rescue_audit: None,
             allow_truncated_fid,
@@ -547,20 +778,7 @@ impl ProcessingRecipe {
             truncated_fid_warning,
         };
         let axes = [&fid.axis_x, &fid.axis_y, &fid.axis_z];
-        if fid.vendor == FidVendor::Varian {
-            for (d, ax) in rec.dims.iter_mut().zip(axes) {
-                d.set_auto_phase_with_stored_fcor(ax.stored_proc.fcor);
-            }
-        } else {
-            for (d, ax) in rec.dims.iter_mut().zip(axes) {
-                if matches!(
-                    d.phase_source,
-                    PhaseSource::AutoChen2002 | PhaseSource::DefaultZero
-                ) {
-                    d.set_auto_phase_with_stored_fcor(ax.stored_proc.fcor);
-                }
-            }
-        }
+        finalize_recipe_dim_phases(&mut rec.dims, &axes, fid.vendor, fid.nus_mask.is_some());
         rec
     }
 
@@ -586,8 +804,15 @@ impl ProcessingRecipe {
 
     /// Configure NUS reconstruction method (`fista_momentum = true` for `FISTA`, `false` for `IST`).
     pub fn set_nus_method_fista(&mut self, fista_momentum: bool) {
+        let is_3d = self.dims.len() >= 3;
         self.nus
-            .get_or_insert_with(NusIstConfig::default)
+            .get_or_insert_with(|| {
+                if is_3d {
+                    NusIstConfig::default_3d()
+                } else {
+                    NusIstConfig::default()
+                }
+            })
             .fista_momentum = fista_momentum;
     }
 
@@ -1552,7 +1777,7 @@ fn resolve_dim_phase(dim: &DimRecipe, full_axis: &AxisPpm, rep_spec: &[Complex64
         (Some(p0), Some(p1), _) => (p0, p1),
         (Some(p0), None, _) => (p0, 0.0),
         (None, Some(p1), _) => (0.0, p1),
-        (None, None, PhaseSource::DefaultZero) => (0.0, 0.0),
+        (None, None, PhaseSource::DefaultZero | PhaseSource::FnMode) => (0.0, 0.0),
         (None, None, PhaseSource::Auto) => {
             let ops_tr = conj_trace_for_ops(rep_spec);
             let mut cfg = AutoPhaseConfig::default();
@@ -2388,7 +2613,7 @@ pub fn process_fid_2d_mut(
         (Some(p0), Some(p1), _) => (p0, p1),
         (Some(p0), None, _) => (p0, 0.0),
         (None, Some(p1), _) => (0.0, p1),
-        (None, None, PhaseSource::DefaultZero) => (0.0, 0.0),
+        (None, None, PhaseSource::DefaultZero | PhaseSource::FnMode) => (0.0, 0.0),
         (None, None, PhaseSource::Auto) => {
             let mut wt = Vec::new();
             let mut wf = Vec::new();
@@ -2519,7 +2744,10 @@ pub fn process_fid_2d_mut(
     let nus_cfg = recipe.nus.clone().unwrap_or_default();
     let auto_solved_y = dim_y.p0_deg.is_none()
         && dim_y.p1_deg.is_none()
-        && !matches!(dim_y.phase_source, PhaseSource::DefaultZero);
+        && !matches!(
+            dim_y.phase_source,
+            PhaseSource::DefaultZero | PhaseSource::FnMode
+        );
     if auto_solved_y {
         // Solve blind indirect `(p0, p1)` without a `+0.5 * s(0)` DC bias (unless multi-dwell `pulprog_p1_deg`
         // already guarantees `|p1| >= 360°`, which requires `fcor = 1.0`); `fcor` is reconciled after solve.
@@ -2534,7 +2762,7 @@ pub fn process_fid_2d_mut(
         (Some(p0), Some(p1), _) => (p0, p1),
         (Some(p0), None, _) => (p0, 0.0),
         (None, Some(p1), _) => (0.0, p1),
-        (None, None, PhaseSource::DefaultZero) => (0.0, 0.0),
+        (None, None, PhaseSource::DefaultZero | PhaseSource::FnMode) => (0.0, 0.0),
         (None, None, _) => {
             // Select up to 48 distinct `1H` local-maximum apex columns for blind indirect autophasing
             let mut col_energy = vec![0.0_f64; nx_out];
@@ -2685,7 +2913,10 @@ pub fn process_fid_2d_mut(
     // resolving any joint `(p0_x + 180°, p0_y)` sign inversion.
     let auto_solved_x = dim_x.p0_deg.is_none()
         && dim_x.p1_deg.is_none()
-        && !matches!(dim_x.phase_source, PhaseSource::DefaultZero);
+        && !matches!(
+            dim_x.phase_source,
+            PhaseSource::DefaultZero | PhaseSource::FnMode
+        );
     let is_all_pos_hetero_2d = (axis_x_out.label == "13C" && axis_y_out.label == "15N")
         || (axis_x_out.label == "1H" && axis_y_out.label == "15N");
     if auto_solved_x && auto_solved_y && is_all_pos_hetero_2d && !data.is_empty() {
@@ -3218,7 +3449,8 @@ fn process_fid_3d_inner(
         validate_nus_states_axis(&fid.axis_z, "3D indirect F1")?;
     }
 
-    let ap_cfg = auto_phase_cfg_for_exp(exp);
+    let resolved_exp = resolve_3d_experiment_label(fid, Some(exp));
+    let ap_cfg = auto_phase_cfg_for_exp(&resolved_exp);
     let any_dim_auto = recipe.dims[..3].iter().any(|d| {
         d.p0_deg.is_none()
             && d.p1_deg.is_none()
@@ -3241,7 +3473,7 @@ fn process_fid_3d_inner(
         (Some(p0), Some(p1), _) => (p0, p1),
         (Some(p0), None, _) => (p0, 0.0),
         (None, Some(p1), _) => (0.0, p1),
-        (None, None, PhaseSource::DefaultZero) => (0.0, 0.0),
+        (None, None, PhaseSource::DefaultZero | PhaseSource::FnMode) => (0.0, 0.0),
         (None, None, PhaseSource::Auto) => {
             let (ax_rep, sample_x) = focused_direct_traces_3d(
                 fid,
@@ -3355,14 +3587,20 @@ fn process_fid_3d_inner(
     let (z0, z1, axis_z_out) = compute_axis_roi(&full_axis_z, dim_z.roi_ppm)?;
     let ny_out = axis_y_out.size;
     let nz_out = axis_z_out.size;
-    let nus_cfg = recipe.nus.clone().unwrap_or_default();
+    let nus_cfg = recipe.nus.clone().unwrap_or_else(NusIstConfig::default_3d);
 
     let need_auto_y = dim_y.p0_deg.is_none()
         && dim_y.p1_deg.is_none()
-        && !matches!(dim_y.phase_source, PhaseSource::DefaultZero);
+        && !matches!(
+            dim_y.phase_source,
+            PhaseSource::DefaultZero | PhaseSource::FnMode
+        );
     let need_auto_z = dim_z.p0_deg.is_none()
         && dim_z.p1_deg.is_none()
-        && !matches!(dim_z.phase_source, PhaseSource::DefaultZero);
+        && !matches!(
+            dim_z.phase_source,
+            PhaseSource::DefaultZero | PhaseSource::FnMode
+        );
     if need_auto_y {
         dim_y.fcor = if fid.axis_y.stored_proc.pulprog_p1_deg.is_some() {
             1.0
@@ -3871,7 +4109,7 @@ fn process_fid_3d_inner(
         }
         Spectrum3D {
             name: fid.name.clone(),
-            exp: exp.to_string(),
+            exp: resolved_exp.clone(),
             axis_x: axis_x_out,
             axis_y: axis_y_out,
             axis_z: axis_z_out,
@@ -3914,7 +4152,7 @@ fn process_fid_3d_inner(
         }
         Spectrum3D {
             name: fid.name.clone(),
-            exp: exp.to_string(),
+            exp: resolved_exp.clone(),
             axis_x: axis_x_out,
             axis_y: axis_z_out,
             axis_z: axis_y_out,
@@ -3926,7 +4164,7 @@ fn process_fid_3d_inner(
         .iter()
         .any(|d| d.phase_source == PhaseSource::Explicit);
     if allow_cacb_unmirror && !any_explicit {
-        let exp_u = exp.trim().to_ascii_uppercase();
+        let exp_u = resolved_exp.trim().to_ascii_uppercase();
         if matches!(exp_u.as_str(), "CBCACONH" | "CBCA(CO)NH" | "HNCACB") {
             let (c_dim, full_c_axis, c0_off) = if swap_yz {
                 (1usize, &full_axis_y, y0)
@@ -4463,5 +4701,551 @@ mod ipap_con_tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod rd11_rd14_tests {
+    use super::*;
+    use crate::fid::{read_bruker_fid_3d_from_bytes, FidVendor, QuadMode, StoredDimProc};
+
+    fn make_test_axis(
+        label: &str,
+        n: usize,
+        sw_hz: f64,
+        obs_mhz: f64,
+        carrier_ppm: f64,
+        quad_mode: QuadMode,
+        si: Option<usize>,
+    ) -> FidAxisMeta {
+        let sw_ppm = sw_hz / obs_mhz;
+        FidAxisMeta {
+            label: label.to_string(),
+            complex_points: n,
+            td_raw: if quad_mode == QuadMode::Qf { n } else { 2 * n },
+            sw_hz,
+            obs_mhz,
+            carrier_mhz: obs_mhz * (1.0 + carrier_ppm * 1e-6),
+            first_ppm: carrier_ppm + 0.5 * sw_ppm,
+            quad_mode,
+            states_recombined: true,
+            group_delay: 0.0,
+            conjugate_for_fft: true,
+            stored_proc: StoredDimProc {
+                si,
+                ..Default::default()
+            },
+        }
+    }
+
+    fn push_complex_trace_i32_le(out: &mut Vec<u8>, tr: &[[f64; 2]]) {
+        for &[re, im] in tr {
+            out.extend_from_slice(&(re.round() as i32).to_le_bytes());
+            out.extend_from_slice(&(im.round() as i32).to_le_bytes());
+        }
+    }
+
+    #[test]
+    fn test_rd11_3d_ipap_nus_collapses_c_prime_doublet_to_singlet() {
+        let bf_c = 150.9028_f64;
+        let car_c = 175.0_f64;
+        let sw_c_ppm = 30.0_f64;
+        let sw_c_hz = sw_c_ppm * bf_c;
+        let sfo_c = bf_c * (1.0 + car_c * 1e-6);
+        let n0 = 256usize;
+        let td0 = n0 * 2;
+
+        let bf_n = 60.810645_f64;
+        let car_n = 118.0_f64;
+        let sw_n_ppm = 32.0_f64;
+        let sw_n_hz = sw_n_ppm * bf_n;
+        let sfo_n = bf_n * (1.0 + car_n * 1e-6);
+        let n1 = 16usize;
+        let n2 = 16usize;
+
+        let peak_c = 176.2_f64;
+        let peak_y = 121.4_f64;
+        let peak_z = 114.6_f64;
+        let j_caco = 53.8_f64;
+        let df_c = (peak_c - car_c) * bf_c;
+        let df_y = (peak_y - car_n) * bf_n;
+        let df_z = (peak_z - car_n) * bf_n;
+
+        // Deterministic 50% 3D NUS schedule covering t=0..2 plus interior coordinates.
+        let mut coords = Vec::new();
+        for k2 in 0..n2 {
+            for k1 in 0..n1 {
+                if (k1 < 3 && k2 < 3) || ((k1 * 5 + k2 * 3) % 2 == 0) {
+                    coords.push((k1, k2));
+                }
+            }
+        }
+        let nuslist_txt: String = coords
+            .iter()
+            .map(|(k1, k2)| format!("{k1}\t{k2}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let td_acq_y = coords.len() * 4;
+
+        enum Case {
+            F2FnIloop(&'static str),
+            F1FnIloop(&'static str),
+            TraceCountNoIa,
+        }
+
+        for case in [
+            Case::F2FnIloop("c_hncacon_iare3d"),
+            Case::F1FnIloop("c_hcccon_ia3d"),
+            Case::TraceCountNoIa,
+        ] {
+            let car_c_f1 = 55.0_f64;
+            let sfo_c_f1 = bf_c * (1.0 + car_c_f1 * 1e-6);
+            let (pulprog, fn_iloop_y, fn_iloop_z, z_nuc, z_bf, z_sfo, z_sw, z_car, z_target) =
+                match case {
+                    Case::F2FnIloop(pp) => (pp, 2, 1, "15N", bf_n, sfo_n, sw_n_ppm, car_n, peak_z),
+                    Case::F1FnIloop(pp) => (
+                        pp, 1, 2, "13C", bf_c, sfo_c_f1, sw_n_ppm, car_c_f1, 51.6_f64,
+                    ),
+                    Case::TraceCountNoIa => (
+                        "custom_con_seq",
+                        0,
+                        0,
+                        "15N",
+                        bf_n,
+                        sfo_n,
+                        sw_n_ppm,
+                        car_n,
+                        peak_z,
+                    ),
+                };
+            let z_sw_hz = z_sw * z_bf;
+            let df_z_hz = if z_nuc == "13C" {
+                (z_target - z_car) * z_bf
+            } else {
+                df_z
+            };
+            let acqus_txt = format!(
+                "##TITLE= acqus\n##$PULPROG= <{pulprog}>\n##$NUC1= <13C>\n\
+                 ##$BF1= {bf_c:.8}\n##$SFO1= {sfo_c:.9}\n##$SW= {sw_c_ppm:.6}\n##$SW_h= {sw_c_hz:.8}\n\
+                 ##$TD= {td0}\n##$BYTORDA= 0\n##$DTYPA= 0\n##$AQSEQ= 0\n##$FnTYPE= 2\n##$GRPDLY= 0\n\
+                 ##$APSCALE= 1.0\n##$NC= 0\n"
+            );
+            let acqu2s_txt = format!(
+                "##TITLE= acqu2s\n##$NUC1= <15N>\n##$BF1= {bf_n:.8}\n##$SFO1= {sfo_n:.9}\n\
+                 ##$SW= {sw_n_ppm:.6}\n##$SW_h= {sw_n_hz:.8}\n##$TD= {td_acq_y}\n\
+                 ##$NusTD= {}\n##$FnMODE= 5\n{}",
+                n1 * 2,
+                if fn_iloop_y > 0 {
+                    format!("##$FnILOOP= {fn_iloop_y}\n")
+                } else {
+                    String::new()
+                }
+            );
+            let acqu3s_txt = format!(
+                "##TITLE= acqu3s\n##$NUC1= <{z_nuc}>\n##$BF1= {z_bf:.8}\n##$SFO1= {z_sfo:.9}\n\
+                 ##$SW= {z_sw:.6}\n##$SW_h= {z_sw_hz:.8}\n##$TD= 1\n\
+                 ##$NusTD= {}\n##$FnMODE= 5\n{}",
+                n2 * 2,
+                if fn_iloop_z > 0 {
+                    format!("##$FnILOOP= {fn_iloop_z}\n")
+                } else {
+                    String::new()
+                }
+            );
+            let pp_opt = if matches!(case, Case::TraceCountNoIa) {
+                None
+            } else {
+                Some(";using IPAP scheme\n\"l0=1\"\nif \"l0 %2 == 1\"\n")
+            };
+
+            let ipap_on_f2 = !matches!(case, Case::F1FnIloop(_));
+            let mut ser = Vec::with_capacity(coords.len() * 8 * td0 * 4);
+            for &(k1, k2) in &coords {
+                let t1 = (k1 as f64) / sw_n_hz;
+                let t2 = (k2 as f64) / z_sw_hz;
+                let sgn1 = if k1 % 2 == 1 { -1.0 } else { 1.0 };
+                let sgn2 = if k2 % 2 == 1 { -1.0 } else { 1.0 };
+                let env_ind = (-10.0 * t1).exp() * (-10.0 * t2).exp();
+                let (sy, cy) = (2.0 * PI * df_y * t1).sin_cos();
+                let (sz, cz) = (2.0 * PI * df_z_hz * t2).sin_cos();
+
+                for iz_sub in 0..2 {
+                    let mod_z = if iz_sub == 0 { cz } else { sz } * sgn2;
+                    if ipap_on_f2 {
+                        for iy_sub in 0..2 {
+                            let mod_y = if iy_sub == 0 { cy } else { sy } * sgn1;
+                            let amp = 100_000.0 * env_ind * mod_y * mod_z;
+                            for ip in 0..2 {
+                                let mut tr = Vec::with_capacity(n0);
+                                for k0 in 0..n0 {
+                                    let t0 = (k0 as f64) / sw_c_hz;
+                                    let env = amp * (-18.0 * t0).exp();
+                                    let (sc, cc) = (2.0 * PI * df_c * t0).sin_cos();
+                                    let (sj, cj) = (PI * j_caco * t0).sin_cos();
+                                    if ip == 0 {
+                                        // IP = exp(+i w_C t) cos(pi J t)
+                                        tr.push([env * cc * cj, env * sc * cj]);
+                                    } else {
+                                        // AP = -i exp(+i w_C t) sin(pi J t) = exp(+i w_C t) * (-i sin)
+                                        tr.push([env * sc * sj, -env * cc * sj]);
+                                    }
+                                }
+                                push_complex_trace_i32_le(&mut ser, &tr);
+                            }
+                        }
+                    } else {
+                        for ip in 0..2 {
+                            for iy_sub in 0..2 {
+                                let mod_y = if iy_sub == 0 { cy } else { sy } * sgn1;
+                                let amp = 100_000.0 * env_ind * mod_y * mod_z;
+                                let mut tr = Vec::with_capacity(n0);
+                                for k0 in 0..n0 {
+                                    let t0 = (k0 as f64) / sw_c_hz;
+                                    let env = amp * (-18.0 * t0).exp();
+                                    let (sc, cc) = (2.0 * PI * df_c * t0).sin_cos();
+                                    let (sj, cj) = (PI * j_caco * t0).sin_cos();
+                                    if ip == 0 {
+                                        tr.push([env * cc * cj, env * sc * cj]);
+                                    } else {
+                                        tr.push([env * sc * sj, -env * cc * sj]);
+                                    }
+                                }
+                                push_complex_trace_i32_le(&mut ser, &tr);
+                            }
+                        }
+                    }
+                }
+            }
+
+            let fid = read_bruker_fid_3d_from_bytes(
+                pulprog,
+                &acqus_txt,
+                None,
+                &acqu2s_txt,
+                None,
+                &acqu3s_txt,
+                None,
+                None,
+                None,
+                None,
+                pp_opt,
+                Some(&nuslist_txt),
+                &ser,
+                false,
+            )
+            .unwrap_or_else(|e| panic!("3D IPAP decode failed for {pulprog}: {e}"));
+            assert_eq!(fid.axis_x.label, "13C");
+            assert!(fid.nus_mask.is_some());
+
+            let mut rec = ProcessingRecipe::from_fid_3d(&fid);
+            rec.set_no_crop();
+            rec.dims[0].window = ApodizationWindow::Exponential { lb_hz: 6.0 };
+            rec.dims[0].baseline = None;
+            rec.dims[0].p0_deg = Some(0.0);
+            rec.dims[0].p1_deg = Some(0.0);
+            rec.dims[0].phase_source = PhaseSource::Explicit;
+            for d in &mut rec.dims[1..3] {
+                d.window = ApodizationWindow::SquaredSineBell {
+                    offset_pi_frac: 0.5,
+                };
+                d.baseline = None;
+            }
+            let spec = process_fid_3d(&fid, "AUTO", &rec)
+                .unwrap_or_else(|e| panic!("3D IPAP process failed for {pulprog}: {e}"));
+
+            let mut best_v = f32::NEG_INFINITY;
+            let mut best_xyz = (0usize, 0usize, 0usize);
+            let max_v = spec.data.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let ix_exp = spec.axis_x.ppm_to_index(peak_c).round() as isize;
+            let iy_exp = spec.axis_y.ppm_to_index(peak_y).round() as isize;
+            let iz_exp = spec.axis_z.ppm_to_index(z_target).round() as isize;
+            for dz in -3isize..=3 {
+                for dy in -3isize..=3 {
+                    for dx in -4isize..=4 {
+                        let x = (ix_exp + dx).clamp(0, spec.axis_x.size as isize - 1) as usize;
+                        let y = (iy_exp + dy).clamp(0, spec.axis_y.size as isize - 1) as usize;
+                        let z = (iz_exp + dz).clamp(0, spec.axis_z.size as isize - 1) as usize;
+                        let v = spec.get(x, y, z);
+                        if v > best_v {
+                            best_v = v;
+                            best_xyz = (x, y, z);
+                        }
+                    }
+                }
+            }
+            assert!(
+                best_v > 0.75 * max_v && best_v > 0.0,
+                "3D IPAP {pulprog} must recover singlet apex near ({peak_c}, {peak_y}, {z_target}); local={best_v}, global_max={max_v}"
+            );
+            let got_c = spec.axis_x.index_to_ppm(best_xyz.0 as f64);
+            let got_y = spec.axis_y.index_to_ppm(best_xyz.1 as f64);
+            let got_z = spec.axis_z.index_to_ppm(best_xyz.2 as f64);
+            assert!(
+                (got_c - peak_c).abs() < 0.05,
+                "{pulprog}: 13C {got_c} vs {peak_c}"
+            );
+            assert!(
+                (got_y - peak_y).abs() < 0.60,
+                "{pulprog}: F2 {got_y} vs {peak_y}"
+            );
+            assert!(
+                (got_z - z_target).abs() < 0.60,
+                "{pulprog}: F1 {got_z} vs {z_target}"
+            );
+
+            let split_ppm = 0.5 * j_caco / bf_c;
+            let ix_up = spec.axis_x.ppm_to_index(peak_c + split_ppm).round() as usize;
+            let ix_dn = spec.axis_x.ppm_to_index(peak_c - split_ppm).round() as usize;
+            assert!(
+                spec.get(ix_up, best_xyz.1, best_xyz.2).abs() < 0.08 * best_v
+                    && spec.get(ix_dn, best_xyz.1, best_xyz.2).abs() < 0.08 * best_v,
+                "{pulprog}: C' ±J/2 satellites must collapse to singlet"
+            );
+        }
+    }
+
+    #[test]
+    fn test_rd14_nn_axis_labeling_indirect_2x_zf_ist_iters_and_fnmode_phase() {
+        // 1. Axis-based N-N label (`BT_HNCACONH` on `1H/15N/15N` never mislabeled `"3D HNCA"` / `"HNCA"`).
+        let ax_h = make_test_axis("1H", 64, 6000.0, 600.0, 4.7, QuadMode::Dqd, Some(128));
+        let ax_n1 = make_test_axis("15N", 32, 2000.0, 60.8, 118.0, QuadMode::StatesTppi, None);
+        let ax_n2 = make_test_axis("15N", 64, 2000.0, 60.8, 118.0, QuadMode::StatesTppi, None);
+        let fid_nn = Fid3D {
+            name: "bt_hncaconh_16".to_string(),
+            vendor: FidVendor::Bruker,
+            pulse_program: "BT_HNCACONH".to_string(),
+            axis_x: ax_h.clone(),
+            axis_y: ax_n1.clone(),
+            axis_z: ax_n2.clone(),
+            nus_mask: Some(vec![true; 32 * 64]),
+            truncated_traces: None,
+            data: vec![[0.0, 0.0]; 64 * 2 * 32 * 2 * 64],
+        };
+        assert_eq!(infer_3d_experiment_label(&fid_nn), "HNCACONH");
+        assert_eq!(
+            resolve_3d_experiment_label(&fid_nn, Some("HNCA")),
+            "HNCACONH"
+        );
+        assert_eq!(
+            resolve_3d_experiment_label(&fid_nn, Some("3D HNCA")),
+            "HNCACONH"
+        );
+
+        let mut fid_hnn = fid_nn.clone();
+        fid_hnn.name = "bt_hnn_16".to_string();
+        fid_hnn.pulse_program = "bt_hnn3d".to_string();
+        assert_eq!(resolve_3d_experiment_label(&fid_hnn, Some("HNCA")), "HNN");
+
+        let rec_nn = ProcessingRecipe::from_fid_3d(&fid_nn);
+        let spec_nn = process_fid_3d(&fid_nn, "HNCA", &rec_nn).expect("process BT_HNCACONH");
+        assert_eq!(spec_nn.exp, "HNCACONH");
+
+        // 2. Indirect 2x zero-fill default (`n=32 -> 128`, `n=64 -> 256`), preserving larger stored `SI=256`.
+        assert_eq!(rec_nn.dims[1].si, 128);
+        assert_eq!(rec_nn.dims[2].si, 256);
+        let ax_zf4 = make_test_axis(
+            "15N",
+            32,
+            2000.0,
+            60.8,
+            118.0,
+            QuadMode::StatesTppi,
+            Some(256),
+        );
+        assert_eq!(DimRecipe::from_axis_meta(&ax_zf4, 1).si, 256);
+
+        // 3. Default 3D IST iteration count raised to 150..=200 (200), keeping 2D default untouched (40).
+        let iters_3d = rec_nn.nus.as_ref().expect("3D NUS cfg").iterations;
+        assert!(
+            (150..=200).contains(&iters_3d),
+            "expected 150..=200, got {iters_3d}"
+        );
+        assert_eq!(NusIstConfig::default().iterations, 40);
+
+        // 4. `FnMODE` + half-dwell indirect phase derivation for sparse NUS Bruker dims (both
+        //    zero-delay `(0, 0) / fcor=0.5` and half-dwell `(+90, -180)` / `(-90, +180) / fcor=1.0`),
+        //    processed cleanly on synthetic sparse 3D `ser` without blind sparse auto-phase.
+        assert_eq!(
+            derive_bruker_indirect_fnmode_phase(QuadMode::StatesTppi, None, false, false, None),
+            (0.0, 0.0, 0.5)
+        );
+        assert_eq!(
+            derive_bruker_indirect_fnmode_phase(
+                QuadMode::StatesTppi,
+                Some(-180.0),
+                false,
+                false,
+                Some(1.0)
+            ),
+            (90.0, -180.0, 1.0)
+        );
+        assert_eq!(
+            derive_bruker_indirect_fnmode_phase(
+                QuadMode::EchoAntiecho,
+                Some(180.0),
+                true,
+                true,
+                Some(1.0)
+            ),
+            (-90.0, 180.0, 1.0)
+        );
+
+        let bf_h = 600.13_f64;
+        let car_h = 4.70_f64;
+        let sw_h_ppm = 10.0_f64;
+        let sw_h_hz = sw_h_ppm * bf_h;
+        let sfo_h = bf_h * (1.0 + car_h * 1e-6);
+        let nx = 128usize;
+        let td0 = nx * 2;
+
+        let bf_n = 60.81_f64;
+        let car_n = 118.0_f64;
+        let sw_n_ppm = 30.0_f64;
+        let sw_n_hz = sw_n_ppm * bf_n;
+        let sfo_n = bf_n * (1.0 + car_n * 1e-6);
+        let n1_hd = 16usize;
+        let n2_hd = 16usize;
+        let d0_hd = 0.5 / sw_n_hz;
+        let d10_hd = 0.5 / sw_n_hz;
+        let mut d_arr = vec!["0".to_string(); 12];
+        d_arr[0] = format!("{d0_hd:.10}");
+        d_arr[10] = format!("{d10_hd:.10}");
+
+        let acqus_hd = format!(
+            "##TITLE= acqus\n##$PULPROG= <BT_HNCACONH>\n##$NUC1= <1H>\n\
+             ##$BF1= {bf_h:.6}\n##$SFO1= {sfo_h:.8}\n##$SW= {sw_h_ppm:.6}\n##$SW_h= {sw_h_hz:.6}\n\
+             ##$TD= {td0}\n##$BYTORDA= 0\n##$DTYPA= 0\n##$AQSEQ= 0\n##$FnTYPE= 2\n##$GRPDLY= 0\n\
+             ##$D= (0..11)\n{}\n##$NC= 0\n",
+            d_arr.join(" ")
+        );
+        let mut coords = Vec::new();
+        for k2 in 0..n2_hd {
+            for k1 in 0..n1_hd {
+                if (k1 < 3 && k2 < 3) || ((k1 * 7 + k2 * 3) % 2 == 0) {
+                    coords.push((k1, k2));
+                }
+            }
+        }
+        let nus_txt: String = coords
+            .iter()
+            .map(|(k1, k2)| format!("{k1}\t{k2}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let td_acq_y = coords.len() * 4;
+        let acqu2s_hd = format!(
+            "##TITLE= acqu2s\n##$NUC1= <15N>\n##$BF1= {bf_n:.6}\n##$SFO1= {sfo_n:.8}\n\
+             ##$SW= {sw_n_ppm:.6}\n##$SW_h= {sw_n_hz:.6}\n##$TD= {td_acq_y}\n\
+             ##$NusTD= {}\n##$FnMODE= 5\n",
+            n1_hd * 2
+        );
+        let acqu3s_hd = format!(
+            "##TITLE= acqu3s\n##$NUC1= <15N>\n##$BF1= {bf_n:.6}\n##$SFO1= {sfo_n:.8}\n\
+             ##$SW= {sw_n_ppm:.6}\n##$SW_h= {sw_n_hz:.6}\n##$TD= 1\n\
+             ##$NusTD= {}\n##$FnMODE= 5\n",
+            n2_hd * 2
+        );
+
+        let pk_h = 8.20_f64;
+        let pk_n1 = 123.5_f64;
+        let pk_n2 = 112.5_f64;
+        let df_h = (pk_h - car_h) * bf_h;
+        let df_n1 = (pk_n1 - car_n) * bf_n;
+        let df_n2 = (pk_n2 - car_n) * bf_n;
+
+        let mut ser_hd = Vec::with_capacity(coords.len() * 4 * td0 * 4);
+        for &(k1, k2) in &coords {
+            let t1 = (k1 as f64 + 0.5) / sw_n_hz;
+            let t2 = (k2 as f64 + 0.5) / sw_n_hz;
+            let s1 = if k1 % 2 == 1 { -1.0 } else { 1.0 };
+            let s2 = if k2 % 2 == 1 { -1.0 } else { 1.0 };
+            let (sn1, cn1) = (2.0 * PI * df_n1 * t1).sin_cos();
+            let (sn2, cn2) = (2.0 * PI * df_n2 * t2).sin_cos();
+            let env_ind = (-12.0 * t1 - 12.0 * t2).exp();
+            for iz in 0..2 {
+                let mz = if iz == 0 { cn2 } else { sn2 } * s2;
+                for iy in 0..2 {
+                    let my = if iy == 0 { cn1 } else { sn1 } * s1;
+                    let amp = 80_000.0 * env_ind * my * mz;
+                    let mut tr = Vec::with_capacity(nx);
+                    for kx in 0..nx {
+                        let tx = (kx as f64) / sw_h_hz;
+                        let e = amp * (-25.0 * tx).exp();
+                        let (sh, ch) = (2.0 * PI * df_h * tx).sin_cos();
+                        // Bruker direct convention: downfield resonances oscillate as `exp(+i 2pi f t)`
+                        // (`axis_x.conjugate_for_fft = true` -> `dim.conjugate_for_fft = false`).
+                        tr.push([e * ch, e * sh]);
+                    }
+                    push_complex_trace_i32_le(&mut ser_hd, &tr);
+                }
+            }
+        }
+
+        let fid_hd = read_bruker_fid_3d_from_bytes(
+            "bt_hncaconh_hd",
+            &acqus_hd,
+            None,
+            &acqu2s_hd,
+            None,
+            &acqu3s_hd,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(&nus_txt),
+            &ser_hd,
+            false,
+        )
+        .expect("decode sparse half-dwell BT_HNCACONH");
+
+        let mut rec_hd = ProcessingRecipe::from_fid_3d(&fid_hd);
+        assert_eq!(rec_hd.dims[1].phase_source, PhaseSource::FnMode);
+        assert_eq!(rec_hd.dims[2].phase_source, PhaseSource::FnMode);
+        assert_eq!(
+            (rec_hd.dims[1].p0_deg, rec_hd.dims[1].p1_deg),
+            (Some(90.0), Some(-180.0))
+        );
+        assert_eq!(
+            (rec_hd.dims[2].p0_deg, rec_hd.dims[2].p1_deg),
+            (Some(90.0), Some(-180.0))
+        );
+        assert_eq!(rec_hd.dims[1].fcor, 1.0);
+        assert_eq!(rec_hd.dims[2].fcor, 1.0);
+
+        rec_hd.set_no_crop();
+        rec_hd.dims[0].p0_deg = Some(0.0);
+        rec_hd.dims[0].p1_deg = Some(0.0);
+        rec_hd.dims[0].phase_source = PhaseSource::Explicit;
+        rec_hd.dims[0].baseline = None;
+        for d in &mut rec_hd.dims[1..3] {
+            d.window = ApodizationWindow::SquaredSineBell {
+                offset_pi_frac: 0.5,
+            };
+            d.baseline = None;
+        }
+        let spec_hd = process_fid_3d(&fid_hd, "HNCA", &rec_hd)
+            .expect("process sparse half-dwell BT_HNCACONH");
+        assert_eq!(spec_hd.exp, "HNCACONH");
+        assert_eq!(spec_hd.axis_y.size, 64);
+        assert_eq!(spec_hd.axis_z.size, 64);
+
+        let ix = spec_hd.axis_x.ppm_to_index(pk_h).round() as usize;
+        let iy = spec_hd.axis_y.ppm_to_index(pk_n1).round() as usize;
+        let iz = spec_hd.axis_z.ppm_to_index(pk_n2).round() as usize;
+        let apex = spec_hd.get(ix, iy, iz);
+        let max_v = spec_hd
+            .data
+            .iter()
+            .copied()
+            .fold(f32::NEG_INFINITY, f32::max);
+        let min_v = spec_hd.data.iter().copied().fold(f32::INFINITY, f32::min);
+        assert!(
+            apex > 0.75 * max_v && apex > 0.0,
+            "sparse half-dwell FnMODE phase must yield positive absorption apex at ({pk_h}, {pk_n1}, {pk_n2}): apex={apex}, max={max_v}, min={min_v}"
+        );
+        assert!(
+            min_v > -0.15 * max_v,
+            "sparse half-dwell FnMODE phase must avoid dispersive negative lobes: min={min_v}, max={max_v}"
+        );
     }
 }
