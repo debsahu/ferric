@@ -537,9 +537,12 @@ pub struct ClassifiedExperiment {
 /// Correlation scope for amino-acid-selective 2D `13C`-detected CAS experiments.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum CasSelectionScope {
-    /// `CAS-CACON`: selects `C'(i-1)-N(i)` where residue `(i-1)` matches `residue_types`.
+    /// `CAS-CACON`: selects `(C'(i-1), N(i))` peptide-bond peaks where predecessor residue `(i-1)`
+    /// matches `residue_types` via `CA(i-1) -> C'(i-1) -> N(i)`.
     Predecessor,
-    /// `CAS-CANCO`: selects intra-residue `C'(i)-N(i)` and sequential `C'(i-1)-N(i)` correlations.
+    /// `CAS-CANCO`: selects `(C'(i-1), N(i))` peptide-bond peaks where residue `i` matches
+    /// `residue_types` via `1J` `CA(i) -> N(i) -> C'(i-1)` (and weakly predecessor `(i-1)` via
+    /// `2J` `CA(i-1) -> N(i) -> C'(i-1)`).
     IntraAndPredecessor,
 }
 
@@ -3276,6 +3279,15 @@ fn parse_ucsf_header(
                     && axes[0].carrier_ppm.unwrap_or(0.0) < 120.0))
         {
             axes.swap(0, 1);
+        } else if axes.len() >= 3
+            && axes.last().is_some_and(|a| a.nucleus == "13C")
+            && (axes[0].nucleus != "13C"
+                || (axes.last().and_then(|a| a.carrier_ppm).unwrap_or(0.0) > 150.0
+                    && axes[0].carrier_ppm.unwrap_or(0.0) < 120.0))
+        {
+            if let Some(c_ax) = axes.pop() {
+                axes.insert(0, c_ax);
+            }
         }
     }
     Ok((dim, axes, base_mhz))
@@ -4133,7 +4145,15 @@ fn append_bruker_processed_axis_warnings(
             .and_then(|m| jcamp_f64(m, "BF1").or_else(|| jcamp_f64(m, "SFO1")))
             .filter(|&bf| bf > 1.0);
         if let Some(bf1) = bf1_opt {
-            if !sf.is_finite() || sf <= 1.0 || (sf - bf1).abs() > 0.01 * bf1 {
+            let sf_ok = sf.is_finite() && sf > 1.0 && (sf - bf1).abs() <= 0.01 * bf1;
+            let sw_ppm = if sf_ok && sw_p.is_finite() {
+                sw_p / sf
+            } else {
+                f64::NAN
+            };
+            let offset_ok =
+                offset.is_finite() && offset.abs() <= 1000.0 && sw_ppm > 0.0 && sw_ppm <= 500.0;
+            if !sf_ok || !offset_ok {
                 let sfo1 = amap_opt
                     .and_then(|m| jcamp_f64(m, "SFO1"))
                     .filter(|&v| v > 1.0)
@@ -4144,7 +4164,7 @@ fn append_bruker_processed_axis_warnings(
                     .filter(|&w| w.is_finite() && w > 0.0)
                     .unwrap_or_else(|| sw_p / bf1);
                 let note = format!(
-                    "Axis warning ({}): RD-12 proc SF ({sf:.6} MHz, OFFSET={offset:.3}) deviates >1% from acqu BF1 ({bf1:.6} MHz); fallback to acquNs (carrier={carrier:.2} ppm, SW={acqu_sw:.2} ppm)",
+                    "Axis warning ({}): RD-12 proc SF/OFFSET ({sf:.6} MHz, OFFSET={offset:.3}) fails consistency vs acqu BF1 ({bf1:.6} MHz); fallback to acquNs (carrier={carrier:.2} ppm, SW={acqu_sw:.2} ppm)",
                     ax.label
                 );
                 if !notes.iter().any(|n| n == &note) {
@@ -4790,27 +4810,66 @@ fn build_bruker_experiment(
         let mut nuc = canonical_nucleus(&raw_nuc);
         let sfo1 = jcamp_f64(amap, "SFO1").or_else(|| jcamp_f64(pmap, "SF"));
         let bf1 = jcamp_f64(amap, "BF1").or(sfo1);
-        let mut sw_ppm = jcamp_f64(amap, "SW");
-        if sw_ppm.is_none() || sw_ppm == Some(0.0) {
-            if let (Some(sw_hz), Some(sf)) = (
-                jcamp_f64(amap, "SW_h").or_else(|| jcamp_f64(pmap, "SW_p")),
-                sfo1,
+        let proc_axis_usable = grp.processed_bytes > 0
+            && !pmap.is_empty()
+            && (idx < 2 || jcamp_usize(pmap, "XDIM").unwrap_or(0) > 0 || amap.is_empty());
+        let valid_proc_scale = if proc_axis_usable {
+            match (
+                jcamp_f64(pmap, "SF"),
+                jcamp_f64(pmap, "SW_p"),
+                jcamp_f64(pmap, "OFFSET"),
             ) {
-                if sf > 1e-3 {
-                    sw_ppm = Some(sw_hz / sf);
+                (Some(sf), Some(sw_p), Some(off)) => {
+                    let bf_ref = jcamp_f64(amap, "BF1")
+                        .or_else(|| jcamp_f64(amap, "SFO1"))
+                        .filter(|&b| b > 1.0);
+                    let sf_ok = sf.is_finite()
+                        && sf > 1.0
+                        && bf_ref.is_none_or(|bf| (sf - bf).abs() <= 0.01 * bf);
+                    let p_sw = if sf_ok && sw_p.is_finite() {
+                        sw_p / sf
+                    } else {
+                        f64::NAN
+                    };
+                    let offset_ok =
+                        off.is_finite() && off.abs() <= 1000.0 && p_sw > 0.0 && p_sw <= 500.0;
+                    if sf_ok && offset_ok {
+                        Some((p_sw, off - 0.5 * p_sw))
+                    } else {
+                        None
+                    }
                 }
-            }
-        }
-        let carrier_ppm = if let (Some(sfo), Some(bf)) = (sfo1, bf1) {
-            if bf > 1.0 && (sfo - bf).abs() > 1e-9 {
-                Some((sfo - bf) * 1.0e6 / bf)
-            } else if let (Some(off), Some(sw)) = (jcamp_f64(pmap, "OFFSET"), sw_ppm) {
-                Some(off - 0.5 * sw)
-            } else {
-                None
+                _ => None,
             }
         } else {
             None
+        };
+        let (sw_ppm, carrier_ppm) = if let Some((p_sw, p_car)) = valid_proc_scale {
+            (Some(p_sw), Some(p_car))
+        } else {
+            let mut sw_ppm = jcamp_f64(amap, "SW");
+            if sw_ppm.is_none() || sw_ppm == Some(0.0) {
+                if let (Some(sw_hz), Some(sf)) = (
+                    jcamp_f64(amap, "SW_h").or_else(|| jcamp_f64(pmap, "SW_p")),
+                    sfo1,
+                ) {
+                    if sf > 1e-3 {
+                        sw_ppm = Some(sw_hz / sf);
+                    }
+                }
+            }
+            let carrier_ppm = if let (Some(sfo), Some(bf)) = (sfo1, bf1) {
+                if bf > 1.0 && (sfo - bf).abs() > 1e-9 {
+                    Some((sfo - bf) * 1.0e6 / bf)
+                } else if let (Some(off), Some(sw)) = (jcamp_f64(pmap, "OFFSET"), sw_ppm) {
+                    Some(off - 0.5 * sw)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            (sw_ppm, carrier_ppm)
         };
 
         let quad = if !amap.is_empty() {
@@ -5535,6 +5594,20 @@ fn build_bruker_experiment(
         &[&p1, &p2, &p3, &p4],
         &mut notes,
     );
+
+    if pulse_class == PulseSequenceClass::Unknown && !is_cal_scout && !is_known_specialized_j {
+        if let Some(pp) = pulprog.as_deref() {
+            if let Some(expected_cls) = classify_pulse_token(pp, dimensionality, &[]) {
+                if expected_cls != PulseSequenceClass::Unknown {
+                    let ax_list: Vec<&str> = axes.iter().map(|a| a.nucleus.as_str()).collect();
+                    notes.push(format!(
+                        "PULPROG '{pp}' ({expected_cls:?}) conflicts with axis nuclei [{}]; kept Unknown (verify acqu2s/acqu3s NUC1/FnMODE)",
+                        ax_list.join(",")
+                    ));
+                }
+            }
+        }
+    }
 
     let quadrature_badge = format_quadrature_badge(&axes);
     let selected_by_default = pulse_class != PulseSequenceClass::Unknown;
@@ -6571,7 +6644,8 @@ fn classify_nmr_entries_named(root_name: &str, raw_entries: &[VirtualEntry]) -> 
                 let quadrature_badge = format_quadrature_badge(&axes);
                 let mut notes = Vec::new();
                 append_cas_filter_note(pulse_class, None, None, &disp, &rel, &mut notes);
-                append_processed_axis_warnings(pulse_class, &axes, true, &mut notes);
+                // `parse_ucsf_header` already reorders `axes` into canonical direct-first order.
+                append_processed_axis_warnings(pulse_class, &axes, false, &mut notes);
                 experiments.push(ClassifiedExperiment {
                     relative_path: rel,
                     display_name: disp,

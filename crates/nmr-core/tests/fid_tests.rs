@@ -2939,3 +2939,271 @@ fn test_b7_raw_3d_ipap_c_cbcanco_and_c_canco_decode_cleanly_matching_splitcomb()
         assert_eq!(fid_bytes.data.len(), fid_split.data.len());
     }
 }
+
+#[test]
+fn test_v0173_r2_3d_ipap_guard_d10_d0_fallback_and_singlet_collapse() {
+    use nmr_core::fid::read_bruker_fid_3d_from_bytes;
+    use std::f64::consts::PI;
+
+    let td0 = 256usize; // 128 complex direct 13C points -> 1024-byte aligned stride
+    let n0 = td0 / 2;
+
+    // 1. Over-eager IPAP guard: non-IPAP 13C-detected 3D NUS/uniform with 2x ser size
+    //    (and no FnILOOP=2) must NOT be silently recombined as IPAP.
+    let acqus_non_ipap = "##TITLE= acqus\n##$PULPROG= <c_canco3d>\n##$NUC1= <13C>\n\
+         ##$BF1= 201.22302255\n##$SFO1= 201.258035\n##$SW= 11.83\n##$SW_h= 2380.95\n\
+         ##$TD= 256\n##$BYTORDA= 0\n##$DTYPA= 0\n##$AQSEQ= 0\n##$FnTYPE= 2\n##$GRPDLY= 0\n";
+    let acqu2s_non_ipap =
+        "##TITLE= acqu2s\n##$NUC1= <15N>\n##$BF1= 81.088628\n##$SFO1= 81.098683\n\
+         ##$SW= 36.0\n##$SW_h= 2919.2\n##$TD= 32\n##$NusTD= 8\n##$FnMODE= 5\n";
+    let acqu3s_non_ipap =
+        "##TITLE= acqu3s\n##$NUC1= <13C>\n##$BF1= 201.22302255\n##$SFO1= 201.233084\n\
+         ##$SW= 40.0\n##$SW_h= 8048.9\n##$TD= 1\n##$NusTD= 8\n##$FnMODE= 5\n";
+    let nuslist_4 = "0 0\n1 0\n0 1\n1 1\n";
+    // 4 NUS coords * 4 quad = 16 quad traces; 32 traces = 2x quad traces, no IPAP PULPROG & no FnILOOP=2.
+    let ser_2x = vec![0u8; td0 * 4 * 32];
+    let res_non_ipap = read_bruker_fid_3d_from_bytes(
+        "non_ipap_2x_nus",
+        acqus_non_ipap,
+        None,
+        acqu2s_non_ipap,
+        None,
+        acqu3s_non_ipap,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some(nuslist_4),
+        &ser_2x,
+        false,
+    );
+    assert!(
+        res_non_ipap.is_err(),
+        "non-IPAP 13C NUS ser with 2x trace count must not silently trigger IPAP"
+    );
+
+    // 2. 3D Bruker `d10` (F2 = axis_y) vs `d0` (F1 = axis_z) fallback delay indices.
+    let sw_y_hz = 2919.2_f64;
+    let sw_z_hz = 2919.2_f64;
+    let hd_y = 0.5 / sw_y_hz;
+    let hd_z = 0.5 / sw_z_hz;
+    let mk_acqus_d = |d0: f64, d10: f64| {
+        let mut d = vec!["0".to_string(); 12];
+        d[0] = format!("{d0:.10}");
+        d[10] = format!("{d10:.10}");
+        format!(
+            "##TITLE= acqus\n##$PULPROG= <hncagp3d>\n##$NUC1= <1H>\n\
+             ##$BF1= 600.13\n##$SFO1= 600.13282\n##$SW= 12.0\n##$SW_h= 7201.56\n\
+             ##$TD= 256\n##$BYTORDA= 0\n##$DTYPA= 0\n##$AQSEQ= 0\n##$GRPDLY= 0\n\
+             ##$D= (0..11)\n{}\n",
+            d.join(" ")
+        )
+    };
+    let acqu2s_u = "##TITLE= acqu2s\n##$NUC1= <15N>\n##$BF1= 81.088628\n##$SFO1= 81.098683\n\
+         ##$SW= 36.0\n##$SW_h= 2919.2\n##$TD= 4\n##$FnMODE= 5\n";
+    let acqu3s_u = "##TITLE= acqu3s\n##$NUC1= <15N>\n##$BF1= 81.088628\n##$SFO1= 81.098683\n\
+         ##$SW= 36.0\n##$SW_h= 2919.2\n##$TD= 4\n##$FnMODE= 5\n";
+    let ser_u = vec![0u8; td0 * 4 * 16];
+
+    let fid_d10_only = read_bruker_fid_3d_from_bytes(
+        "d10_f2",
+        &mk_acqus_d(0.0, hd_y),
+        None,
+        acqu2s_u,
+        None,
+        acqu3s_u,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        &ser_u,
+        false,
+    )
+    .expect("read d10-only 3D");
+    assert!(
+        fid_d10_only.axis_y.stored_proc.pulprog_p1_deg.is_some(),
+        "d10 half-dwell must attach to F2 (axis_y)"
+    );
+    assert!(
+        fid_d10_only.axis_z.stored_proc.pulprog_p1_deg.is_none(),
+        "d0=0 must not attach half-dwell to F1 (axis_z)"
+    );
+
+    let fid_d0_only = read_bruker_fid_3d_from_bytes(
+        "d0_f1",
+        &mk_acqus_d(hd_z, 0.0),
+        None,
+        acqu2s_u,
+        None,
+        acqu3s_u,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        &ser_u,
+        false,
+    )
+    .expect("read d0-only 3D");
+    assert!(
+        fid_d0_only.axis_y.stored_proc.pulprog_p1_deg.is_none(),
+        "d10=0 must not attach half-dwell to F2 (axis_y)"
+    );
+    assert!(
+        fid_d0_only.axis_z.stored_proc.pulprog_p1_deg.is_some(),
+        "d0 half-dwell must attach to F1 (axis_z)"
+    );
+
+    // 3. Cropped `c_hncacon_iare3d` singlet-collapse regression (both FnILOOP=2 on F2 and on F1).
+    let sw_c_hz = 2380.95_f64;
+    let j_caco = 53.0_f64;
+    let f_sig = 320.0_f64; // single carbonyl resonance +320 Hz from carrier
+    let r2 = 8.0_f64;
+    let make_ip_ap = |is_ap: bool| -> Vec<u8> {
+        let mut out = Vec::with_capacity(td0 * 4);
+        for k in 0..n0 {
+            let t = (k as f64) / sw_c_hz;
+            let env = (-r2 * t).exp() * 100_000.0;
+            let (s_f, c_f) = (2.0 * PI * f_sig * t).sin_cos();
+            let (s_j, c_j) = (PI * j_caco * t).sin_cos();
+            // In-phase: cos(pi J t) * exp(+i 2pi f t)
+            // Anti-phase (Bruker ph7 90 deg phase): -i * sin(pi J t) * exp(+i 2pi f t)
+            let (re, im) = if !is_ap {
+                (env * c_j * c_f, env * c_j * s_f)
+            } else {
+                (env * s_j * s_f, -env * s_j * c_f)
+            };
+            out.extend_from_slice(&(re.round() as i32).to_le_bytes());
+            out.extend_from_slice(&(im.round() as i32).to_le_bytes());
+        }
+        out
+    };
+    let ip_tr = make_ip_ap(false);
+    let ap_tr = make_ip_ap(true);
+
+    // Evaluate DFT magnitude at frequency f (Hz) for a complex trace.
+    let dft_mag = |tr: &[[f64; 2]], f_hz: f64| -> f64 {
+        let mut re = 0.0_f64;
+        let mut im = 0.0_f64;
+        for (k, &[xr, xi]) in tr.iter().enumerate() {
+            let ang = -2.0 * PI * f_hz * (k as f64) / sw_c_hz;
+            let (sa, ca) = ang.sin_cos();
+            re += xr * ca - xi * sa;
+            im += xr * sa + xi * ca;
+        }
+        re.hypot(im)
+    };
+
+    for (iloop_on_f1, aqseq) in [(false, 0), (true, 0), (true, 1)] {
+        let (fn_il_y, fn_il_z) = if iloop_on_f1 { (1, 2) } else { (2, 1) };
+        let acqus_ia = format!(
+            "##TITLE= acqus\n##$PULPROG= <c_hncacon_iare3d>\n##$NUC1= <13C>\n\
+             ##$BF1= 201.22302255\n##$SFO1= 201.258035\n##$SW= 11.830347\n##$SW_h= {sw_c_hz:.6}\n\
+             ##$TD= {td0}\n##$BYTORDA= 0\n##$DTYPA= 0\n##$AQSEQ= {aqseq}\n##$FnTYPE= 2\n##$GRPDLY= 0\n\
+             ##$CNST= (0..30)\n0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 53 0 0 0 0 0\n"
+        );
+        let acqu2s_ia = format!(
+            "##TITLE= acqu2s\n##$NUC1= <15N>\n##$BF1= 81.088628\n##$SFO1= 81.098683\n\
+             ##$SW= 35.99\n##$SW_h= 2918.8\n##$TD= 32\n##$NusTD= 8\n##$FnMODE= 5\n##$FnILOOP= {fn_il_y}\n"
+        );
+        let acqu3s_ia = format!(
+            "##TITLE= acqu3s\n##$NUC1= <15N>\n##$BF1= 81.088628\n##$SFO1= 81.098683\n\
+             ##$SW= 35.99\n##$SW_h= 2918.8\n##$TD= 1\n##$NusTD= 8\n##$FnMODE= 5\n##$FnILOOP= {fn_il_z}\n"
+        );
+        // 4 NUS points x 8 raw traces per NUS row; place IP/AP according to fast/slow FnILOOP layout.
+        let ipap_on_fast = (aqseq == 0 && !iloop_on_f1) || (aqseq == 1 && iloop_on_f1);
+        let mut ser_ia = Vec::with_capacity(4 * 8 * td0 * 4);
+        for _row in 0..4 {
+            let mut row_traces: [Option<&[u8]>; 8] = [None; 8];
+            for slow_q in 0..2 {
+                for fast_q in 0..2 {
+                    let (i0, i1) = if ipap_on_fast {
+                        let b = (slow_q * 2 + fast_q) * 2;
+                        (b, b + 1)
+                    } else {
+                        let b = (slow_q * 2) * 2 + fast_q;
+                        (b, b + 2)
+                    };
+                    row_traces[i0] = Some(&ip_tr);
+                    row_traces[i1] = Some(&ap_tr);
+                }
+            }
+            for tr in row_traces {
+                ser_ia.extend_from_slice(tr.unwrap());
+            }
+        }
+        let fid_ia = read_bruker_fid_3d_from_bytes(
+            "c_hncacon_iare3d_crop",
+            &acqus_ia,
+            None,
+            &acqu2s_ia,
+            None,
+            &acqu3s_ia,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(nuslist_4),
+            &ser_ia,
+            false,
+        )
+        .unwrap_or_else(|e| {
+            panic!("decode c_hncacon_iare3d (iloop_f1={iloop_on_f1}, aqseq={aqseq}): {e}")
+        });
+        let tr0 = &fid_ia.data[0..n0];
+        let m_singlet = dft_mag(tr0, f_sig);
+        let m_side_hi = dft_mag(tr0, f_sig + 0.5 * j_caco);
+        let m_side_lo = dft_mag(tr0, f_sig - 0.5 * j_caco);
+        assert!(
+            m_singlet > 3.0 * m_side_hi.max(m_side_lo),
+            "c_hncacon_iare3d (iloop_f1={iloop_on_f1}, aqseq={aqseq}) must collapse doublet into singlet at {f_sig} Hz: singlet={m_singlet:.1}, side_hi={m_side_hi:.1}, side_lo={m_side_lo:.1}"
+        );
+    }
+
+    // 4. Optional real-data regression (`NMR_REAL_DATA_DIR`): verify `091119/12` `c_hncacon_iare3d`
+    //    decodes cleanly and IPAP virtual decoupling sharpens direct-1D peak/mean vs raw uncombined trace.
+    if let Ok(real_dir) = std::env::var("NMR_REAL_DATA_DIR") {
+        let exp12 =
+            PathBuf::from(real_dir).join("private/clec16a/13C15N_Clec16aIDPR2_MG_091119/12");
+        if exp12.join("ser").is_file() {
+            let fid_real = read_bruker_fid_3d(&exp12)
+                .expect("decode real 091119/12 c_hncacon_iare3d NUS IPAP");
+            assert_eq!(fid_real.axis_x.label, "13C");
+            assert_eq!(fid_real.axis_y.label, "15N");
+            assert_eq!(fid_real.axis_z.label, "15N");
+            assert_eq!(fid_real.axis_y.complex_points, 64);
+            assert_eq!(fid_real.axis_z.complex_points, 32);
+            let nx_r = fid_real.axis_x.complex_points;
+            let tr_dec = &fid_real.data[0..nx_r];
+            let peak_mean_ratio = |tr: &[[f64; 2]]| -> f64 {
+                let mut mags = Vec::with_capacity(256);
+                for bin in 0..256 {
+                    let f =
+                        -0.5 * fid_real.axis_x.sw_hz + (bin as f64 / 256.0) * fid_real.axis_x.sw_hz;
+                    let mut re = 0.0_f64;
+                    let mut im = 0.0_f64;
+                    for (k, &[xr, xi]) in tr.iter().enumerate() {
+                        let ang = -2.0 * PI * f * (k as f64) / fid_real.axis_x.sw_hz;
+                        let (sa, ca) = ang.sin_cos();
+                        re += xr * ca - xi * sa;
+                        im += xr * sa + xi * ca;
+                    }
+                    mags.push(re.hypot(im));
+                }
+                let max_m = mags.iter().copied().fold(0.0_f64, f64::max);
+                let mean_m = mags.iter().sum::<f64>() / (mags.len() as f64).max(1.0);
+                max_m / mean_m.max(1e-12)
+            };
+            let ratio_dec = peak_mean_ratio(tr_dec);
+            assert!(
+                ratio_dec > 1.35 && ratio_dec.is_finite(),
+                "real 091119/12 c_hncacon_iare3d IPAP-decoded first trace must show crisp decoupled resonances, got peak/mean={ratio_dec:.3}"
+            );
+        }
+    }
+}

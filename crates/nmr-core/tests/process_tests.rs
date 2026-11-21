@@ -1898,3 +1898,177 @@ fn low_snr_3d_focused_autophase_mirrored_cacb_recovery_and_rigid_hn_registration
         picked_reg.len()
     );
 }
+
+#[test]
+fn test_v0173_r2_p1_3_p1_4_p1_5_and_rd9_post_process_checks() {
+    use nmr_core::fid::{Fid2D, Fid3D, FidAxisMeta, FidVendor, QuadMode, StoredDimProc};
+    use nmr_core::process::{
+        infer_3d_experiment_label, process_fid_3d, DimRecipe, PhaseSource, ProcessingRecipe,
+    };
+    use nmr_core::spectrum::check_spectrum3d_axis_ranges;
+
+    let make_ax = |label: &str,
+                   n: usize,
+                   sw_hz: f64,
+                   obs_mhz: f64,
+                   car_ppm: f64,
+                   pulprog_p1_deg: Option<f64>| {
+        let sp = StoredDimProc {
+            pulprog_p1_deg,
+            ..StoredDimProc::default()
+        };
+        FidAxisMeta {
+            label: label.to_string(),
+            td_raw: n * 2,
+            complex_points: n,
+            sw_hz,
+            obs_mhz,
+            carrier_mhz: obs_mhz * (1.0 + car_ppm * 1e-6),
+            first_ppm: car_ppm + 0.5 * (sw_hz / obs_mhz),
+            quad_mode: QuadMode::StatesTppi,
+            states_recombined: true,
+            group_delay: 0.0,
+            conjugate_for_fft: false,
+            stored_proc: sp,
+        }
+    };
+
+    // 1. 173.proc:P1-3: 2D NUS, non-Bruker 3D NUS, and 3D Bruker NUS without `pulprog_p1_deg`
+    //    must keep `AutoChen2002` blind autophasing; only 3D Bruker NUS WITH `pulprog_p1_deg` uses `FnMode`.
+    let fid_2d_nus = Fid2D {
+        name: "hsqc_2d_nus".to_string(),
+        vendor: FidVendor::Bruker,
+        pulse_program: "hsqcetfpf3gpsi".to_string(),
+        axis_x: make_ax("1H", 64, 6000.0, 600.0, 4.7, None),
+        axis_y: make_ax("15N", 32, 2000.0, 60.8, 118.0, Some(-180.0)),
+        data: vec![[0.0, 0.0]; 32 * 2 * 64],
+        nus_mask: Some(vec![true; 32]),
+        truncated_traces: None,
+    };
+    let rec_2d_nus = ProcessingRecipe::from_fid_2d(&fid_2d_nus);
+    assert_eq!(
+        rec_2d_nus.dims[1].phase_source,
+        PhaseSource::Auto,
+        "2D Bruker NUS must keep blind Auto (Chen2002) autophasing, not FnMode"
+    );
+    assert!(rec_2d_nus.dims[1].p0_deg.is_none() && rec_2d_nus.dims[1].p1_deg.is_none());
+
+    // 173.proc:P1-4: 2D indirect default zero-fill stays `(2 * n_eff).next_power_of_two()` (`32 -> 64`).
+    assert_eq!(rec_2d_nus.dims[1].si, 64);
+    assert_eq!(DimRecipe::from_axis_meta(&fid_2d_nus.axis_y, 1).si, 64);
+
+    // Non-Bruker (Varian) 3D NUS (even with `pulprog_p1_deg`) keeps blind `Auto` (Chen2002).
+    let fid_varian = Fid3D {
+        name: "varian_3d_nus".to_string(),
+        vendor: FidVendor::Varian,
+        pulse_program: "ghnca".to_string(),
+        axis_x: make_ax("1H", 32, 6000.0, 600.0, 4.7, None),
+        axis_y: make_ax("15N", 16, 2000.0, 60.8, 118.0, Some(-180.0)),
+        axis_z: make_ax("13C", 16, 4800.0, 150.9, 54.0, Some(-180.0)),
+        data: vec![[0.0, 0.0]; 16 * 2 * 16 * 2 * 32],
+        nus_mask: Some(vec![true; 16 * 16]),
+        truncated_traces: None,
+    };
+    let rec_varian = ProcessingRecipe::from_fid_3d(&fid_varian);
+    assert_eq!(
+        rec_varian.dims[1].phase_source,
+        PhaseSource::Auto,
+        "Varian 3D NUS must keep blind Auto (Chen2002)"
+    );
+    assert_eq!(
+        rec_varian.dims[2].phase_source,
+        PhaseSource::Auto,
+        "Varian 3D NUS must keep blind Auto (Chen2002)"
+    );
+
+    // 3D Bruker NUS `15N/15N` (RD-14 N-N target): dim without `pulprog_p1_deg` keeps blind `Auto`,
+    // dim with `pulprog_p1_deg` uses `FnMode`, and indirect zero-fill is `4 * n_eff` (`32 -> 128`, `64 -> 256`).
+    let fid_bruker_3d = Fid3D {
+        name: "bruker_3d_mixed".to_string(),
+        vendor: FidVendor::Bruker,
+        pulse_program: "c_hncacon_iare3d".to_string(),
+        axis_x: make_ax("13C", 32, 2400.0, 201.2, 174.0, None),
+        axis_y: make_ax("15N", 32, 2900.0, 81.1, 122.0, None),
+        axis_z: make_ax("15N", 64, 2900.0, 81.1, 122.0, Some(-180.0)),
+        data: vec![[0.0, 0.0]; 4],
+        nus_mask: Some(vec![true; 32 * 64]),
+        truncated_traces: None,
+    };
+    let rec_b3 = ProcessingRecipe::from_fid_3d(&fid_bruker_3d);
+    assert_eq!(rec_b3.dims[1].phase_source, PhaseSource::Auto);
+    assert_eq!(rec_b3.dims[2].phase_source, PhaseSource::FnMode);
+    assert_eq!(rec_b3.dims[1].si, 128);
+    assert_eq!(rec_b3.dims[2].si, 256);
+    assert_eq!(rec_b3.nus.as_ref().expect("3D N-N NUS").iterations, 200);
+
+    // Standard 3D triple-resonance (`1H/15N/13C`) keeps `(2 * n_eff).next_power_of_two()` (`32 -> 64`, `64 -> 128`)
+    // and 40 default IST iterations so CISD3/globular 3D bin spacing, runtime, and memory footprint are preserved.
+    let fid_std_3d = Fid3D {
+        name: "std_3d_hnca".to_string(),
+        vendor: FidVendor::Bruker,
+        pulse_program: "hncagp3d".to_string(),
+        axis_x: make_ax("1H", 64, 6000.0, 600.0, 4.7, None),
+        axis_y: make_ax("15N", 32, 2000.0, 60.8, 118.0, None),
+        axis_z: make_ax("13C", 64, 4800.0, 150.9, 54.0, None),
+        data: vec![[0.0, 0.0]; 4],
+        nus_mask: Some(vec![true; 32 * 64]),
+        truncated_traces: None,
+    };
+    let rec_std_3d = ProcessingRecipe::from_fid_3d(&fid_std_3d);
+    assert_eq!(rec_std_3d.dims[1].si, 64);
+    assert_eq!(rec_std_3d.dims[2].si, 128);
+    assert_eq!(rec_std_3d.nus.as_ref().expect("std 3D NUS").iterations, 40);
+
+    // 2. 173.proc:P1-5: `hncocacbgpwg3d` resolves to `"CBCA(CO)NH"`, not `"HN(CO)CA"`.
+    let mut fid_lbl = Fid3D {
+        name: "triple".to_string(),
+        vendor: FidVendor::Bruker,
+        pulse_program: String::new(),
+        axis_x: make_ax("1H", 16, 6000.0, 600.0, 4.7, None),
+        axis_y: make_ax("15N", 8, 2000.0, 60.8, 118.0, None),
+        axis_z: make_ax("13C", 8, 9000.0, 150.9, 44.0, None),
+        data: Vec::new(),
+        nus_mask: None,
+        truncated_traces: None,
+    };
+    for (pp, expected) in [
+        ("hncocacbgpwg3d", "CBCA(CO)NH"),
+        ("b_hncocacbgp3d", "CBCA(CO)NH"),
+        ("hn_co_cacb_3d", "CBCA(CO)NH"),
+        ("cbcaconhgp3d", "CBCA(CO)NH"),
+        ("cbca_co_nh", "CBCA(CO)NH"),
+        ("hncocagpwg3d", "HN(CO)CA"),
+        ("hncacbgpwg3d", "HNCACB"),
+        ("hncacogpwg3d", "HN(CA)CO"),
+        ("hncogpwg3d", "HNCO"),
+        ("hncagpwg3d", "HNCA"),
+    ] {
+        fid_lbl.pulse_program = pp.to_string();
+        assert_eq!(
+            infer_3d_experiment_label(&fid_lbl),
+            expected,
+            "pulprog={pp}"
+        );
+    }
+
+    // 3. RD-9 post-process check: raw `c_hcccon_ia3d` with aliphatic axis at O1=172 ppm yields warning.
+    let (nx, ny, nz) = (8usize, 4usize, 4usize);
+    let fid_hcccon = Fid3D {
+        name: "raw_hcccon_8".to_string(),
+        vendor: FidVendor::Bruker,
+        pulse_program: "c_hcccon_ia3d".to_string(),
+        axis_x: make_ax("13C", nx, 1612.9, 201.22, 172.0, None),
+        axis_y: make_ax("15N", ny, 2918.9, 81.09, 124.0, None),
+        axis_z: make_ax("13C", nz, 16077.2, 201.22, 172.0, None),
+        data: vec![[1.0, 0.0]; nz * 2 * ny * 2 * nx],
+        nus_mask: None,
+        truncated_traces: None,
+    };
+    let mut rec_h = ProcessingRecipe::from_fid_3d(&fid_hcccon);
+    rec_h.set_no_crop();
+    let spec_h = process_fid_3d(&fid_hcccon, "AUTO", &rec_h).expect("process raw hcccon");
+    assert_eq!(spec_h.exp, "HCCCON");
+    let warns = check_spectrum3d_axis_ranges(&spec_h, None);
+    assert_eq!(warns.len(), 1, "expected aliphatic F1 warning: {warns:?}");
+    assert!(warns[0].message.contains("aliphatic 13C"));
+}

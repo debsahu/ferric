@@ -2247,6 +2247,9 @@ fn detect_bruker_3d_ipap_unsplit_mode(
         (_, Some(2)) => Some(Bruker3dIpapAxis::F1),
         _ => None,
     };
+    if !is_seq_ipap && iloop_axis.is_none() {
+        return None;
+    }
 
     if is_nus {
         let single_matches = bruker_ser_matches_trace_count(
@@ -4205,17 +4208,17 @@ fn read_bruker_fid_3d_from_params(
         .as_ref()
         .and_then(|pi| pi.indirect_dims.get(1));
 
-    let mut axis_y =
-        parse_bruker_indirect_axis(acqus, acqu2s, proc2s, "15N", Some(td_full_y), ind_phys_y, 0)?;
-    let mut axis_z = parse_bruker_indirect_axis(
+    let mut axis_y = parse_bruker_indirect_axis(
         acqus,
-        acqu3s,
-        proc3s,
-        "13C",
-        Some(td_full_z),
-        ind_phys_z,
+        acqu2s,
+        proc2s,
+        "15N",
+        Some(td_full_y),
+        ind_phys_y,
         10,
     )?;
+    let mut axis_z =
+        parse_bruker_indirect_axis(acqus, acqu3s, proc3s, "13C", Some(td_full_z), ind_phys_z, 0)?;
     let sync_reverse_3d = |ay: &mut FidAxisMeta, az: &mut FidAxisMeta| {
         if proc2s.and_then(|p| p.get("REVERSE")).is_none()
             || proc3s.and_then(|p| p.get("REVERSE")).is_none()
@@ -4478,7 +4481,7 @@ fn read_bruker_fid_3d_from_params(
                         "15N",
                         Some(td_full_y),
                         ind_phys_y,
-                        0,
+                        10,
                     )?;
                 }
                 Bruker3dIpapAxis::F1 => {
@@ -4490,7 +4493,7 @@ fn read_bruker_fid_3d_from_params(
                         "13C",
                         Some(td_full_z),
                         ind_phys_z,
-                        10,
+                        0,
                     )?;
                 }
             }
@@ -4656,9 +4659,9 @@ pub fn read_bruker_pseudo3d_planes_2d(
     let ind_y = pulprog_interp.indirect_dims.first();
     let ind_z = pulprog_interp.indirect_dims.get(1);
     let mut axis_2 =
-        parse_bruker_indirect_axis(&acqus, &acqu2s, proc2s.as_ref(), "15N", None, ind_y, 0)?;
+        parse_bruker_indirect_axis(&acqus, &acqu2s, proc2s.as_ref(), "15N", None, ind_y, 10)?;
     let mut axis_3 =
-        parse_bruker_indirect_axis(&acqus, &acqu3s, proc3s.as_ref(), "15N", None, ind_z, 10)?;
+        parse_bruker_indirect_axis(&acqus, &acqu3s, proc3s.as_ref(), "15N", None, ind_z, 0)?;
     if proc2s.as_ref().and_then(|p| p.get("REVERSE")).is_none() {
         if let Some(ip) = ind_y {
             sync_bruker_indirect_reverse(&mut axis_2, ip.reverse_frequency);
