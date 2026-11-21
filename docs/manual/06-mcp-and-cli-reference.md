@@ -305,8 +305,8 @@ Add the following block to your client's `mcpServers` configuration file (for **
 
 #### 2. Live `nmr-gui` Desktop Loopback Bridge Mode (`HttpBridge`)
 
-1. Open `ferric-gui` on your desktop, navigate to the **`MCP Bridge`** panel, choose **`ReadOnly`** (default) or **`ReadWrite`**, and click **Start Local Bridge**.
-2. `nmr-gui` binds strictly to `127.0.0.1:<port>` (ephemeral loopback port by default) and generates a fresh 256-bit OS CSPRNG session bearer token (`nmr_mcp_<64-hex>`, drawn from `/dev/urandom` on Unix and Windows CNG `BCryptGenRandom` on Windows).
+1. Open `ferric-gui` on your desktop, navigate to the **`MCP Bridge`** panel, choose **`ReadOnly`** (default) or **`ReadWrite`**, review/customize **Approved Workspace Roots** (defaulting to your active study folder, or non-root working directory), and click **Start Local Bridge**.
+2. `nmr-gui` binds strictly to `127.0.0.1:<port>` (ephemeral loopback port by default) and generates a fresh 256-bit OS CSPRNG session bearer token (`nmr_mcp_<64-hex>`, drawn from `/dev/urandom` on Unix and Windows CNG `BCryptGenRandom` on Windows). Enabling **Show JSON** displays the client snippet with the bearer token masked (`••••••••••••`) unless **Reveal Token** is explicitly checked.
 3. Click **Copy MCP Config** (or run `ferric mcp-config --client <antigravity|claude-desktop|cursor> --bridge-port <port>`), which emits the identical canonical `"ferric-workbench"` entry for your selected host client:
 
 **Claude Desktop (`--client claude-desktop`)**:
@@ -362,14 +362,18 @@ Add the following block to your client's `mcpServers` configuration file (for **
 
 Every `MCP` request passes through defense-in-depth security checks (`McpSecurityPolicy`):
 
-1. **Default-Safe `ReadOnly` Mode**: Both the `stdio` server and the `nmr-gui` bridge default to **`McpAccessMode::ReadOnly`**. State-modifying tools (`write_curated_peak_tsv`, `export_nmrstar_shifts`, `navigate_workbench`, `propose_curation_edit`, `undo_last_ai_edit`) carry MCP safety annotations (`readOnlyHint: false`, `destructiveHint: true`) and are unconditionally rejected (`-32002 ERR_READ_ONLY_DENIED` / `isError: true`) unless the user explicitly enables `ReadWrite`.
-2. **Canonicalized Path Sandbox (`resolve_sandboxed_path`) & Pre-Open `symlink_metadata` Guards**:
+1. **Default-Safe `ReadOnly` Mode**: Both the `stdio` server and the `nmr-gui` bridge default to **`McpAccessMode::ReadOnly`**. State-modifying tools (`write_curated_peak_tsv`, `export_nmrstar_shifts`, `navigate_workbench`, `propose_curation_edit`, `undo_last_ai_edit`, `run_workbench_workflow`, `dispatch_workbench_action`) carry MCP safety annotations (`readOnlyHint: false`, `destructiveHint: true`) and are unconditionally rejected (`-32002 ERR_READ_ONLY_DENIED` / `isError: true`) unless the user explicitly enables `ReadWrite`.
+2. **Canonicalized Path Sandbox (`resolve_sandboxed_path`), Pre-Open `symlink_metadata`, Overwrite & Destructive-Action Guards**:
    - Rejects empty paths, embedded null bytes (`\0`), URI schemes (`file://`, `http://`, `nmr://`), and any lexical `..` (`ParentDir`) traversal before touching the filesystem.
    - Blocks access to hidden credential and secret locations (`.ssh`, `.aws`, `.gnupg`, `.env`, `.env.*`, `.netrc`, `.kube`, `id_rsa`, `id_ed25519`).
-   - Verifies `std::fs::symlink_metadata` (`ft.is_file()`, rejecting FIFOs, sockets, and device nodes) and enforces pre-allocation file size (`<= 64 MiB`) and pose count (`<= 32` poses in `score_cofold_poses`) caps before opening files; canonicalizes every `allowed_root` and target path via `std::fs::canonicalize`; and sanitizes error strings so raw input lines or host paths are never echoed.
-3. **Loopback-Only Binding, 256-Bit CSPRNG / `>= 32`-Char Bearer Floor, Per-Request `ReadOnly` Downgrade & DNS-Rebinding Defense**:
+   - Verifies `std::fs::symlink_metadata` (`ft.is_file()`, rejecting FIFOs, sockets, device nodes, and escaping symlinks) and enforces pre-allocation file size (`<= 64 MiB`, `16 MiB` sequence cap in `nmr-gui`) and pose count (`<= 32` poses in `score_cofold_poses`) caps before opening files; canonicalizes every `allowed_root` and target path via `std::fs::canonicalize`; and sanitizes error strings so raw input lines or host paths are never echoed.
+   - **`nmr-gui` `ReadWrite` Filesystem Sandboxing**: All filesystem-touching workflow inputs (`run_workbench_workflow`: `load_study_folder.path`, `set_sequence.sequence_path`, `export_results.prefix`) and file-backed `dispatch_workbench_action` operations (`SaveSessionNef`, `SaveSessionNefAs`, `LoadSessionNef`, `ExportNmrStar`, `ExportPeaksTsv`, `ExportQualityReportHtml`, `ProcessAllRawFids`, `ReconstructNusIstFista`) are canonicalized and prefix-checked against **Approved Workspace Roots** (defaulting to the active study/workspace folder, or the current working directory if non-root `/`, and configurable in the GUI **MCP Bridge** panel; filesystem root `/` is always refused). Out-of-root paths, escaping symlinks, and export prefixes equal to a root directory itself (which would produce `<root>.<ext>` outside the root) are refused (`-32001 ERR_SECURITY_VIOLATION` / `"status": "denied"`).
+   - **Overwrite Refusal & Explicit Confirmation**: Existing output files are never silently overwritten by `export_results` or file-exporting `dispatch_workbench_action` calls unless `"overwrite": true` is explicitly supplied (`"error_kind": "overwrite_refused"`). `ResetWorkspace` is denied (`"error_kind": "destructive_action_denied"` / `"confirmation_required"`) unless the user enables **Allow destructive actions (`ResetWorkspace`)** in the **MCP Bridge** panel AND passes `"confirm": true`; interactive dialog dispatch `LoadPathOrSpectrum` is disabled via MCP (`"error_kind": "sandbox_required"`, use `load_study_folder`).
+3. **Loopback-Only Binding, Pre-Body Validation, Slow-Loris Deadlines, `Accept` & Batch Handling**:
    - Both `ferric-gui` and `ferric mcp --transport http` refuse non-loopback bind addresses (`0.0.0.0`, LAN IPs, `[::]`), and `nmr-gui`'s HTTP bridge honors `X-Nmr-Access-Mode: read-only` to downgrade individual requests to `ReadOnly` even when the bridge was started in `ReadWrite` mode (never escalating `ReadOnly -> ReadWrite`).
-   - Every HTTP request must carry `Authorization: Bearer <token>` verified via non-branching constant-time byte comparison (`401 Unauthorized`), a loopback `Host` header (`127.0.0.1`, `[::1]`, or `localhost`), and **zero** cross-origin browser `Origin` headers (`403 Forbidden`), defeating local browser CSRF and DNS-rebinding attacks; rejected `400`/`401`/`403`/`405`/`413` responses drain bounded unread request-body bytes into stack scratch (`0 B` heap allocation) and half-close cleanly (`Shutdown::Write`) so split-`send()` HTTP clients never encounter `ECONNRESET`.
+   - Every HTTP request in `nmr-gui` is checked strictly **before** reading any request body: loopback `Host` (`127.0.0.1`, `[::1]`, `localhost`) and **zero** cross-origin `Origin` headers (`403 Forbidden`), constant-time `Authorization: Bearer <token>` (`401 Unauthorized`), `/mcp` route (`404`) and `POST` method (`405`), `Accept` negotiation (`application/json`, `text/event-stream` SSE framing, `*/*`; `406 Not Acceptable` if neither is accepted or `q=0`), and bounded `Content-Length` (`<= 4 MiB`; `413`/`400`).
+   - Bounded concurrent worker connections (`<= 16`) enforce `200 ms` socket read slices and a `2 s` total wall-clock request deadline (`408 Request Timeout`) across both headers and body, preventing slow-loris stalls; rejected responses drain bounded unread bytes into stack scratch (`0 B` heap allocation) and half-close cleanly (`Shutdown::Write`).
+   - `nmr-gui` supports JSON-RPC 2.0 single objects, one-way notifications (`202 Accepted`), and batch arrays (`200 OK` JSON array or SSE event, or `202 Accepted` for all-notification batches).
    - For headless `ferric mcp --transport http` and `ferric mcp-config --bridge-port`, strongly prefer injecting `NMR_MCP_BEARER_TOKEN` via environment variables rather than passing `--token <bearer>` in `ps`-visible process `argv`. Any user-supplied token (`NMR_MCP_BEARER_TOKEN` or `--token`) must be at least **`32` trimmed characters** (`MIN_HTTP_BEARER_TOKEN_LEN = 32`, returning an error on shorter secrets); omitting both `NMR_MCP_BEARER_TOKEN` and `--token` on `ferric mcp --transport http` automatically generates a fresh 256-bit (`64`-hex-char) OS CSPRNG bearer token (`/dev/urandom` on Unix, Windows CNG `BCryptGenRandom` on Windows) and emits `MCP_HTTP_BEARER_TOKEN <hex64>` on `stderr` while keeping `stdout` clean.
 4. **Unified Monotonic User + AI Undo Journal (`UndoJournal` + `256`-Step `McpUndoLog`)**:
    - In `nmr-gui`, all live workbench operations (`get_workbench_state`, `capture_viewport_png`, `undo_last_ai_edit`, `navigate_workbench`, `propose_curation_edit`) record monotonic sequence entries on the shared User+MCP `UndoJournal` (`UndoOrigin::{User, Mcp}`); pressing **`Cmd/Ctrl+Z`** undoes whichever User or MCP mutation occurred most recently (`Shift+Cmd/Ctrl+Z` redoes), while `undo_last_ai_edit` reverts the latest AI bridge action.
@@ -401,6 +405,27 @@ Every `MCP` request passes through defense-in-depth security checks (`McpSecurit
 | `capture_viewport_png` | `gui` | `ReadOnly` | Encode active 2D contour / 3D strip / 3D ribbon viewport as RFC 2083 `image/png` Base64 |
 | `propose_curation_edit` | `gui` | `ReadWrite` | Undo-logged curation (`action`: `"assign_spin_system"`, `"unassign_residue"`, or `"toggle_peak_exclusion"`) |
 | `undo_last_ai_edit` | `gui` | `ReadWrite` | Revert the most recent AI navigation or curation action from `McpUndoLog` |
+| `run_workbench_workflow` | `gui` | `ReadWrite` | Execute parameterized workbench workflows (`load_study_folder`, `set_sequence`, `pick_peaks`, `run_assignment`, `select_workbook_page`, `set_contour_level`, `set_viewport_bounds`, `export_results`, `set_lock_residue`) inside approved roots |
+| `dispatch_workbench_action` | `gui` | `ReadWrite` | Dispatch any registered `WorkbenchAction` (`PascalCase` or `snake_case`) with root-sandboxing, `overwrite`, and destructive `confirm` guards |
+| `inspect_workbench_data` | `gui` | `ReadOnly` | Query filtered, paginated workbench tables (`assignments`, `spin_systems`, `peaks`, `unassigned_residues`, `low_confidence`, `qc_report`, `workbook_pages`, `actions`) |
+
+#### Desktop GUI Workflow, Action & Inspection Tools (`nmr-gui`)
+
+- **`run_workbench_workflow`** (`ReadWrite`, undo-logged):
+  - `load_study_folder`: `path` (existing directory inside **Approved Workspace Roots**), optional `run_full_pipeline` (`bool`).
+  - `set_sequence`: inline `sequence` (1-letter or FASTA) or sandboxed `sequence_path` (`<= 16 MiB` regular file inside approved roots).
+  - `pick_peaks`: optional `snr_threshold`, `auto_threshold`, `picker_mode` (`"classical"` \| `"neural"`).
+  - `run_assignment`: optional `solver` (`"evo-graph"` \| `"standard"` \| `"bayes-sa"`), `engine` (`"cpu"` \| `"gpu"`).
+  - `select_workbook_page`: `page_index` (`>= 0`) and/or `page_name`.
+  - `set_contour_level`: optional `contour_base`, `multiplier`, `show_negative`.
+  - `set_viewport_bounds`: `h_left`, `h_right`, `n_top`, `n_bottom`.
+  - `export_results`: `prefix` (resolved inside approved roots; defaults to current export prefix), `format` (`"star"` \| `"peaks"` \| `"nef"` \| `"html"`), optional `overwrite` (`bool`, default `false` — existing files are refused unless `overwrite: true`).
+  - `set_lock_residue`: `seq_id` (`integer`), `locked` (`bool`).
+- **`dispatch_workbench_action`** (`ReadWrite`):
+  - Accepts `action` (`PascalCase` or `snake_case`, enumerable via `inspect_workbench_data(section="actions")`), optional `overwrite` (`bool`, required to replace existing `.nef`/`.str`/`.tsv`/`.html` targets), and optional `confirm` (`bool`, required alongside enabling **Allow destructive actions (`ResetWorkspace`)** in the **MCP Bridge** panel for `ResetWorkspace`).
+- **`inspect_workbench_data`** (`ReadOnly`):
+  - `section`: `"assignments"` \| `"spin_systems"` \| `"peaks"` \| `"unassigned_residues"` \| `"low_confidence"` \| `"qc_report"` \| `"workbook_pages"` \| `"actions"`.
+  - Pagination & filters: `limit` (`1..=500`), `offset` (`>= 0`), `experiment` (for `peaks`), `max_confidence` (for `low_confidence`, default `0.8`).
 
 #### Built-In `nmr://` Resources & Guided Spectroscopist Prompts
 
