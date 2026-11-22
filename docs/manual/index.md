@@ -100,7 +100,7 @@ ferric-gui
 - **GPG Verification (`gpgcheck=1` + `repo_gpgcheck=1`)**: Packages and `repomd.xml` metadata are signed with [`RPM-GPG-KEY-ferric`](https://debsahu.github.io/ferric-rpm/RPM-GPG-KEY-ferric) (RSA-4096 / SHA-256 fingerprint `A484 B4E4 D0D7 6A41 91DD 6228 8E1B 8E3E EAF5 655B`).
 - **Air-gapped / direct `.rpm` install** (for spectrometer hosts without outbound HTTPS):
   ```bash
-  VER=0.17.3
+  VER=0.18.0
   TMP="$(mktemp -d)" && (
     cd "$TMP"
     curl -fsSLO "https://github.com/debsahu/ferric/releases/download/v${VER}/ferric-v${VER}-linux-x86_64.rpm"
@@ -121,7 +121,7 @@ ferric-gui
   ```
 - **No-`sudo` user-local install into `~/.local/bin` (with desktop launcher & icons)**:
   ```bash
-  VER=0.17.3
+  VER=0.18.0
   TMP="$(mktemp -d)" && (
     cd "$TMP"
     curl -fsSLO "https://github.com/debsahu/ferric/releases/download/v${VER}/ferric-v${VER}-linux-x86_64.tar.gz"
@@ -136,8 +136,8 @@ ferric-gui
 
 #### Other Prebuilt Platforms & Direct Cargo Install
 
-- **Debian / Ubuntu (`x86_64`)**: Download `ferric-v0.17.3-linux-x86_64.deb` from GitHub Releases and run `sudo apt install ./ferric-v0.17.3-linux-x86_64.deb`.
-- **Legacy 32-bit Linux (`i686` CLI-only)**: Static musl `ferric` CLI packages (`ferric-v0.17.3-linux-i686-cli.rpm`, `.deb`, and `.tar.gz`).
+- **Debian / Ubuntu (`x86_64`)**: Download `ferric-v0.18.0-linux-x86_64.deb` from GitHub Releases and run `sudo apt install ./ferric-v0.18.0-linux-x86_64.deb`.
+- **Legacy 32-bit Linux (`i686` CLI-only)**: Static musl `ferric` CLI packages (`ferric-v0.18.0-linux-i686-cli.rpm`, `.deb`, and `.tar.gz`).
 - **macOS (Apple Silicon & Intel)**:
   ```bash
   brew tap debsahu/tap
@@ -145,11 +145,11 @@ ferric-gui
   brew install --cask --no-quarantine ferric # FERRIC.app GUI + CLI (macOS arm64/x86_64)
   ```
   Or download the `.dmg` / `.tar.gz` archives directly from [**GitHub Releases**](https://github.com/debsahu/ferric/releases). Because `FERRIC.app` is ad-hoc signed (not Apple-notarized), after dragging it from a `.dmg` into `/Applications`, clear the download quarantine flag once with `xattr -dr com.apple.quarantine /Applications/FERRIC.app` (or click **Open Anyway** in **System Settings → Privacy & Security**; `brew install --cask --no-quarantine ferric` skips this automatically).
-- **Windows (`x86_64`)**: Download `ferric-v0.17.3-windows-x86_64.zip` (`ferric-gui.exe` + `ferric.exe`).
+- **Windows (`x86_64`)**: Download `ferric-v0.18.0-windows-x86_64.zip` (`ferric-gui.exe` + `ferric.exe`).
 - **Direct Cargo Install (any platform with Rust)**:
   ```bash
-  cargo install --git https://github.com/debsahu/ferric.git --tag v0.17.3 nmr-cli
-  cargo install --git https://github.com/debsahu/ferric.git --tag v0.17.3 nmr-gui
+  cargo install --git https://github.com/debsahu/ferric.git --tag v0.18.0 nmr-cli
+  cargo install --git https://github.com/debsahu/ferric.git --tag v0.18.0 nmr-gui
   ```
 
 ### Building from Source — Prerequisites

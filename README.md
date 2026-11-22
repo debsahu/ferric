@@ -49,7 +49,7 @@ ferric-gui
 - **Automatic updates & GPG verification:** Upgrade anytime with `sudo dnf upgrade ferric`. Both packages (`gpgcheck=1`) and repo metadata (`repo_gpgcheck=1`) are signed with [`RPM-GPG-KEY-ferric`](https://debsahu.github.io/ferric-rpm/RPM-GPG-KEY-ferric) (RSA-4096 / SHA-256 fingerprint `A484 B4E4 D0D7 6A41 91DD 6228 8E1B 8E3E EAF5 655B`); browse indexed packages at [**debsahu.github.io/ferric-rpm**](https://debsahu.github.io/ferric-rpm/).
 - Verified on RHEL 9.8 with NVIDIA proprietary Vulkan drivers (`wgpu` automatically selects the discrete NVIDIA GPU for `ferric-gui` and `--engine gpu`).
 - On minimal or headless RHEL 9 installs without desktop X11/Vulkan libraries, install GUI runtime dependencies with: `sudo dnf install -y libxkbcommon libX11 vulkan-loader mesa-vulkan-drivers`.
-- **Air-gapped / no-`sudo` fallbacks:** For offline workstations, download [`ferric-v0.17.3-linux-x86_64.rpm`](https://github.com/debsahu/ferric/releases) + `SHA256SUMS.txt` directly; without `sudo`, extract `ferric-v0.17.3-linux-x86_64.tar.gz` and run `./install-desktop.sh --prefix "$HOME/.local"` (see the [User Manual](https://debsahu.github.io/ferric/)).
+- **Air-gapped / no-`sudo` fallbacks:** For offline workstations, download [`ferric-v0.18.0-linux-x86_64.rpm`](https://github.com/debsahu/ferric/releases) + `SHA256SUMS.txt` directly; without `sudo`, extract `ferric-v0.18.0-linux-x86_64.tar.gz` and run `./install-desktop.sh --prefix "$HOME/.local"` (see the [User Manual](https://debsahu.github.io/ferric/)).
 
 Install via **Homebrew** (macOS Apple Silicon / Intel & Linux `x86_64`):
 
@@ -73,8 +73,8 @@ Or install directly with **Cargo** (from Git) or build from a local clone:
 
 ```bash
 # Install the ferric CLI (and optionally ferric-gui) directly via Cargo
-cargo install --git https://github.com/debsahu/ferric.git --tag v0.17.3 nmr-cli
-cargo install --git https://github.com/debsahu/ferric.git --tag v0.17.3 nmr-gui
+cargo install --git https://github.com/debsahu/ferric.git --tag v0.18.0 nmr-cli
+cargo install --git https://github.com/debsahu/ferric.git --tag v0.18.0 nmr-gui
 
 # Or run from a local checkout
 cargo run --release -p nmr-gui --bin ferric-gui

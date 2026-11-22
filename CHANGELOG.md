@@ -4,6 +4,24 @@ All notable architectural changes, algorithm milestones, and verified benchmark 
 
 ---
 
+## [0.18.0] — 2026-11-21
+
+### Unified Joint HN + 13C-Detected IDP Backbone Solver (`idp-joint`), Scale-Invariant Shift-Bias QC, GUI CAS Slot Mapper & Desktop MCP Status Pill
+
+- **Verification & Benchmark Gates**: Verified at `8b51ffb` + version bump (`fmt`, `clippy +1.100.0 --workspace --all-targets -- -D warnings`, `wasm32-unknown-unknown`, `123` release test suites: `1,149 passed, 0 failed, 8 ignored`, docs/CLI-flags/manual/`package_release`/P17 checks, `0`-byte protected diff on `docs/specs/03-assignment.md` & `.github/workflows/docs.yml`), Ubiquitin 5-seed `--realistic` (`evo-graph` CPU `acc=98.4%, rec=90.8%, HC_prec=98.4% (310/315)`; `standard` CPU `acc=90.0%, rec=72.5%, HC_prec=97.1% (170/175)`; `standard` WebGPU Apple M5 Pro `acc=88.4%, rec=70.2%, HC_prec=95.8% (181/189)`), and `CISD3` (`BMRB 51439`) 5-seed evaluation (`real-benchmark --split dev --seeds 5`: `evo-graph` `acc=64.4%, rec=40.4%, HC_prec=100.0% (59/59)`, `standard` CPU `acc=62.5%, rec=39.2%, HC_prec=92.9% (52/56)`, `standard` GPU `acc=58.8%, rec=36.9%, HC_prec=96.6% (57/59)`).
+- **Unified Joint `HN + 13C` IDP Backbone Solver (`T23.2`, `nmr-core::joint_idp_solver`, `crates/nmr-cli`)**:
+  - Added `--regime idp-joint` (CPU-only; fail-closed `Err` on `--engine gpu`, explicit CPU fallback warning on `--engine auto`) fusing `HNCO`-supported amide roots with `2D CON` peaks via Hungarian bipartite matching alongside Proline-only `CON` bridges and exchange-broadened `CON`-only non-Pro nodes; pools `HNCACB`/`HN(CA)CO`, `HN(CO)CACB`/`H(CC)CON`, `CAS` (`cacon`/`canco`), and reciprocal `N–N` edges (`BT_HNCACONH`, `(H)N(CA)CON`).
+  - Added field-scaled TROSY (`46 Hz`) offset auto-calibration, segmental-robust post-Pass-1 offset refinement (`9`-residue rolling medians + half-sample mode + double-Tukey biweight), `F1(C')` NUS sidelobe pruning, `Gly CB` guard, Platzer/ncIDP C-terminal `COO-` & pre-Proline priors, multi-seed SA ensemble with `5..=24`-res chain & periodic motif-repeat block swaps, and bias-free PAV confidence calibration knots (`5,851` unbiased samples).
+  - Added scale-invariant exact-tail predictor-mismatch QC (per-AA ANOVA + LOO Student-t, lag-1 autocorr + `W in {8,12,16}` sliding-window scans across `{N, C', CA, CB, CA-CB}`, and neighbor ANOVA; `0/24` internal and `0/16` independent unbiased false alarms), motif-repeat ambiguity QC, and fail-closed `QC=ABSTAIN` provisional markers across `.str`, `.tsv`, `.json`, `#`-stripped NEF (`_nef_nmr_meta_data.ferric_qc_verdict` / `ferric_provisional_status`), `propensity.tsv`, and `report.html` (withholding propensity/dihedrals on `Abstain`).
+  - Synthetic validation only (**no real-data IDP accuracy/HC-precision claim** — unlabelled Clec16a replay returns `QC=ABSTAIN` with `0` HC and preserves byte-identical `idp-13c` output): fair 3-seed real-solver comparison `94.2%` acc / `93.7%` Pro / `96.8%` HC prec (`134.0` HC/seed) vs `65.5%` / `82.5%` / `96.8%` for standalone `idp-13c` and `54.4%` / `0.0%` / `92.8%` for `evo-graph`; held-out-from-calibration bias suite (`B0a–B7`) and independent unseen bias generalization probes (beta/PPII segments, Student-t(2) heavy tails, sequence gradients, HN↔CON offsets; provenance evaluation) keep HC precision >= `94.5%` without overconfident collapse.
+- **GUI `idp-joint` Mode, Interactive `CAS` Slot Mapper & Desktop MCP Footer Pill (`T23.3`, `crates/nmr-gui`)**:
+  - Wired `idp-joint` regime toggle, interactive `CAS` (`cacon`/`canco`) slot mapper & validation, runnable CLI preview, Proline-bridge / cross-route agreement ribbon & strip indicators, and shared `IdpJoint` `QC=ABSTAIN/WARN/PASS` propagation across GUI & MCP HTML/NEF exports and propensity reports.
+  - Added a desktop-only (`#[cfg(not(target_arch = "wasm32"))]`) clickable `MCP: ...` status pill in the bottom status bar.
+- **Spec & Manual Docs (`T23.4`, `docs/specs/14-regime-solvers.md`, `docs/manual/{03-solvers-and-calibration,06-mcp-and-cli-reference}.md`)**:
+  - Documented `idp-joint` scoring, TROSY/segmental offset calibration, bias-free calibration knots, mismatch QC, provisional exports, and CLI/GUI `CAS` workflows without touching `docs/specs/03-assignment.md`.
+
+---
+
 ## [0.17.3] — 2026-11-21
 
 ### Real-Data IDP Hardening (`RD-1`–`RD-14`), 3D Bruker IPAP/NUS Defaults, Polarity Guards & MCP Destructive-Action Gating
