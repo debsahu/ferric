@@ -419,7 +419,7 @@ Every `MCP` request passes through defense-in-depth security checks (`McpSecurit
   - `select_workbook_page`: `page_index` (`>= 0`) and/or `page_name`.
   - `set_contour_level`: optional `contour_base`, `multiplier`, `show_negative`.
   - `set_viewport_bounds`: `h_left`, `h_right`, `n_top`, `n_bottom`.
-  - `export_results`: `prefix` (resolved inside approved roots; defaults to current export prefix), `format` (`"star"` \| `"peaks"` \| `"nef"` \| `"html"`), optional `overwrite` (`bool`, default `false` — existing files are refused unless `overwrite: true`).
+  - `export_results`: `prefix` (resolved inside approved roots; defaults to current export prefix), `format` (`"star"` \| `"peaks"` \| `"nef"` \| `"html"`), optional `overwrite` (`bool`, default `false` — existing files are refused unless `overwrite: true`). Under `IdpJoint`, `"html"` propagates `ReportInput::with_qc_status` (`#qc-status-banner`, withholding `propensity_report` & `dihedrals` and marking CSI/Ramachandran `[PROVISIONAL — QC=ABSTAIN]` when `QC = ABSTAIN`) and `"nef"` stamps structured `_nef_nmr_meta_data.ferric_qc_verdict` & `_nef_nmr_meta_data.ferric_provisional_status`.
   - `set_lock_residue`: `seq_id` (`integer`), `locked` (`bool`).
 - **`dispatch_workbench_action`** (`ReadWrite`):
   - Accepts `action` (`PascalCase` or `snake_case`, enumerable with `"destructive"` flags via `inspect_workbench_data(section="actions")`), optional `overwrite` (`bool`, required to replace existing `.nef`/`.str`/`.tsv`/`.html` targets), and optional `confirm` (`bool`, required alongside enabling **Allow destructive MCP actions** in the **MCP Bridge** panel for `ResetWorkspace`, `LoadUbiquitinDemo`, `LoadSessionNef`, `ReSimulateSyntheticNoise`, `ProcessAllRawFids`, and `ReconstructNusIstFista`).
